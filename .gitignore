@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+dist/
+build/
+*.egg-info/
+
+# Generated artifacts (uncomment if you don't want to commit samples)
+# *.pptx
+# *.mp4
+# *.srt
