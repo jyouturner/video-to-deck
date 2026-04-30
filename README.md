@@ -18,24 +18,27 @@ that segment; the full transcript is also placed in speaker notes.
 4. **Deck build** — one slide per kept frame, image on top, transcript snippet
    below, full transcript in speaker notes.
 
-## Requirements
+## Setup
 
-- [`uv`](https://docs.astral.sh/uv/) for Python + dependency management
-- `ffmpeg` and `ffprobe` on `PATH` (e.g. `brew install ffmpeg`)
+One command:
 
-Python deps (`imagehash`, `Pillow`, `python-pptx`) are declared in `pyproject.toml`
-and resolved by uv automatically — you do not need to install them by hand.
+```bash
+./setup.sh
+```
+
+This checks for `ffmpeg`/`ffprobe`, offers to install [`uv`](https://docs.astral.sh/uv/)
+if it's missing, then runs `uv sync` to materialize the Python environment.
+
+If you'd rather do it by hand: install `ffmpeg` (`brew install ffmpeg` on macOS) and
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/), then run `uv sync`.
 
 ## Usage
 
 ```bash
-# One-shot: uv resolves deps into .venv on first run.
-uv run video_to_deck.py input.mp4 transcript.srt -o output.pptx
-
-# Or sync once, then run repeatedly:
-uv sync
 uv run video_to_deck.py input.mp4 transcript.srt -o output.pptx
 ```
+
+uv resolves deps into `.venv` on first run; subsequent runs reuse it.
 
 ### Options
 
@@ -77,6 +80,7 @@ Done. 69 content slides + 1 title slide written to Agent_Harness_deck.pptx
 
 ```
 video_to_deck.py    main script
+setup.sh            one-shot onboarding (checks ffmpeg, installs uv, syncs deps)
 pyproject.toml      project metadata + dependencies (used by uv)
 uv.lock             pinned resolution (commit this to share an exact env)
 .python-version     pinned Python version for uv
