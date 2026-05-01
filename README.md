@@ -78,7 +78,20 @@ yt2md meta run                      # generate a meta-digest now
 yt2md schedule install              # poll every 6h + meta weekly via launchd
 yt2md schedule status               # check job status
 yt2md schedule uninstall            # remove both jobs
+
+yt2md serve                         # local web reader at http://localhost:7682
 ```
+
+### Reading the digests
+
+The simplest reader is `yt2md serve` — a small local web app at
+`http://localhost:7682/` that lists every digest and meta-digest, renders
+them with embedded images, and rewrites cross-references so meta-digests
+link to their source digests. Auto-opens a browser tab. Ctrl-C to stop.
+
+You can also browse `~/yt2md/digests/` and `~/yt2md/meta/` directly in
+Finder, Obsidian, VS Code, or any other Markdown reader — the files are
+plain `.md`.
 
 **Everything lives in one visible directory: `~/yt2md/`** (override with
 `YT2MD_DATA=/path/to/dir`). To inspect or remove all of the tool's data,
