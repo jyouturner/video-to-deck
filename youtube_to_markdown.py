@@ -1128,6 +1128,274 @@ def cmd_schedule_status(args) -> int:
     return 0
 
 
+# ---- serve subcommand (local reader UI) ----
+
+SERVE_PAGE_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} — yt2md</title>
+{% if base_href %}<base href="{{ base_href }}">{% endif %}
+<style>
+:root {
+  --bg: #fafaf7;
+  --fg: #1a1a1a;
+  --muted: #6b6b6b;
+  --accent: #b65a2c;
+  --border: #e5e3dc;
+  --sidebar-bg: #f0eee6;
+  --code-bg: #ececea;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1a1a1a;
+    --fg: #e8e8e8;
+    --muted: #999;
+    --accent: #d97a4d;
+    --border: #2e2e2e;
+    --sidebar-bg: #141414;
+    --code-bg: #232323;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  display: flex;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.6;
+}
+aside {
+  width: 320px;
+  flex-shrink: 0;
+  height: 100vh;
+  overflow-y: auto;
+  padding: 20px 16px;
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--border);
+}
+aside h1 { margin: 0 0 16px; font-size: 18px; }
+aside h1 a { color: var(--fg); text-decoration: none; }
+aside h2 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin: 20px 0 8px;
+  font-weight: 600;
+}
+aside ul { list-style: none; padding: 0; margin: 0; }
+aside li { margin: 0; }
+aside li a {
+  display: block;
+  padding: 6px 8px;
+  border-radius: 4px;
+  color: var(--fg);
+  text-decoration: none;
+  font-size: 13px;
+  line-height: 1.4;
+}
+aside li a:hover { background: rgba(0,0,0,0.05); }
+@media (prefers-color-scheme: dark) {
+  aside li a:hover { background: rgba(255,255,255,0.05); }
+}
+aside li.active a { background: var(--accent); color: white; }
+aside .empty { color: var(--muted); font-size: 13px; padding: 6px 8px; }
+main {
+  flex: 1;
+  height: 100vh;
+  overflow-y: auto;
+  padding: 32px 48px 80px;
+}
+main .reader {
+  max-width: 720px;
+  margin: 0 auto;
+}
+main h1 { font-size: 28px; line-height: 1.25; margin-top: 0; }
+main h2 { font-size: 22px; line-height: 1.3; margin-top: 32px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+main h3 { font-size: 17px; }
+main img { max-width: 100%; height: auto; border: 1px solid var(--border); border-radius: 4px; }
+main a { color: var(--accent); }
+main code { background: var(--code-bg); padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
+main pre { background: var(--code-bg); padding: 12px; border-radius: 4px; overflow-x: auto; }
+main pre code { background: none; padding: 0; }
+main blockquote { border-left: 3px solid var(--border); padding-left: 16px; color: var(--muted); margin-left: 0; }
+main ul, main ol { padding-left: 24px; }
+main hr { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
+main sub { color: var(--muted); font-size: 0.85em; }
+.empty-state { color: var(--muted); margin-top: 80px; text-align: center; }
+.meta-info { color: var(--muted); font-size: 13px; margin-top: -12px; margin-bottom: 24px; }
+</style>
+</head>
+<body>
+<aside>
+  <h1><a href="/">yt2md</a></h1>
+
+  <h2>Meta-digests ({{ metas|length }})</h2>
+  <ul>
+    {% for m in metas %}
+    <li{% if current == 'meta:' + m.week %} class="active"{% endif %}><a href="/meta/{{ m.week }}/">{{ m.week }}</a></li>
+    {% else %}
+    <li class="empty">none yet</li>
+    {% endfor %}
+  </ul>
+
+  <h2>Digests ({{ digests|length }})</h2>
+  <ul>
+    {% for d in digests %}
+    <li{% if current == 'digest:' + d.id %} class="active"{% endif %}><a href="/digests/{{ d.id }}/">{{ d.title }}</a></li>
+    {% else %}
+    <li class="empty">none yet</li>
+    {% endfor %}
+  </ul>
+</aside>
+<main>
+  <div class="reader">
+    {{ body|safe }}
+  </div>
+</main>
+</body>
+</html>
+"""
+
+
+def _list_digests(digests_dir: Path) -> List[dict]:
+    if not digests_dir.exists():
+        return []
+    results = []
+    for d in sorted(digests_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        digest_md = d / "digest.md"
+        if not d.is_dir() or not digest_md.exists():
+            continue
+        title = d.name
+        try:
+            for line in digest_md.read_text().splitlines():
+                if line.startswith("# "):
+                    title = line[2:].strip()
+                    break
+        except Exception:
+            pass
+        results.append({"id": d.name, "title": title, "mtime": d.stat().st_mtime})
+    return results
+
+
+def _list_metas(meta_dir: Path) -> List[dict]:
+    if not meta_dir.exists():
+        return []
+    results = []
+    for f in sorted(meta_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+        results.append({"week": f.stem, "mtime": f.stat().st_mtime})
+    return results
+
+
+def _render_markdown(text: str) -> str:
+    import markdown as md_lib
+    html = md_lib.markdown(text, extensions=["fenced_code", "tables", "sane_lists"])
+    # Rewrite cross-references to other digests (e.g. ../digests/X/digest.md) into view URLs.
+    html = re.sub(r'href="[^"]*digests/([^"/]+)/digest\.md"', r'href="/digests/\1/"', html)
+    return html
+
+
+def cmd_serve(args) -> int:
+    try:
+        from flask import Flask, render_template_string, abort, send_from_directory
+    except ImportError:
+        sys.exit(
+            "Flask is required for the reader. Reinstall with:\n"
+            "  uv tool install --reinstall git+https://github.com/jyouturner/youtube-to-markdown"
+        )
+
+    data_dir = get_data_dir()
+    digests_dir = data_dir / "digests"
+    meta_dir = data_dir / "meta"
+
+    app = Flask(__name__)
+    # Disable Flask's default request logging — keep stdout clean.
+    import logging
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+    def page(body: str, *, title: str, current: str, base_href: str = None):
+        return render_template_string(
+            SERVE_PAGE_TEMPLATE,
+            body=body,
+            title=title,
+            current=current,
+            base_href=base_href,
+            digests=_list_digests(digests_dir),
+            metas=_list_metas(meta_dir),
+        )
+
+    @app.route("/")
+    def home():
+        digests = _list_digests(digests_dir)
+        metas = _list_metas(meta_dir)
+        body = "<h1>yt2md reader</h1>"
+        body += f"<p class='meta-info'>Reading from <code>{data_dir}</code></p>"
+        if not digests and not metas:
+            body += (
+                "<div class='empty-state'>"
+                "<p>No digests yet.</p>"
+                "<p>Add a channel: <code>yt2md watch add &lt;URL&gt;</code><br>"
+                "Then trigger a poll: <code>yt2md watch run</code></p>"
+                "</div>"
+            )
+            return page(body, title="yt2md", current="home")
+
+        if metas:
+            body += "<h2>Latest meta-digest</h2>"
+            body += f"<p><a href='/meta/{metas[0]['week']}/'>{metas[0]['week']}</a></p>"
+        if digests:
+            body += "<h2>Recent digests</h2><ul>"
+            for d in digests[:10]:
+                body += f"<li><a href='/digests/{d['id']}/'>{d['title']}</a></li>"
+            body += "</ul>"
+        return page(body, title="Home", current="home")
+
+    @app.route("/digests/<video_id>/")
+    def view_digest(video_id):
+        digest_md = digests_dir / video_id / "digest.md"
+        if not digest_md.exists():
+            abort(404)
+        html = _render_markdown(digest_md.read_text())
+        return page(html, title=video_id, current=f"digest:{video_id}",
+                    base_href=f"/digests/{video_id}/")
+
+    @app.route("/digests/<video_id>/digest_images/<path:filename>")
+    def digest_image(video_id, filename):
+        return send_from_directory(digests_dir / video_id / "digest_images", filename)
+
+    @app.route("/meta/<week>/")
+    def view_meta(week):
+        meta_md = meta_dir / f"{week}.md"
+        if not meta_md.exists():
+            abort(404)
+        html = _render_markdown(meta_md.read_text())
+        return page(html, title=f"Meta-digest {week}", current=f"meta:{week}",
+                    base_href="/meta/")
+
+    @app.errorhandler(404)
+    def not_found(e):
+        return page(
+            "<h1>Not found</h1><p>That digest or meta-digest doesn't exist yet.</p>",
+            title="404", current="home",
+        ), 404
+
+    url = f"http://127.0.0.1:{args.port}/"
+    print(f"yt2md reader: {url}")
+    print(f"Data dir: {data_dir}")
+    print("Press Ctrl-C to stop.\n")
+
+    if not args.no_browser:
+        import webbrowser
+        import threading
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+
+    app.run(host="127.0.0.1", port=args.port, debug=False, use_reloader=False)
+    return 0
+
+
 # ---- subcommand dispatcher ----
 
 def _subcommand_main(argv: List[str]) -> int:
@@ -1156,6 +1424,12 @@ def _subcommand_main(argv: List[str]) -> int:
                    help=f"Claude model (default: {META_MODEL_DEFAULT})")
     p.set_defaults(func=cmd_meta_run)
 
+    serve = sub.add_parser("serve", help="Start a local web reader for digests")
+    serve.add_argument("--port", type=int, default=7682, help="Port (default: 7682)")
+    serve.add_argument("--no-browser", action="store_true",
+                       help="Don't auto-open a browser tab on start")
+    serve.set_defaults(func=cmd_serve)
+
     schedule = sub.add_parser("schedule", help="Install/uninstall launchd jobs")
     sched_sub = schedule.add_subparsers(dest="schedule_cmd", required=True)
     p = sched_sub.add_parser("install", help="Install both launchd jobs")
@@ -1174,7 +1448,7 @@ def _subcommand_main(argv: List[str]) -> int:
 def main():
     # Subcommand dispatch — short-circuit the single-video flow when the user
     # invokes yt2md watch / meta / schedule.
-    if len(sys.argv) > 1 and sys.argv[1] in ("watch", "meta", "schedule"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("watch", "meta", "schedule", "serve"):
         load_env_files()
         sys.exit(_subcommand_main(sys.argv[1:]))
 
