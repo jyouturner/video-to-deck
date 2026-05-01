@@ -44,7 +44,7 @@ Output lands in the current directory: `<video-id>_digest.md` + a sibling
 
 First run prompts for an Anthropic API key
 ([get one here](https://console.anthropic.com/settings/keys)) and offers to
-save it to `~/.config/youtube-to-markdown/.env` so future runs find it
+save it to `~/yt2md/.env` so future runs find it
 automatically.
 
 ## How it works
@@ -80,13 +80,21 @@ yt2md schedule status               # check job status
 yt2md schedule uninstall            # remove both jobs
 ```
 
-**Where things live** (override the data location with `YT2MD_DATA=/path/to/dir`):
-- `~/.config/youtube-to-markdown/channels.txt` — your subscriptions
-- `~/.config/youtube-to-markdown/state.json` — last-seen video IDs per channel
-- `~/.config/youtube-to-markdown/.env` — API key (auto-saved on first run)
+**Everything lives in one visible directory: `~/yt2md/`** (override with
+`YT2MD_DATA=/path/to/dir`). To inspect or remove all of the tool's data,
+look in or delete that one folder. Layout:
+
+- `~/yt2md/channels.txt` — your subscriptions
+- `~/yt2md/state.json` — last-seen video IDs per channel
+- `~/yt2md/.env` — API key (auto-saved on first run)
 - `~/yt2md/digests/<video-id>/digest.md` — one per video
 - `~/yt2md/meta/YYYY-WW.md` — weekly cross-cutting synthesis
 - `~/yt2md/logs/{poll,meta}.log` — job logs
+- `~/yt2md/downloads/<video-id>/` — yt-dlp cache (re-runs skip downloaded videos)
+
+(The launchd plists are the one exception — macOS requires those at
+`~/Library/LaunchAgents/com.youtube-to-markdown.{poll,meta}.plist`. They're
+tiny pointer files; `yt2md schedule uninstall` removes them.)
 
 **Behavior notes:**
 - First run on a new channel just *seeds* state without backfilling — only videos posted *after* you add the channel get digested.
@@ -120,11 +128,11 @@ YouTube downloads cache to `./downloads/<video-id>/` and re-runs on the same URL
 
 The digest needs `ANTHROPIC_API_KEY`. The tool looks in this order:
 1. The shell environment
-2. `.env` in the current directory
-3. `~/.config/youtube-to-markdown/.env`
+2. `./.env` in the current directory (per-project override)
+3. `~/yt2md/.env` (default, used by scheduled jobs)
 
 If none of those have it, the first interactive run prompts for the key and offers
-to save it to `~/.config/youtube-to-markdown/.env` so you never have to think about
+to save it to `~/yt2md/.env` so you never have to think about
 it again. Get a key at https://console.anthropic.com/settings/keys.
 
 For non-interactive contexts (CI, cron) just export `ANTHROPIC_API_KEY` directly.

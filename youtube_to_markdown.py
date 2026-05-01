@@ -280,8 +280,19 @@ def build_deck(slides_data, output: Path, video_name: str) -> None:
 
 # ---------- Config / API key handling ----------
 
-CONFIG_DIR = Path.home() / ".config" / "youtube-to-markdown"
-CONFIG_ENV_FILE = CONFIG_DIR / ".env"
+# Everything lives in one visible directory under HOME. Override with YT2MD_DATA.
+# Layout under that directory:
+#   .env, channels.txt, state.json, digests/, meta/, downloads/, logs/
+
+DEFAULT_DATA_DIR = Path.home() / "yt2md"
+
+
+def get_data_dir() -> Path:
+    return Path(os.environ.get("YT2MD_DATA", str(DEFAULT_DATA_DIR))).expanduser()
+
+
+def env_file() -> Path:
+    return get_data_dir() / ".env"
 
 
 def load_env_files() -> None:
@@ -289,14 +300,15 @@ def load_env_files() -> None:
 
     Order (lowest priority first; later loads do NOT override earlier-set keys):
       1. Real env vars (from the shell)
-      2. CWD/.env (project-local)
-      3. ~/.config/video-digest/.env (global fallback)
+      2. CWD/.env (project-local override)
+      3. <data dir>/.env (default: ~/yt2md/.env)
     """
     from dotenv import load_dotenv
 
     load_dotenv()  # CWD/.env, only fills in missing
-    if CONFIG_ENV_FILE.exists():
-        load_dotenv(CONFIG_ENV_FILE)
+    e = env_file()
+    if e.exists():
+        load_dotenv(e)
 
 
 def ensure_api_key() -> None:
@@ -304,6 +316,7 @@ def ensure_api_key() -> None:
     if os.environ.get("ANTHROPIC_API_KEY"):
         return
 
+    e = env_file()
     msg = (
         "ANTHROPIC_API_KEY is not set.\n"
         "Get a key from: https://console.anthropic.com/settings/keys"
@@ -311,10 +324,8 @@ def ensure_api_key() -> None:
     if not sys.stdin.isatty():
         sys.exit(
             f"{msg}\n"
-            "Then either export it (`export ANTHROPIC_API_KEY=...`), put it in a .env "
-            "file in the current directory, or save it globally via:\n"
-            "  mkdir -p ~/.config/video-digest && echo 'ANTHROPIC_API_KEY=sk-ant-...' "
-            "> ~/.config/video-digest/.env"
+            "Then either export it (`export ANTHROPIC_API_KEY=...`) or save it via:\n"
+            f"  mkdir -p {e.parent} && echo 'ANTHROPIC_API_KEY=sk-ant-...' > {e}"
         )
 
     print(msg)
@@ -323,16 +334,16 @@ def ensure_api_key() -> None:
         sys.exit("Aborted.")
 
     save = input(
-        f"Save it to {CONFIG_ENV_FILE} so future runs find it automatically? [Y/n] "
+        f"Save it to {e} so future runs find it automatically? [Y/n] "
     ).strip().lower()
     if save in ("", "y", "yes"):
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_ENV_FILE.write_text(f"ANTHROPIC_API_KEY={key}\n")
+        e.parent.mkdir(parents=True, exist_ok=True)
+        e.write_text(f"ANTHROPIC_API_KEY={key}\n")
         try:
-            os.chmod(CONFIG_ENV_FILE, 0o600)
+            os.chmod(e, 0o600)
         except OSError:
             pass
-        print(f"      saved to {CONFIG_ENV_FILE}")
+        print(f"      saved to {e}")
     os.environ["ANTHROPIC_API_KEY"] = key
 
 
@@ -682,7 +693,6 @@ def write_markdown_digest(
 
 # ---------- Subcommands: watch / meta / schedule ----------
 
-DEFAULT_DATA_DIR = Path.home() / "yt2md"
 SCHEDULE_LABEL_POLL = "com.youtube-to-markdown.poll"
 SCHEDULE_LABEL_META = "com.youtube-to-markdown.meta"
 LATEST_LIMIT = 10
@@ -692,16 +702,12 @@ META_MIN_DIGESTS = 2
 META_MODEL_DEFAULT = "claude-sonnet-4-6"
 
 
-def get_data_dir() -> Path:
-    return Path(os.environ.get("YT2MD_DATA", str(DEFAULT_DATA_DIR))).expanduser()
-
-
 def channels_file() -> Path:
-    return CONFIG_DIR / "channels.txt"
+    return get_data_dir() / "channels.txt"
 
 
 def state_file() -> Path:
-    return CONFIG_DIR / "state.json"
+    return get_data_dir() / "state.json"
 
 
 def read_channels() -> List[str]:
@@ -716,7 +722,7 @@ def read_channels() -> List[str]:
 
 
 def write_channels(channels: List[str]) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    get_data_dir().mkdir(parents=True, exist_ok=True)
     body = "# YouTube channels to watch. One URL per line. Lines starting with # are ignored.\n"
     body += "\n".join(channels) + ("\n" if channels else "")
     channels_file().write_text(body)
@@ -730,7 +736,7 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    get_data_dir().mkdir(parents=True, exist_ok=True)
     state_file().write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
