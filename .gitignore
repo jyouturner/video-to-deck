@@ -5,6 +5,8 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+.env
+.env.*
 
 # Generated artifacts (uncomment if you don't want to commit samples)
 *.pptx

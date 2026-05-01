@@ -1,54 +1,127 @@
-# video-to-deck
+# video-digest
 
-Turn a screen-recording MP4 + SRT transcript into a PowerPoint deck. Each slide is one
-representative frame from the video, captioned with the transcript text spoken during
-that segment; the full transcript is also placed in speaker notes.
+Turn a YouTube video (or local MP4 + SRT) into a Markdown digest you can read in 2–3
+minutes. Topic-segmented summary, one representative frame per topic embedded as
+`<img>` tags, full transcript in speaker notes if you also build a deck. Optional
+PowerPoint output for the same content.
+
+## Quick start
+
+```bash
+# Install (requires `uv` and `ffmpeg`)
+uv tool install --from git+https://github.com/<your-handle>/video-to-deck video-digest
+
+# Run on a YouTube URL — that's it
+video-digest "https://youtu.be/nWzXyjXCoCE"
+```
+
+First run prompts for an Anthropic API key
+([get one here](https://console.anthropic.com/settings/keys)) and offers to save it to
+`~/.config/video-digest/.env` so future runs find it automatically.
+
+Output: `<video-id>_digest.md` plus a `<video-id>_digest_images/` folder, in your
+current directory.
 
 ## How it works
 
-1. **Frame extraction** — combines `ffmpeg` scene detection with periodic interval
-   sampling (one frame every N seconds). The interval pass is what makes screen
-   recordings work; gradual scrolling/typing rarely trips a scene cut on its own.
-2. **Dedup** — perceptual-hash (`imagehash.phash`) compared only against the *previous
-   kept frame*. Identical-looking neighbors are dropped, but recurring views (e.g.
-   returning to the same editor 5 minutes later) are preserved.
-3. **Transcript alignment** — the SRT is parsed into segments; each frame's slide
-   covers the window `[t_i, t_{i+1})` and collects every segment whose midpoint falls
-   inside it.
-4. **Deck build** — one slide per kept frame, image on top, transcript snippet
-   below, full transcript in speaker notes.
+1. **Fetch** — given a YouTube URL, download mp4 + auto-captions via `yt-dlp`,
+   cached under `./downloads/<video-id>/`.
+2. **Frame extraction** — `ffmpeg` scene detection + periodic interval sampling
+   (every 20s by default). The interval pass is what makes screen recordings work;
+   gradual scrolling rarely trips a scene cut on its own.
+3. **Dedup** — perceptual-hash (`imagehash.phash`) compared only against the *previous
+   kept frame*. Drops identical-looking neighbors, preserves recurring views (e.g.
+   returning to the same editor 5 minutes later).
+4. **Topic segmentation** — Claude reads the timestamped transcript and returns 5–12
+   topic sections (title, summary, key points), each anchored to a real timestamp.
+5. **Vision-aware frame picking** — for each topic, Claude looks at the candidate
+   frames in that topic's time window and picks the most illustrative one.
+6. **Render** — Markdown digest with `<img>` tags inline, plus the chosen frames in
+   a sibling `_images/` folder. Optionally also a PowerPoint deck (one slide per
+   kept frame, full transcript in speaker notes).
 
-## Setup
+## Install
 
-One command:
+Two prerequisites: `uv` (https://docs.astral.sh/uv/) and `ffmpeg` (e.g.
+`brew install ffmpeg` on macOS).
 
 ```bash
-./setup.sh
+uv tool install --from git+https://github.com/<your-handle>/video-to-deck video-digest
 ```
 
-This checks for `ffmpeg`/`ffprobe`, offers to install [`uv`](https://docs.astral.sh/uv/)
-if it's missing, then runs `uv sync` to materialize the Python environment.
+This installs both the `video-digest` and `video-to-deck` commands. Substitute the
+right repo URL after pushing to GitHub.
 
-If you'd rather do it by hand: install `ffmpeg` (`brew install ffmpeg` on macOS) and
-[`uv`](https://docs.astral.sh/uv/getting-started/installation/), then run `uv sync`.
+For local development instead:
+```bash
+git clone <repo>
+cd video-to-deck
+./setup.sh
+```
 
 ## Usage
 
 ```bash
-uv run video_to_deck.py input.mp4 transcript.srt -o output.pptx
+# Default — digest with vision-picked frames, from a YouTube URL
+video-digest "https://youtu.be/nWzXyjXCoCE"
+
+# Local files
+video-digest input.mp4 transcript.srt
+
+# Also build a PowerPoint deck
+video-digest "https://youtu.be/..." --deck
+
+# Just the deck, no API call (no key needed)
+video-digest "https://youtu.be/..." --deck-only
+
+# Cheaper digest (skip the vision pass)
+video-digest "https://youtu.be/..." --no-vision
 ```
 
-uv resolves deps into `.venv` on first run; subsequent runs reuse it.
+Output (defaults):
+- `<video-name>_digest.md` — readable digest (overview + 5–12 topic sections)
+- `<video-name>_digest_images/topic_NN.jpg` — one frame per topic, embedded as `<img>` tags
+- `<video-name>_deck.pptx` — only when `--deck` is set
+
+YouTube downloads cache to `./downloads/<video-id>/` and re-runs on the same URL
+skip the download.
+
+## API key
+
+The digest needs `ANTHROPIC_API_KEY`. The tool looks in this order:
+1. The shell environment
+2. `.env` in the current directory
+3. `~/.config/video-digest/.env`
+
+If none of those have it, the first interactive run prompts for the key and offers
+to save it to `~/.config/video-digest/.env` so you never have to think about it
+again. Get a key at https://console.anthropic.com/settings/keys.
+
+For non-interactive contexts (CI, cron) just export `ANTHROPIC_API_KEY` directly.
+
+## Cost
+
+Default settings on a 20-min video: ~$0.16
+- Digest: ~$0.05 (Sonnet 4.6, ~9k input + ~2k output tokens)
+- Vision pass: ~$0.11 (Sonnet 4.6, ~30 frames as input)
+
+`--no-vision` drops it to ~$0.05. `--digest-model claude-opus-4-7` raises quality
+~3–5× the cost. `--deck-only` skips the API entirely.
 
 ### Options
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `-o`, `--output` | `output.pptx` | Output file path. |
+| `-o`, `--output` | `<video-name>_digest.md` | Digest output path. |
+| `--deck [PATH]` | off | Also write a PowerPoint deck (default path: `<video-name>_deck.pptx`). |
+| `--deck-only` | off | Skip the digest entirely. No API key required. |
+| `--no-vision` | off | Skip vision-based frame picking; cheaper but less illustrative. |
+| `--digest-model` | `claude-sonnet-4-6` | Claude model for the digest. `claude-opus-4-7` for higher quality. |
 | `--scene-threshold` | `0.2` | ffmpeg scene-cut sensitivity. `0.1` = many cuts, `0.5` = only major cuts. |
 | `--interval` | `20` | Also sample one frame every N seconds. Set to `0` to disable. |
 | `--hash-distance` | `4` | Perceptual-hash dedup threshold (compared to previous kept frame only). Higher = more aggressive dedup. |
 | `--keep-frames` | off | Copy extracted frames to `./frames_<videoname>/` for inspection. |
+| `--downloads-dir` | `./downloads` | Where to cache YouTube downloads. |
 
 ### Tuning
 
@@ -60,20 +133,24 @@ uv resolves deps into `.venv` on first run; subsequent runs reuse it.
 ## Example
 
 ```bash
-uv run video_to_deck.py Agent_Harness.mp4 Agent_Harness.srt -o Agent_Harness_deck.pptx
-```
-
-```
+$ video-digest "https://youtu.be/nWzXyjXCoCE"
+[0/5] Fetching YouTube video: https://youtu.be/nWzXyjXCoCE
+      using cached downloads/nWzXyjXCoCE/
 [1/5] Extracting frames (scene threshold=0.2, interval=20.0s)...
       18 scene + 62 interval = 80 candidate frames
 [2/5] Deduping consecutive near-identical frames (hash distance <= 4)...
-      69 unique frames
-[3/5] Parsing SRT: Agent_Harness.srt
+      68 unique frames
+[3/5] Parsing SRT: nWzXyjXCoCE.en.srt
       506 transcript segments
 [4/5] Aligning transcript to frames...
-[5/5] Building deck -> Agent_Harness_deck.pptx
+[5/5] Skipping deck (use --deck to also write one)
+[+] Generating digest with claude-sonnet-4-6 -> nWzXyjXCoCE_digest.md
+      9 topics  |  input: 7600 tokens (cache write) |  output: 1891 tokens
+[+] Vision-picking frames with claude-sonnet-4-6...
+      vision-selected 9/9 topics  |  input: 30928 tokens  |  output: 512 tokens
+      Digest written. Images in nWzXyjXCoCE_digest_images/
 
-Done. 69 content slides + 1 title slide written to Agent_Harness_deck.pptx
+Done. Wrote: nWzXyjXCoCE_digest.md
 ```
 
 ## Project layout

@@ -67,5 +67,12 @@ Run the converter with:
 
     uv run video_to_deck.py input.mp4 transcript.srt -o output.pptx
 
+For the LLM-summarized Markdown digest, also export an Anthropic API key
+and pass --markdown:
+
+    export ANTHROPIC_API_KEY=sk-ant-...
+    uv run video_to_deck.py input.mp4 transcript.srt \
+        -o output.pptx --markdown digest.md
+
 See README.md for all options.
 EOF
