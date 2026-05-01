@@ -7,6 +7,14 @@ build/
 *.egg-info/
 .env
 .env.*
+.claude/
+
+# Generated outputs
+downloads/
+*_digest.md
+*_digest_images/
+*_deck.pptx
+frames_*/
 
 # Generated artifacts (uncomment if you don't want to commit samples)
 *.pptx
