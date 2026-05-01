@@ -742,8 +742,26 @@ def save_state(state: dict) -> None:
 
 # ---- watch subcommands ----
 
+def normalize_channel_url(url: str) -> str:
+    """Light normalization for YouTube channel URLs.
+
+    Accepts: '@handle', 'youtube.com/@handle', 'https://www.youtube.com/@handle/videos'.
+    Always returns a fully-qualified URL. Adds '/videos' to bare @handle URLs so
+    yt-dlp targets the videos tab specifically.
+    """
+    url = url.strip()
+    if url.startswith("@"):
+        url = f"https://www.youtube.com/{url}"
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    m = re.match(r"^(https?://(?:www\.)?youtube\.com/@[^/]+)/?$", url)
+    if m:
+        url = m.group(1) + "/videos"
+    return url
+
+
 def cmd_watch_add(args) -> int:
-    url = args.url.strip()
+    url = normalize_channel_url(args.url)
     if not is_url(url):
         sys.exit(f"Not a URL: {url}")
     channels = read_channels()
@@ -1227,11 +1245,41 @@ main hr { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
 main sub { color: var(--muted); font-size: 0.85em; }
 .empty-state { color: var(--muted); margin-top: 80px; text-align: center; }
 .meta-info { color: var(--muted); font-size: 13px; margin-top: -12px; margin-bottom: 24px; }
+.add-form { display: flex; gap: 8px; margin: 24px 0; }
+.add-form input[type="text"] {
+  flex: 1; padding: 10px 12px; font-size: 14px;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg); color: var(--fg);
+}
+.add-form button, .channel-list button {
+  padding: 10px 16px; font-size: 14px;
+  border: 1px solid var(--accent); border-radius: 4px;
+  background: var(--accent); color: white; cursor: pointer;
+}
+.channel-list { list-style: none; padding: 0; }
+.channel-list li {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 4px;
+  margin-bottom: 8px; gap: 12px;
+}
+.channel-list .url { flex: 1; word-break: break-all; font-size: 14px; }
+.channel-list button {
+  background: transparent; color: var(--muted);
+  border-color: var(--border); padding: 6px 12px; font-size: 12px;
+}
+.channel-list button:hover { color: var(--accent); border-color: var(--accent); }
+.flash { padding: 10px 14px; border-radius: 4px; margin: 16px 0;
+  background: var(--code-bg); border-left: 3px solid var(--accent); }
 </style>
 </head>
 <body>
 <aside>
   <h1><a href="/">yt2md</a></h1>
+
+  <h2>Manage</h2>
+  <ul>
+    <li{% if current == 'channels' %} class="active"{% endif %}><a href="/channels">Subscriptions ({{ channel_count }})</a></li>
+  </ul>
 
   <h2>Meta-digests ({{ metas|length }})</h2>
   <ul>
@@ -1325,6 +1373,7 @@ def cmd_serve(args) -> int:
             base_href=base_href,
             digests=_list_digests(digests_dir),
             metas=_list_metas(meta_dir),
+            channel_count=len(read_channels()),
         )
 
     @app.route("/")
@@ -1352,6 +1401,66 @@ def cmd_serve(args) -> int:
                 body += f"<li><a href='/digests/{d['id']}/'>{d['title']}</a></li>"
             body += "</ul>"
         return page(body, title="Home", current="home")
+
+    @app.route("/channels", methods=["GET"])
+    def channels_page():
+        from flask import request
+        channels = read_channels()
+        flash = request.args.get("msg", "")
+        body = "<h1>Subscriptions</h1>"
+        if flash:
+            body += f'<div class="flash">{flash}</div>'
+        body += (
+            '<form method="post" action="/channels" class="add-form">'
+            '<input type="text" name="url" '
+            'placeholder="https://www.youtube.com/@channel/videos  (or @handle)" '
+            'autofocus required>'
+            '<button type="submit">Add</button>'
+            '</form>'
+        )
+        if channels:
+            body += '<ul class="channel-list">'
+            for ch in channels:
+                body += (
+                    '<li>'
+                    f'<span class="url">{ch}</span>'
+                    '<form method="post" action="/channels/remove" style="margin:0;">'
+                    f'<input type="hidden" name="url" value="{ch}">'
+                    '<button type="submit">Remove</button>'
+                    '</form>'
+                    '</li>'
+                )
+            body += '</ul>'
+        else:
+            body += "<p class='empty-state'>No subscriptions yet. Paste a YouTube channel URL above.</p>"
+        body += (
+            "<p class='meta-info' style='margin-top:32px'>"
+            "Stored in <code>~/yt2md/channels.txt</code>. "
+            "Polling fires every 6h once <code>yt2md schedule install</code> is set up."
+            "</p>"
+        )
+        return page(body, title="Subscriptions", current="channels")
+
+    @app.route("/channels", methods=["POST"])
+    def channels_add():
+        from flask import request, redirect
+        url = normalize_channel_url(request.form.get("url", ""))
+        if not is_url(url):
+            return redirect("/channels?msg=Not+a+valid+URL")
+        channels = read_channels()
+        if url in channels:
+            return redirect(f"/channels?msg=Already+watching+{url}")
+        channels.append(url)
+        write_channels(channels)
+        return redirect(f"/channels?msg=Added+{url}")
+
+    @app.route("/channels/remove", methods=["POST"])
+    def channels_remove():
+        from flask import request, redirect
+        url = request.form.get("url", "").strip()
+        channels = [c for c in read_channels() if c != url]
+        write_channels(channels)
+        return redirect(f"/channels?msg=Removed+{url}")
 
     @app.route("/digests/<video_id>/")
     def view_digest(video_id):
