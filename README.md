@@ -1,25 +1,51 @@
 # youtube-to-markdown
 
-Turn a YouTube video (or local MP4 + SRT) into a Markdown digest you can read in 2–3
-minutes. Topic-segmented summary, one representative frame per topic embedded as
-`<img>` tags. Optional PowerPoint export for the same content.
+Read YouTube without watching. Subscribe to channels and get Markdown digests
+of new videos automatically — topic-segmented summaries, frames embedded as
+`<img>` tags, plus a weekly cross-cutting meta-digest. Or digest one video on
+demand. Runs entirely on your Mac.
 
-## Quick start
+## Two modes
+
+### Subscription mode (the recommended daily-use path)
+
+Set up once, runs forever. New videos get digested in the background; a
+weekly meta-digest weaves the week's videos into one cross-cutting summary.
 
 ```bash
 # Install (requires `uv` and `ffmpeg`)
+brew install ffmpeg uv
 uv tool install git+https://github.com/jyouturner/youtube-to-markdown
+uv tool install yt-dlp
 
-# Run on a YouTube URL — that's it
+# Subscribe to a channel
+yt2md watch add https://www.youtube.com/@LennysPodcast/videos
+
+# Schedule both jobs on your Mac (polling every 6h, meta-digest weekly)
+yt2md schedule install
+```
+
+That's it. Outputs land in `~/yt2md/digests/<video-id>/digest.md` (one per
+video) and `~/yt2md/meta/YYYY-WW.md` (one per week). Read them in Finder,
+Obsidian, or whatever you like.
+
+### One-off mode (digest a single video)
+
+Saw a video and want a digest of just that one? Skip the subscription:
+
+```bash
 yt2md "https://youtu.be/nWzXyjXCoCE"
 ```
 
-First run prompts for an Anthropic API key
-([get one here](https://console.anthropic.com/settings/keys)) and offers to save it
-to `~/.config/youtube-to-markdown/.env` so future runs find it automatically.
+Output lands in the current directory: `<video-id>_digest.md` + a sibling
+`_images/` folder.
 
-Output: `<video-id>_digest.md` plus a `<video-id>_digest_images/` folder, in your
-current directory.
+---
+
+First run prompts for an Anthropic API key
+([get one here](https://console.anthropic.com/settings/keys)) and offers to
+save it to `~/.config/youtube-to-markdown/.env` so future runs find it
+automatically.
 
 ## How it works
 
@@ -39,86 +65,33 @@ current directory.
    a sibling `_images/` folder. Optionally also a PowerPoint deck (one slide per
    kept frame, full transcript in speaker notes).
 
-## Install
-
-Two prerequisites: `uv` (https://docs.astral.sh/uv/) and `ffmpeg` (e.g.
-`brew install ffmpeg` on macOS).
+## Subscription mode — reference
 
 ```bash
-uv tool install git+https://github.com/jyouturner/youtube-to-markdown
+yt2md watch add <CHANNEL_URL>      # subscribe to a channel
+yt2md watch list                    # see what you're watching
+yt2md watch remove <CHANNEL_URL>    # unsubscribe
+yt2md watch run                     # poll once now (no scheduler needed)
+
+yt2md meta run                      # generate a meta-digest now
+
+yt2md schedule install              # poll every 6h + meta weekly via launchd
+yt2md schedule status               # check job status
+yt2md schedule uninstall            # remove both jobs
 ```
 
-This installs both `yt2md` (short) and `youtube-to-markdown` (long form) — the
-two are aliases for the same command.
-
-For local development instead:
-```bash
-git clone <repo>
-cd youtube-to-markdown
-./setup.sh
-```
-
-## Usage
-
-```bash
-# Default — digest with vision-picked frames, from a YouTube URL
-yt2md "https://youtu.be/nWzXyjXCoCE"
-
-# Local files
-yt2md input.mp4 transcript.srt
-
-# Also build a PowerPoint deck
-yt2md "https://youtu.be/..." --deck
-
-# Just the deck, no API call (no key needed)
-yt2md "https://youtu.be/..." --deck-only
-
-# Cheaper digest (skip the vision pass)
-yt2md "https://youtu.be/..." --no-vision
-```
-
-Output (defaults):
-- `<video-name>_digest.md` — readable digest (overview + 5–12 topic sections)
-- `<video-name>_digest_images/topic_NN.jpg` — one frame per topic, embedded as `<img>` tags
-- `<video-name>_deck.pptx` — only when `--deck` is set
-
-YouTube downloads cache to `./downloads/<video-id>/` and re-runs on the same URL
-skip the download.
-
-## Unattended mode (watch a channel for new videos)
-
-If you'd rather subscribe to a channel and have new videos digested automatically,
-yt2md ships with a polling + scheduling layer. No second repo, no scripts to copy
-— it's all in the `yt2md` command:
-
-```bash
-# Add channels you want to follow
-yt2md watch add https://www.youtube.com/@LennysPodcast/videos
-yt2md watch list
-
-# Manually trigger one polling pass (digest any new videos since last run)
-yt2md watch run
-
-# Schedule both jobs as launchd agents on your Mac:
-#   - polling every 6 hours
-#   - weekly meta-digest every Sunday at 9am local
-yt2md schedule install
-yt2md schedule status
-```
-
-Outputs land in `~/yt2md/` by default (override with `YT2MD_DATA=/path/to/dir`):
-
+**Where things live** (override the data location with `YT2MD_DATA=/path/to/dir`):
+- `~/.config/youtube-to-markdown/channels.txt` — your subscriptions
+- `~/.config/youtube-to-markdown/state.json` — last-seen video IDs per channel
+- `~/.config/youtube-to-markdown/.env` — API key (auto-saved on first run)
 - `~/yt2md/digests/<video-id>/digest.md` — one per video
 - `~/yt2md/meta/YYYY-WW.md` — weekly cross-cutting synthesis
 - `~/yt2md/logs/{poll,meta}.log` — job logs
 
-Config files (channels, last-seen state) live in
-`~/.config/youtube-to-markdown/`. The first run on a new channel just *seeds*
-state without backfilling — only videos posted after you add the channel get
-digested.
-
-The meta-digest synthesizes the past 7 days of digests when at least 2 are
-present, and skips otherwise. Generate one manually with `yt2md meta run`.
+**Behavior notes:**
+- First run on a new channel just *seeds* state without backfilling — only videos posted *after* you add the channel get digested.
+- Meta-digest synthesizes the past 7 days when at least 2 digests are present; otherwise skips.
+- Schedule defaults: poll every 6 hours; meta-digest Sundays at 9am local time.
 
 **Why local instead of a cloud runner?** YouTube's "sign in to confirm you're
 not a bot" wall fires on datacenter IPs (GitHub Actions, Claude Code remote
@@ -126,7 +99,22 @@ routines), so video downloads need a residential IP. Running on your Mac
 sidesteps the wall entirely. Tradeoff: the Mac has to be powered on for jobs
 to fire — easy to satisfy with a normally-used laptop.
 
-To remove the schedule: `yt2md schedule uninstall`.
+## One-off mode — reference
+
+```bash
+yt2md "https://youtu.be/..."                 # YouTube URL
+yt2md input.mp4 input.srt                    # local files
+yt2md "https://youtu.be/..." --deck          # also write a PowerPoint deck
+yt2md "https://youtu.be/..." --deck-only     # only the deck (no API call needed)
+yt2md "https://youtu.be/..." --no-vision     # cheaper, skip vision frame picking
+```
+
+Output (defaults) lands in the current directory:
+- `<video-name>_digest.md` — overview + 5–12 topic sections
+- `<video-name>_digest_images/topic_NN.jpg` — one frame per topic, embedded as `<img>` tags
+- `<video-name>_deck.pptx` — only when `--deck` is set
+
+YouTube downloads cache to `./downloads/<video-id>/` and re-runs on the same URL skip the download.
 
 ## API key
 
