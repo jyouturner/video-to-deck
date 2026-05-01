@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Onboarding script for video-to-deck.
+# Onboarding script for youtube-to-markdown.
 # Checks for required tools (uv, ffmpeg, ffprobe), installs uv if absent,
 # then syncs Python dependencies into a local .venv via uv.
 #
@@ -14,7 +14,7 @@ green() { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow(){ printf '\033[33m%s\033[0m\n' "$*"; }
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 
-bold "==> video-to-deck setup"
+bold "==> youtube-to-markdown setup"
 
 # ---- 1. ffmpeg / ffprobe (system dep, can't safely auto-install) ----
 missing_system=()
@@ -63,16 +63,14 @@ uv sync
 bold "==> Ready"
 cat <<'EOF'
 
-Run the converter with:
+Run the tool with:
 
-    uv run video_to_deck.py input.mp4 transcript.srt -o output.pptx
+    uv run yt2md "https://youtu.be/..."
 
-For the LLM-summarized Markdown digest, also export an Anthropic API key
-and pass --markdown:
+Or on local files:
 
-    export ANTHROPIC_API_KEY=sk-ant-...
-    uv run video_to_deck.py input.mp4 transcript.srt \
-        -o output.pptx --markdown digest.md
+    uv run yt2md input.mp4 transcript.srt
 
+The first run prompts for an Anthropic API key and offers to save it.
 See README.md for all options.
 EOF

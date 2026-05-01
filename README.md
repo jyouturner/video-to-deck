@@ -1,23 +1,22 @@
-# video-digest
+# youtube-to-markdown
 
 Turn a YouTube video (or local MP4 + SRT) into a Markdown digest you can read in 2–3
 minutes. Topic-segmented summary, one representative frame per topic embedded as
-`<img>` tags, full transcript in speaker notes if you also build a deck. Optional
-PowerPoint output for the same content.
+`<img>` tags. Optional PowerPoint export for the same content.
 
 ## Quick start
 
 ```bash
 # Install (requires `uv` and `ffmpeg`)
-uv tool install --from git+https://github.com/<your-handle>/video-to-deck video-digest
+uv tool install --from git+https://github.com/<your-handle>/youtube-to-markdown yt2md
 
 # Run on a YouTube URL — that's it
-video-digest "https://youtu.be/nWzXyjXCoCE"
+yt2md "https://youtu.be/nWzXyjXCoCE"
 ```
 
 First run prompts for an Anthropic API key
-([get one here](https://console.anthropic.com/settings/keys)) and offers to save it to
-`~/.config/video-digest/.env` so future runs find it automatically.
+([get one here](https://console.anthropic.com/settings/keys)) and offers to save it
+to `~/.config/youtube-to-markdown/.env` so future runs find it automatically.
 
 Output: `<video-id>_digest.md` plus a `<video-id>_digest_images/` folder, in your
 current directory.
@@ -46,16 +45,16 @@ Two prerequisites: `uv` (https://docs.astral.sh/uv/) and `ffmpeg` (e.g.
 `brew install ffmpeg` on macOS).
 
 ```bash
-uv tool install --from git+https://github.com/<your-handle>/video-to-deck video-digest
+uv tool install --from git+https://github.com/<your-handle>/youtube-to-markdown yt2md
 ```
 
-This installs both the `video-digest` and `video-to-deck` commands. Substitute the
-right repo URL after pushing to GitHub.
+This installs both `yt2md` (short) and `youtube-to-markdown` (long form) — the
+two are aliases for the same command.
 
 For local development instead:
 ```bash
 git clone <repo>
-cd video-to-deck
+cd youtube-to-markdown
 ./setup.sh
 ```
 
@@ -63,19 +62,19 @@ cd video-to-deck
 
 ```bash
 # Default — digest with vision-picked frames, from a YouTube URL
-video-digest "https://youtu.be/nWzXyjXCoCE"
+yt2md "https://youtu.be/nWzXyjXCoCE"
 
 # Local files
-video-digest input.mp4 transcript.srt
+yt2md input.mp4 transcript.srt
 
 # Also build a PowerPoint deck
-video-digest "https://youtu.be/..." --deck
+yt2md "https://youtu.be/..." --deck
 
 # Just the deck, no API call (no key needed)
-video-digest "https://youtu.be/..." --deck-only
+yt2md "https://youtu.be/..." --deck-only
 
 # Cheaper digest (skip the vision pass)
-video-digest "https://youtu.be/..." --no-vision
+yt2md "https://youtu.be/..." --no-vision
 ```
 
 Output (defaults):
@@ -91,11 +90,11 @@ skip the download.
 The digest needs `ANTHROPIC_API_KEY`. The tool looks in this order:
 1. The shell environment
 2. `.env` in the current directory
-3. `~/.config/video-digest/.env`
+3. `~/.config/youtube-to-markdown/.env`
 
 If none of those have it, the first interactive run prompts for the key and offers
-to save it to `~/.config/video-digest/.env` so you never have to think about it
-again. Get a key at https://console.anthropic.com/settings/keys.
+to save it to `~/.config/youtube-to-markdown/.env` so you never have to think about
+it again. Get a key at https://console.anthropic.com/settings/keys.
 
 For non-interactive contexts (CI, cron) just export `ANTHROPIC_API_KEY` directly.
 
@@ -133,7 +132,7 @@ Default settings on a 20-min video: ~$0.16
 ## Example
 
 ```bash
-$ video-digest "https://youtu.be/nWzXyjXCoCE"
+$ yt2md "https://youtu.be/nWzXyjXCoCE"
 [0/5] Fetching YouTube video: https://youtu.be/nWzXyjXCoCE
       using cached downloads/nWzXyjXCoCE/
 [1/5] Extracting frames (scene threshold=0.2, interval=20.0s)...
@@ -156,7 +155,7 @@ Done. Wrote: nWzXyjXCoCE_digest.md
 ## Project layout
 
 ```
-video_to_deck.py    main script
+youtube_to_markdown.py    main script
 setup.sh            one-shot onboarding (checks ffmpeg, installs uv, syncs deps)
 pyproject.toml      project metadata + dependencies (used by uv)
 uv.lock             pinned resolution (commit this to share an exact env)
