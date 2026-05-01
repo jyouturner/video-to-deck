@@ -85,6 +85,49 @@ Output (defaults):
 YouTube downloads cache to `./downloads/<video-id>/` and re-runs on the same URL
 skip the download.
 
+## Unattended mode (watch a channel for new videos)
+
+If you'd rather subscribe to a channel and have new videos digested automatically,
+yt2md ships with a polling + scheduling layer. No second repo, no scripts to copy
+— it's all in the `yt2md` command:
+
+```bash
+# Add channels you want to follow
+yt2md watch add https://www.youtube.com/@LennysPodcast/videos
+yt2md watch list
+
+# Manually trigger one polling pass (digest any new videos since last run)
+yt2md watch run
+
+# Schedule both jobs as launchd agents on your Mac:
+#   - polling every 6 hours
+#   - weekly meta-digest every Sunday at 9am local
+yt2md schedule install
+yt2md schedule status
+```
+
+Outputs land in `~/yt2md/` by default (override with `YT2MD_DATA=/path/to/dir`):
+
+- `~/yt2md/digests/<video-id>/digest.md` — one per video
+- `~/yt2md/meta/YYYY-WW.md` — weekly cross-cutting synthesis
+- `~/yt2md/logs/{poll,meta}.log` — job logs
+
+Config files (channels, last-seen state) live in
+`~/.config/youtube-to-markdown/`. The first run on a new channel just *seeds*
+state without backfilling — only videos posted after you add the channel get
+digested.
+
+The meta-digest synthesizes the past 7 days of digests when at least 2 are
+present, and skips otherwise. Generate one manually with `yt2md meta run`.
+
+**Why local instead of a cloud runner?** YouTube's "sign in to confirm you're
+not a bot" wall fires on datacenter IPs (GitHub Actions, Claude Code remote
+routines), so video downloads need a residential IP. Running on your Mac
+sidesteps the wall entirely. Tradeoff: the Mac has to be powered on for jobs
+to fire — easy to satisfy with a normally-used laptop.
+
+To remove the schedule: `yt2md schedule uninstall`.
+
 ## API key
 
 The digest needs `ANTHROPIC_API_KEY`. The tool looks in this order:
