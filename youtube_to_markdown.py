@@ -1152,6 +1152,26 @@ def _job_status(label: str) -> dict:
     return info
 
 
+def _job_summary(status: dict) -> Tuple[str, str]:
+    """Translate a launchd status dict into a one-sentence English summary.
+
+    Returns (sentence, dot_class) where dot_class is one of dot-on/dot-warn/dot-off.
+    """
+    if not status["loaded"]:
+        return ("Schedule isn't installed yet.", "dot-off")
+    if status["state"] == "running":
+        pid = status.get("pid", "?")
+        return (f"Running now (PID {pid}).", "dot-on")
+    runs = status.get("runs")
+    last = status.get("last_exit")
+    if runs in (None, "0"):
+        return ("Set up — first run hasn't happened yet.", "dot-warn")
+    if last and last not in ("0", "(never exited)"):
+        return (f"Last run failed (exit code {last}). Check the log.", "dot-warn")
+    n = runs if runs else "?"
+    return (f"Healthy — ran {n} time{'s' if n != '1' else ''}, last run was clean.", "dot-on")
+
+
 def _tail_log(path: Path, n: int = 20) -> str:
     if not path.exists():
         return "(no log yet)"
@@ -1260,13 +1280,16 @@ aside h2 {
 aside ul { list-style: none; padding: 0; margin: 0; }
 aside li { margin: 0; }
 aside li a {
-  display: block;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
   padding: 6px 8px;
   border-radius: 4px;
   color: var(--fg);
   text-decoration: none;
   font-size: 13px;
-  line-height: 1.4;
+  line-height: 1.35;
 }
 aside li a:hover { background: rgba(0,0,0,0.05); }
 @media (prefers-color-scheme: dark) {
@@ -1274,6 +1297,19 @@ aside li a:hover { background: rgba(0,0,0,0.05); }
 }
 aside li.active a { background: var(--accent); color: white; }
 aside .empty { color: var(--muted); font-size: 13px; padding: 6px 8px; }
+aside .meta-card {
+  display: block; padding: 10px 12px; border-radius: 4px;
+  border: 1px solid var(--border); margin-bottom: 6px;
+  text-decoration: none; color: var(--fg);
+}
+aside .meta-card:hover { border-color: var(--accent); }
+aside .meta-card.active { background: var(--accent); color: white; border-color: var(--accent); }
+aside .meta-card .week { font-weight: 600; font-size: 13px; line-height: 1.2; }
+aside .meta-card .count {
+  color: var(--muted); font-size: 11px; margin-top: 2px;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+aside .meta-card.active .count { color: white; opacity: 0.85; }
 main {
   flex: 1;
   height: 100vh;
@@ -1298,6 +1334,21 @@ main hr { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
 main sub { color: var(--muted); font-size: 0.85em; }
 .empty-state { color: var(--muted); margin-top: 80px; text-align: center; }
 .meta-info { color: var(--muted); font-size: 13px; margin-top: -12px; margin-bottom: 24px; }
+.featured-eyebrow {
+  color: var(--muted); font-size: 12px; text-transform: uppercase;
+  letter-spacing: 0.06em; margin-bottom: 24px;
+}
+.featured-eyebrow a { color: var(--accent); text-decoration: none; font-weight: 600; }
+.cta {
+  display: inline-block; background: var(--accent); color: white;
+  padding: 12px 20px; border-radius: 4px; text-decoration: none;
+  font-weight: 500; margin-top: 12px;
+}
+.cta:hover { opacity: 0.9; }
+.recent-list { list-style: none; padding: 0; margin: 12px 0; }
+.recent-list li { padding: 6px 0; border-bottom: 1px solid var(--border); }
+.recent-list a { color: var(--fg); text-decoration: none; }
+.recent-list a:hover { color: var(--accent); }
 .add-form { display: flex; gap: 8px; margin: 24px 0; }
 .add-form input[type="text"] {
   flex: 1; padding: 10px 12px; font-size: 14px;
@@ -1339,6 +1390,14 @@ main sub { color: var(--muted); font-size: 0.85em; }
 }
 .job-actions button.primary { background: var(--accent); color: white; border-color: var(--accent); }
 .job-actions button:hover { border-color: var(--accent); }
+.job-summary { font-size: 15px; margin: 0 0 12px; }
+details summary {
+  cursor: pointer; color: var(--muted); font-size: 12px;
+  text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 4px 0; user-select: none;
+}
+details summary:hover { color: var(--accent); }
+details[open] summary { margin-bottom: 8px; }
 .log-block {
   background: var(--code-bg); padding: 12px; border-radius: 4px;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
@@ -1363,13 +1422,14 @@ main sub { color: var(--muted); font-size: 0.85em; }
   </ul>
 
   <h2>Meta-digests ({{ metas|length }})</h2>
-  <ul>
-    {% for m in metas %}
-    <li{% if current == 'meta:' + m.week %} class="active"{% endif %}><a href="/meta/{{ m.week }}/">{{ m.week }}</a></li>
-    {% else %}
-    <li class="empty">none yet</li>
-    {% endfor %}
-  </ul>
+  {% for m in metas %}
+  <a class="meta-card{% if current == 'meta:' + m.week %} active{% endif %}" href="/meta/{{ m.week }}/">
+    <div class="week">{{ m.week }}</div>
+    <div class="count">{% if m.count %}covers {{ m.count }} video{{ 's' if m.count != 1 else '' }}{% else %}meta-digest{% endif %}</div>
+  </a>
+  {% else %}
+  <p class="empty">none yet</p>
+  {% endfor %}
 
   <h2>Digests ({{ digests|length }})</h2>
   <ul>
@@ -1415,7 +1475,13 @@ def _list_metas(meta_dir: Path) -> List[dict]:
         return []
     results = []
     for f in sorted(meta_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
-        results.append({"week": f.stem, "mtime": f.stat().st_mtime})
+        # Count unique digest backlinks to show "covers N videos" in the card.
+        try:
+            text = f.read_text()
+            count = len(set(re.findall(r"digests/([^/)\"\s]+)/digest\.md", text)))
+        except Exception:
+            count = 0
+        results.append({"week": f.stem, "mtime": f.stat().st_mtime, "count": count})
     return results
 
 
@@ -1461,27 +1527,54 @@ def cmd_serve(args) -> int:
     def home():
         digests = _list_digests(digests_dir)
         metas = _list_metas(meta_dir)
-        body = "<h1>yt2md reader</h1>"
-        body += f"<p class='meta-info'>Reading from <code>{data_dir}</code></p>"
+        channels = read_channels()
+
+        # Empty states first — show a real CTA, not a list of zero items.
         if not digests and not metas:
-            body += (
-                "<div class='empty-state'>"
-                "<p>No digests yet.</p>"
-                "<p>Add a channel: <code>yt2md watch add &lt;URL&gt;</code><br>"
-                "Then trigger a poll: <code>yt2md watch run</code></p>"
-                "</div>"
-            )
+            if not channels:
+                body = (
+                    "<h1>Welcome to yt2md</h1>"
+                    "<p>You haven't subscribed to any channels yet.</p>"
+                    '<p><a class="cta" href="/channels">Add your first channel →</a></p>'
+                )
+            else:
+                body = (
+                    "<h1>Polling is set up</h1>"
+                    f"<p>You're watching {len(channels)} channel(s). Your first digest "
+                    "will appear after the next polling run (every 6 hours, or "
+                    'fire one now from the <a href="/schedule">Schedule</a> page).</p>'
+                )
             return page(body, title="yt2md", current="home")
 
+        # Featured content: prefer the latest meta-digest, fall back to the latest digest.
         if metas:
-            body += "<h2>Latest meta-digest</h2>"
-            body += f"<p><a href='/meta/{metas[0]['week']}/'>{metas[0]['week']}</a></p>"
+            featured = metas[0]
+            featured_md = (meta_dir / f"{featured['week']}.md").read_text()
+            body = (
+                f'<p class="featured-eyebrow">Latest weekly meta-digest · '
+                f'<a href="/meta/{featured["week"]}/">{featured["week"]}</a> · '
+                f'covers {featured["count"]} video{"s" if featured["count"] != 1 else ""}</p>'
+            )
+            body += _render_markdown(featured_md)
+            base_href = f"/meta/{featured['week']}/"
+        else:
+            featured = digests[0]
+            featured_md = (digests_dir / featured["id"] / "digest.md").read_text()
+            body = (
+                f'<p class="featured-eyebrow">Latest digest · '
+                f'<a href="/digests/{featured["id"]}/">{featured["title"]}</a></p>'
+            )
+            body += _render_markdown(featured_md)
+            base_href = f"/digests/{featured['id']}/"
+
+        # Footer nav: quick scan of recent digests.
         if digests:
-            body += "<h2>Recent digests</h2><ul>"
-            for d in digests[:10]:
-                body += f"<li><a href='/digests/{d['id']}/'>{d['title']}</a></li>"
-            body += "</ul>"
-        return page(body, title="Home", current="home")
+            body += '<hr><h3 style="margin-top: 32px;">More digests</h3><ul class="recent-list">'
+            for d in digests[:8]:
+                body += f'<li><a href="/digests/{d["id"]}/">{d["title"]}</a></li>'
+            body += '</ul>'
+
+        return page(body, title="Home", current="home", base_href=base_href)
 
     @app.route("/channels", methods=["GET"])
     def channels_page():
@@ -1572,22 +1665,17 @@ def cmd_serve(args) -> int:
                 '<p class="meta-info">Adds two launchd agents: polling every 6h, meta-digest Sundays at 9am local time.</p>'
             )
 
-        for label, status, run_key, desc in [
-            (SCHEDULE_LABEL_POLL, poll_status, "poll", "Polling — every 6 hours, fires <code>yt2md watch run</code>"),
-            (SCHEDULE_LABEL_META, meta_status, "meta", "Meta-digest — Sundays at 9am local, fires <code>yt2md meta run</code>"),
+        for label, status, run_key, friendly, desc in [
+            (SCHEDULE_LABEL_POLL, poll_status, "poll", "Polling",
+             "every 6 hours · fires <code>yt2md watch run</code>"),
+            (SCHEDULE_LABEL_META, meta_status, "meta", "Meta-digest",
+             "Sundays at 9am local · fires <code>yt2md meta run</code>"),
         ]:
-            dot_class = "dot-on" if status["loaded"] else "dot-off"
-            body += f'<div class="job-block"><h3><span class="dot {dot_class}"></span>{h(label)}</h3>'
-            body += f'<p class="meta-info" style="margin: 0 0 8px;">{desc}</p>'
-
-            body += '<table class="status-table">'
-            body += f'<tr><td>plist exists</td><td>{status["plist_exists"]}</td></tr>'
-            body += f'<tr><td>loaded</td><td>{status["loaded"]}</td></tr>'
-            for k in ("state", "runs", "last_exit", "pid"):
-                v = status.get(k)
-                if v is not None:
-                    body += f'<tr><td>{k.replace("_", " ")}</td><td>{h(str(v))}</td></tr>'
-            body += '</table>'
+            # English-language status sentence + dot color signaling actual health.
+            sentence, dot_class = _job_summary(status)
+            body += f'<div class="job-block"><h3><span class="dot {dot_class}"></span>{friendly}</h3>'
+            body += f'<p class="meta-info" style="margin: 0 0 12px;">{desc}</p>'
+            body += f'<p class="job-summary">{sentence}</p>'
 
             if status["loaded"]:
                 body += (
@@ -1597,9 +1685,21 @@ def cmd_serve(args) -> int:
                     f'</form></div>'
                 )
 
+            # Disclosure for the diagnostic dump.
+            body += '<details><summary>Diagnostics</summary>'
+            body += '<table class="status-table">'
+            body += f'<tr><td>plist exists</td><td>{status["plist_exists"]}</td></tr>'
+            body += f'<tr><td>loaded</td><td>{status["loaded"]}</td></tr>'
+            for k in ("state", "runs", "last_exit", "pid"):
+                v = status.get(k)
+                if v is not None:
+                    body += f'<tr><td>{k.replace("_", " ")}</td><td>{h(str(v))}</td></tr>'
+            body += '</table></details>'
+
             log_path = data_dir / "logs" / f"{run_key}.log"
-            body += '<h4 style="margin: 12px 0 6px; font-size: 13px;">Recent log (last 20 lines)</h4>'
+            body += '<details style="margin-top: 8px;"><summary>Recent log (last 20 lines)</summary>'
             body += f'<div class="log-block">{h(_tail_log(log_path, 20))}</div>'
+            body += '</details>'
             body += '</div>'
 
         body += '<p class="meta-info">Refresh the page to see updated status after a run.</p>'
