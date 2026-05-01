@@ -1067,13 +1067,14 @@ def _make_meta_plist(yt2md_path: str, data_dir: Path) -> str:
 """
 
 
-def cmd_schedule_install(args) -> int:
+def _do_schedule_install():
+    """Install both launchd jobs. Returns (success, list_of_messages)."""
     yt2md_path = shutil.which("yt2md")
     if not yt2md_path:
-        sys.exit("Could not find yt2md on PATH. Install with: uv tool install ...")
+        return False, ["yt2md not found on PATH (install with `uv tool install ...`)"]
     for tool in ("yt-dlp", "ffmpeg", "ffprobe"):
         if not shutil.which(tool):
-            sys.exit(f"Required tool '{tool}' is not on PATH.")
+            return False, [f"required tool '{tool}' is not on PATH"]
 
     data_dir = get_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -1081,13 +1082,10 @@ def cmd_schedule_install(args) -> int:
     LAUNCHD_DIR.mkdir(parents=True, exist_ok=True)
 
     plists = [
-        (SCHEDULE_LABEL_POLL, _make_poll_plist(yt2md_path, data_dir),
-         "polling job (every 6 hours)"),
-        (SCHEDULE_LABEL_META, _make_meta_plist(yt2md_path, data_dir),
-         "meta-digest (Sundays at 9am local)"),
+        (SCHEDULE_LABEL_POLL, _make_poll_plist(yt2md_path, data_dir), "polling job (every 6 hours)"),
+        (SCHEDULE_LABEL_META, _make_meta_plist(yt2md_path, data_dir), "meta-digest (Sundays at 9am local)"),
     ]
-
-    print(f"Installing 2 launchd jobs (yt2md = {yt2md_path}, data dir = {data_dir})")
+    messages = []
     for label, content, desc in plists:
         plist_path = LAUNCHD_DIR / f"{label}.plist"
         plist_path.write_text(content)
@@ -1095,26 +1093,19 @@ def cmd_schedule_install(args) -> int:
             ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist_path)],
             check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        subprocess.run(
+        result = subprocess.run(
             ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)],
-            check=True,
+            capture_output=True, text=True,
         )
-        print(f"  ✓ {label} — {desc}")
-
-    print(
-        f"\nLogs:\n"
-        f"  tail -f {data_dir/'logs'/'poll.log'}\n"
-        f"  tail -f {data_dir/'logs'/'meta.log'}\n"
-        f"\nManually trigger:\n"
-        f"  launchctl kickstart -k \"gui/$(id -u)/{SCHEDULE_LABEL_POLL}\"\n"
-        f"  launchctl kickstart -k \"gui/$(id -u)/{SCHEDULE_LABEL_META}\"\n"
-        f"\nUninstall:\n"
-        f"  yt2md schedule uninstall"
-    )
-    return 0
+        if result.returncode != 0:
+            return False, [f"failed to load {label}: {result.stderr.strip()}"]
+        messages.append(f"{label} — {desc}")
+    return True, messages
 
 
-def cmd_schedule_uninstall(args) -> int:
+def _do_schedule_uninstall():
+    """Uninstall both launchd jobs. Returns list of (label, action_taken)."""
+    results = []
     for label in (SCHEDULE_LABEL_POLL, SCHEDULE_LABEL_META):
         plist_path = LAUNCHD_DIR / f"{label}.plist"
         subprocess.run(
@@ -1123,26 +1114,88 @@ def cmd_schedule_uninstall(args) -> int:
         )
         if plist_path.exists():
             plist_path.unlink()
-            print(f"  ✓ removed {label}")
+            results.append((label, "removed"))
         else:
-            print(f"  - {label} was not installed")
+            results.append((label, "was not installed"))
+    return results
+
+
+def _job_status(label: str) -> dict:
+    """Return loaded/state/runs/last_exit for a launchd label."""
+    plist_path = LAUNCHD_DIR / f"{label}.plist"
+    info = {
+        "label": label,
+        "plist_exists": plist_path.exists(),
+        "loaded": False,
+        "state": None,
+        "runs": None,
+        "last_exit": None,
+        "pid": None,
+    }
+    result = subprocess.run(
+        ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return info
+    info["loaded"] = True
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("state ="):
+            info["state"] = line.split("=", 1)[1].strip()
+        elif line.startswith("runs ="):
+            info["runs"] = line.split("=", 1)[1].strip()
+        elif line.startswith("last exit code ="):
+            info["last_exit"] = line.split("=", 1)[1].strip()
+        elif line.startswith("pid ="):
+            info["pid"] = line.split("=", 1)[1].strip()
+    return info
+
+
+def _tail_log(path: Path, n: int = 20) -> str:
+    if not path.exists():
+        return "(no log yet)"
+    try:
+        text = path.read_text(errors="replace")
+    except Exception as e:
+        return f"(error reading log: {e})"
+    lines = text.splitlines()
+    return "\n".join(lines[-n:]) if lines else "(empty)"
+
+
+def cmd_schedule_install(args) -> int:
+    success, messages = _do_schedule_install()
+    if not success:
+        sys.exit(messages[0])
+    data_dir = get_data_dir()
+    print(f"Installed 2 launchd jobs (data dir = {data_dir})")
+    for m in messages:
+        print(f"  ✓ {m}")
+    print(
+        f"\nLogs:\n"
+        f"  tail -f {data_dir/'logs'/'poll.log'}\n"
+        f"  tail -f {data_dir/'logs'/'meta.log'}\n"
+        f"\nUninstall: yt2md schedule uninstall"
+    )
+    return 0
+
+
+def cmd_schedule_uninstall(args) -> int:
+    for label, action in _do_schedule_uninstall():
+        print(f"  {'✓' if action == 'removed' else '-'} {label} {action}")
     return 0
 
 
 def cmd_schedule_status(args) -> int:
     for label in (SCHEDULE_LABEL_POLL, SCHEDULE_LABEL_META):
+        info = _job_status(label)
         print(f"--- {label}")
-        result = subprocess.run(
-            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
+        if not info["loaded"]:
             print("  not loaded")
             continue
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if any(k in line for k in ("state =", "runs =", "last exit code", "pid =", "next run")):
-                print(f"  {line}")
+        for k in ("state", "runs", "last_exit", "pid"):
+            if info.get(k) is not None:
+                print(f"  {k} = {info[k]}")
     return 0
 
 
@@ -1270,6 +1323,33 @@ main sub { color: var(--muted); font-size: 0.85em; }
 .channel-list button:hover { color: var(--accent); border-color: var(--accent); }
 .flash { padding: 10px 14px; border-radius: 4px; margin: 16px 0;
   background: var(--code-bg); border-left: 3px solid var(--accent); }
+.status-table { width: 100%; border-collapse: collapse; font-size: 13px;
+  margin: 12px 0 16px; }
+.status-table td { padding: 6px 12px; border-bottom: 1px solid var(--border); }
+.status-table td:first-child { color: var(--muted); width: 140px; }
+.status-table td:last-child { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.job-block { border: 1px solid var(--border); border-radius: 4px; padding: 16px 20px;
+  margin: 16px 0; background: var(--sidebar-bg); }
+.job-block h3 { margin: 0 0 8px; font-size: 15px; }
+.job-actions { display: flex; gap: 8px; margin: 8px 0 16px; flex-wrap: wrap; }
+.job-actions button {
+  padding: 8px 14px; font-size: 13px; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg); color: var(--fg);
+}
+.job-actions button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+.job-actions button:hover { border-color: var(--accent); }
+.log-block {
+  background: var(--code-bg); padding: 12px; border-radius: 4px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px; line-height: 1.4; max-height: 240px;
+  overflow: auto; white-space: pre-wrap; word-break: break-all;
+}
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: 6px; vertical-align: middle; }
+.dot-on { background: #4caf50; }
+.dot-off { background: #999; }
+.dot-warn { background: #d97a4d; }
 </style>
 </head>
 <body>
@@ -1279,6 +1359,7 @@ main sub { color: var(--muted); font-size: 0.85em; }
   <h2>Manage</h2>
   <ul>
     <li{% if current == 'channels' %} class="active"{% endif %}><a href="/channels">Subscriptions ({{ channel_count }})</a></li>
+    <li{% if current == 'schedule' %} class="active"{% endif %}><a href="/schedule">Schedule</a></li>
   </ul>
 
   <h2>Meta-digests ({{ metas|length }})</h2>
@@ -1461,6 +1542,99 @@ def cmd_serve(args) -> int:
         channels = [c for c in read_channels() if c != url]
         write_channels(channels)
         return redirect(f"/channels?msg=Removed+{url}")
+
+    @app.route("/schedule")
+    def schedule_page():
+        from flask import request
+        from html import escape as h
+        flash = request.args.get("msg", "")
+        poll_status = _job_status(SCHEDULE_LABEL_POLL)
+        meta_status = _job_status(SCHEDULE_LABEL_META)
+        any_loaded = poll_status["loaded"] or meta_status["loaded"]
+
+        body = "<h1>Schedule</h1>"
+        if flash:
+            body += f'<div class="flash">{h(flash)}</div>'
+
+        # Top-level install/uninstall
+        if any_loaded:
+            body += (
+                '<form method="post" action="/schedule/uninstall" style="margin-bottom: 8px;">'
+                '<button type="submit" class="primary">Uninstall both jobs</button>'
+                '</form>'
+                '<p class="meta-info">Removes both launchd jobs. Stops scheduled polling and meta-digest runs.</p>'
+            )
+        else:
+            body += (
+                '<form method="post" action="/schedule/install" style="margin-bottom: 8px;">'
+                '<button type="submit" class="primary">Install both jobs</button>'
+                '</form>'
+                '<p class="meta-info">Adds two launchd agents: polling every 6h, meta-digest Sundays at 9am local time.</p>'
+            )
+
+        for label, status, run_key, desc in [
+            (SCHEDULE_LABEL_POLL, poll_status, "poll", "Polling — every 6 hours, fires <code>yt2md watch run</code>"),
+            (SCHEDULE_LABEL_META, meta_status, "meta", "Meta-digest — Sundays at 9am local, fires <code>yt2md meta run</code>"),
+        ]:
+            dot_class = "dot-on" if status["loaded"] else "dot-off"
+            body += f'<div class="job-block"><h3><span class="dot {dot_class}"></span>{h(label)}</h3>'
+            body += f'<p class="meta-info" style="margin: 0 0 8px;">{desc}</p>'
+
+            body += '<table class="status-table">'
+            body += f'<tr><td>plist exists</td><td>{status["plist_exists"]}</td></tr>'
+            body += f'<tr><td>loaded</td><td>{status["loaded"]}</td></tr>'
+            for k in ("state", "runs", "last_exit", "pid"):
+                v = status.get(k)
+                if v is not None:
+                    body += f'<tr><td>{k.replace("_", " ")}</td><td>{h(str(v))}</td></tr>'
+            body += '</table>'
+
+            if status["loaded"]:
+                body += (
+                    f'<div class="job-actions">'
+                    f'<form method="post" action="/schedule/run/{run_key}" style="margin:0;">'
+                    f'<button type="submit">Run now</button>'
+                    f'</form></div>'
+                )
+
+            log_path = data_dir / "logs" / f"{run_key}.log"
+            body += '<h4 style="margin: 12px 0 6px; font-size: 13px;">Recent log (last 20 lines)</h4>'
+            body += f'<div class="log-block">{h(_tail_log(log_path, 20))}</div>'
+            body += '</div>'
+
+        body += '<p class="meta-info">Refresh the page to see updated status after a run.</p>'
+        return page(body, title="Schedule", current="schedule")
+
+    @app.route("/schedule/install", methods=["POST"])
+    def schedule_install():
+        from flask import redirect
+        success, messages = _do_schedule_install()
+        msg = ("Installed: " + "; ".join(messages)) if success else f"Install failed: {messages[0]}"
+        return redirect(f"/schedule?msg={msg}")
+
+    @app.route("/schedule/uninstall", methods=["POST"])
+    def schedule_uninstall():
+        from flask import redirect
+        results = _do_schedule_uninstall()
+        msg = "Uninstalled: " + "; ".join(f"{lbl} ({act})" for lbl, act in results)
+        return redirect(f"/schedule?msg={msg}")
+
+    @app.route("/schedule/run/<job>", methods=["POST"])
+    def schedule_run(job):
+        from flask import redirect
+        label_map = {"poll": SCHEDULE_LABEL_POLL, "meta": SCHEDULE_LABEL_META}
+        if job not in label_map:
+            abort(404)
+        label = label_map[job]
+        result = subprocess.run(
+            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return redirect(f"/schedule?msg=Failed+to+trigger+{job}:+{result.stderr.strip()}")
+        return redirect(
+            f"/schedule?msg=Triggered+{job}+(refresh+in+a+few+seconds+to+see+log+update)"
+        )
 
     @app.route("/digests/<video_id>/")
     def view_digest(video_id):
