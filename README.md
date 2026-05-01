@@ -8,7 +8,7 @@ minutes. Topic-segmented summary, one representative frame per topic embedded as
 
 ```bash
 # Install (requires `uv` and `ffmpeg`)
-uv tool install --from git+https://github.com/<your-handle>/youtube-to-markdown yt2md
+uv tool install --from git+https://github.com/jyouturner/youtube-to-markdown yt2md
 
 # Run on a YouTube URL — that's it
 yt2md "https://youtu.be/nWzXyjXCoCE"
@@ -45,7 +45,7 @@ Two prerequisites: `uv` (https://docs.astral.sh/uv/) and `ffmpeg` (e.g.
 `brew install ffmpeg` on macOS).
 
 ```bash
-uv tool install --from git+https://github.com/<your-handle>/youtube-to-markdown yt2md
+uv tool install --from git+https://github.com/jyouturner/youtube-to-markdown yt2md
 ```
 
 This installs both `yt2md` (short) and `youtube-to-markdown` (long form) — the
