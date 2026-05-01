@@ -680,9 +680,498 @@ def write_markdown_digest(
     output_md.write_text("\n".join(lines).rstrip() + "\n")
 
 
+# ---------- Subcommands: watch / meta / schedule ----------
+
+DEFAULT_DATA_DIR = Path.home() / "yt2md"
+SCHEDULE_LABEL_POLL = "com.youtube-to-markdown.poll"
+SCHEDULE_LABEL_META = "com.youtube-to-markdown.meta"
+LATEST_LIMIT = 10
+MAX_NEW_PER_RUN = 3
+META_LOOKBACK_DAYS = 7
+META_MIN_DIGESTS = 2
+META_MODEL_DEFAULT = "claude-sonnet-4-6"
+
+
+def get_data_dir() -> Path:
+    return Path(os.environ.get("YT2MD_DATA", str(DEFAULT_DATA_DIR))).expanduser()
+
+
+def channels_file() -> Path:
+    return CONFIG_DIR / "channels.txt"
+
+
+def state_file() -> Path:
+    return CONFIG_DIR / "state.json"
+
+
+def read_channels() -> List[str]:
+    p = channels_file()
+    if not p.exists():
+        return []
+    return [
+        line.strip()
+        for line in p.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def write_channels(channels: List[str]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    body = "# YouTube channels to watch. One URL per line. Lines starting with # are ignored.\n"
+    body += "\n".join(channels) + ("\n" if channels else "")
+    channels_file().write_text(body)
+
+
+def load_state() -> dict:
+    p = state_file()
+    if not p.exists():
+        return {"channels": {}}
+    return json.loads(p.read_text())
+
+
+def save_state(state: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    state_file().write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+# ---- watch subcommands ----
+
+def cmd_watch_add(args) -> int:
+    url = args.url.strip()
+    if not is_url(url):
+        sys.exit(f"Not a URL: {url}")
+    channels = read_channels()
+    if url in channels:
+        print(f"Already watching: {url}")
+        return 0
+    channels.append(url)
+    write_channels(channels)
+    print(f"Added: {url}")
+    return 0
+
+
+def cmd_watch_list(args) -> int:
+    channels = read_channels()
+    if not channels:
+        print("No channels configured. Add one with: yt2md watch add <URL>")
+        return 0
+    print(f"Watching {len(channels)} channel(s):")
+    for ch in channels:
+        print(f"  {ch}")
+    print(f"\nConfig: {channels_file()}")
+    print(f"State:  {state_file()}")
+    print(f"Data:   {get_data_dir()}")
+    return 0
+
+
+def cmd_watch_remove(args) -> int:
+    url = args.url.strip()
+    channels = read_channels()
+    if url not in channels:
+        sys.exit(f"Not in list: {url}")
+    channels = [c for c in channels if c != url]
+    write_channels(channels)
+    print(f"Removed: {url}")
+    return 0
+
+
+def _list_channel_videos(url: str, limit: int = LATEST_LIMIT) -> List[str]:
+    out = subprocess.check_output(
+        ["yt-dlp", "--flat-playlist", "--playlist-end", str(limit), "--print", "%(id)s", url],
+        text=True,
+    )
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _digest_video(video_id: str, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    digest_path = output_dir / "digest.md"
+    yt2md = shutil.which("yt2md") or sys.argv[0]
+    subprocess.run(
+        [yt2md, f"https://youtu.be/{video_id}", "-o", str(digest_path)],
+        check=True,
+        cwd=output_dir,
+    )
+
+
+def cmd_watch_run(args) -> int:
+    ensure_api_key()
+    channels = read_channels()
+    if not channels:
+        print("No channels configured. Add one with: yt2md watch add <URL>")
+        return 0
+
+    data_dir = get_data_dir()
+    digests_dir = data_dir / "digests"
+    state = load_state()
+    any_failures = False
+
+    for channel_url in channels:
+        print(f"--- {channel_url}")
+        seen = set(state["channels"].get(channel_url, {}).get("seen", []))
+        latest_ids = _list_channel_videos(channel_url)
+
+        if not seen:
+            print(f"  first run, seeding state with {len(latest_ids)} videos (no backfill)")
+            state["channels"][channel_url] = {"seen": sorted(latest_ids)}
+            continue
+
+        new_ids = [vid for vid in latest_ids if vid not in seen][:MAX_NEW_PER_RUN]
+        if not new_ids:
+            print("  no new videos")
+            continue
+
+        print(f"  {len(new_ids)} new: {new_ids}")
+        for vid in reversed(new_ids):
+            print(f"  processing {vid}...")
+            try:
+                _digest_video(vid, digests_dir / vid)
+                seen.add(vid)
+                state["channels"][channel_url] = {"seen": sorted(seen)}
+                save_state(state)
+            except subprocess.CalledProcessError as e:
+                print(f"  FAILED on {vid}: {e}", file=sys.stderr)
+                any_failures = True
+
+    save_state(state)
+    return 1 if any_failures else 0
+
+
+# ---- meta subcommand ----
+
+META_SYSTEM_PROMPT = (
+    "You synthesize multiple video digests into a single readable cross-cutting "
+    "meta-digest. Match the tone of the source digests: direct, concrete, "
+    "reader-first. Quote real claims, name real people and products, cite real "
+    "numbers. This is synthesis, not summary of summaries — find the through-lines."
+)
+
+META_USER_PROMPT_TEMPLATE = """\
+Below are {n} video digests added or modified in the last {days} days. Produce a \
+~600–1000 word meta-digest with:
+
+1. A one-line teaser per video.
+2. 3–5 themes spanning multiple videos. Under each theme, weave together specific points across the digests, with backlinks to source digests using relative paths like `[Spiegel on distribution](../digests/-7Yol5vX5xw/digest.md)`.
+3. An optional final "Standout single-video items" section for anything notable that didn't fit a theme.
+
+Drop a theme rather than padding if it doesn't have substance. The output is the meta-digest itself — no preamble.
+
+---
+
+{digests}
+"""
+
+
+def _find_recent_digests(digests_dir: Path, lookback_days: int):
+    """Return list of (video_id, digest_path) for digests modified in lookback window."""
+    if not digests_dir.exists():
+        return []
+    import datetime as _dt
+    cutoff = _dt.datetime.now().timestamp() - lookback_days * 86400
+    results = []
+    for video_dir in sorted(digests_dir.iterdir()):
+        digest = video_dir / "digest.md"
+        if not video_dir.is_dir() or not digest.exists():
+            continue
+        if digest.stat().st_mtime >= cutoff:
+            results.append((video_dir.name, digest))
+    return results
+
+
+def cmd_meta_run(args) -> int:
+    ensure_api_key()
+    import datetime as _dt
+    import anthropic
+
+    data_dir = get_data_dir()
+    digests_dir = data_dir / "digests"
+    meta_dir = data_dir / "meta"
+
+    recent = _find_recent_digests(digests_dir, args.lookback_days)
+    if len(recent) < args.min_digests:
+        print(
+            f"Only {len(recent)} digest(s) modified in the last {args.lookback_days} days "
+            f"(need at least {args.min_digests}). Skipping."
+        )
+        return 0
+
+    sections = []
+    for vid, path in recent:
+        sections.append(
+            f"## Video {vid}\n\nSource path: digests/{vid}/digest.md\n\n{path.read_text()}"
+        )
+    digests_blob = "\n\n---\n\n".join(sections)
+    user_text = META_USER_PROMPT_TEMPLATE.format(
+        n=len(recent), days=args.lookback_days, digests=digests_blob
+    )
+
+    iso_year, iso_week, _ = _dt.datetime.now().isocalendar()
+    out_path = meta_dir / f"{iso_year}-W{iso_week:02d}.md"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Synthesizing {len(recent)} digests with {args.model} -> {out_path}")
+    for vid, _p in recent:
+        print(f"  - {vid}")
+
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model=args.model,
+        max_tokens=8000,
+        system=META_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": [{
+            "type": "text",
+            "text": user_text,
+            "cache_control": {"type": "ephemeral"},
+        }]}],
+    )
+    text = next(b.text for b in response.content if b.type == "text")
+    out_path.write_text(text.rstrip() + "\n")
+
+    print(f"Wrote {out_path} ({len(text)} chars)")
+    print(
+        f"Tokens: input={response.usage.input_tokens}, "
+        f"output={response.usage.output_tokens}, "
+        f"cache_read={getattr(response.usage, 'cache_read_input_tokens', 0)}"
+    )
+    return 0
+
+
+# ---- schedule subcommands ----
+
+LAUNCHD_DIR = Path.home() / "Library" / "LaunchAgents"
+
+
+def _launchd_path_value() -> str:
+    """PATH for launchd-spawned processes (HOME-anchored, includes uv-tool bin and brew)."""
+    home = str(Path.home())
+    return ":".join([
+        f"{home}/.local/bin",
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    ])
+
+
+def _make_poll_plist(yt2md_path: str, data_dir: Path) -> str:
+    log_path = data_dir / "logs" / "poll.log"
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{SCHEDULE_LABEL_POLL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{yt2md_path}</string>
+        <string>watch</string>
+        <string>run</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>21600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>{log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>{log_path}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{_launchd_path_value()}</string>
+        <key>YT2MD_DATA</key>
+        <string>{data_dir}</string>
+        <key>HOME</key>
+        <string>{Path.home()}</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>
+"""
+
+
+def _make_meta_plist(yt2md_path: str, data_dir: Path) -> str:
+    log_path = data_dir / "logs" / "meta.log"
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{SCHEDULE_LABEL_META}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{yt2md_path}</string>
+        <string>meta</string>
+        <string>run</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>{log_path}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{_launchd_path_value()}</string>
+        <key>YT2MD_DATA</key>
+        <string>{data_dir}</string>
+        <key>HOME</key>
+        <string>{Path.home()}</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>
+"""
+
+
+def cmd_schedule_install(args) -> int:
+    yt2md_path = shutil.which("yt2md")
+    if not yt2md_path:
+        sys.exit("Could not find yt2md on PATH. Install with: uv tool install ...")
+    for tool in ("yt-dlp", "ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            sys.exit(f"Required tool '{tool}' is not on PATH.")
+
+    data_dir = get_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "logs").mkdir(parents=True, exist_ok=True)
+    LAUNCHD_DIR.mkdir(parents=True, exist_ok=True)
+
+    plists = [
+        (SCHEDULE_LABEL_POLL, _make_poll_plist(yt2md_path, data_dir),
+         "polling job (every 6 hours)"),
+        (SCHEDULE_LABEL_META, _make_meta_plist(yt2md_path, data_dir),
+         "meta-digest (Sundays at 9am local)"),
+    ]
+
+    print(f"Installing 2 launchd jobs (yt2md = {yt2md_path}, data dir = {data_dir})")
+    for label, content, desc in plists:
+        plist_path = LAUNCHD_DIR / f"{label}.plist"
+        plist_path.write_text(content)
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist_path)],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)],
+            check=True,
+        )
+        print(f"  ✓ {label} — {desc}")
+
+    print(
+        f"\nLogs:\n"
+        f"  tail -f {data_dir/'logs'/'poll.log'}\n"
+        f"  tail -f {data_dir/'logs'/'meta.log'}\n"
+        f"\nManually trigger:\n"
+        f"  launchctl kickstart -k \"gui/$(id -u)/{SCHEDULE_LABEL_POLL}\"\n"
+        f"  launchctl kickstart -k \"gui/$(id -u)/{SCHEDULE_LABEL_META}\"\n"
+        f"\nUninstall:\n"
+        f"  yt2md schedule uninstall"
+    )
+    return 0
+
+
+def cmd_schedule_uninstall(args) -> int:
+    for label in (SCHEDULE_LABEL_POLL, SCHEDULE_LABEL_META):
+        plist_path = LAUNCHD_DIR / f"{label}.plist"
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist_path)],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if plist_path.exists():
+            plist_path.unlink()
+            print(f"  ✓ removed {label}")
+        else:
+            print(f"  - {label} was not installed")
+    return 0
+
+
+def cmd_schedule_status(args) -> int:
+    for label in (SCHEDULE_LABEL_POLL, SCHEDULE_LABEL_META):
+        print(f"--- {label}")
+        result = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print("  not loaded")
+            continue
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if any(k in line for k in ("state =", "runs =", "last exit code", "pid =", "next run")):
+                print(f"  {line}")
+    return 0
+
+
+# ---- subcommand dispatcher ----
+
+def _subcommand_main(argv: List[str]) -> int:
+    """Handle yt2md {watch,meta,schedule} ..."""
+    ap = argparse.ArgumentParser(prog="yt2md", description="yt2md subcommands")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    watch = sub.add_parser("watch", help="Manage watched channels and run polling")
+    watch_sub = watch.add_subparsers(dest="watch_cmd", required=True)
+    p = watch_sub.add_parser("add", help="Add a channel URL"); p.add_argument("url")
+    p.set_defaults(func=cmd_watch_add)
+    p = watch_sub.add_parser("list", help="List watched channels"); p.set_defaults(func=cmd_watch_list)
+    p = watch_sub.add_parser("remove", help="Remove a channel URL"); p.add_argument("url")
+    p.set_defaults(func=cmd_watch_remove)
+    p = watch_sub.add_parser("run", help="Poll all channels and digest new videos")
+    p.set_defaults(func=cmd_watch_run)
+
+    meta = sub.add_parser("meta", help="Generate cross-cutting meta-digests")
+    meta_sub = meta.add_subparsers(dest="meta_cmd", required=True)
+    p = meta_sub.add_parser("run", help="Synthesize a meta-digest of recent digests")
+    p.add_argument("--lookback-days", type=int, default=META_LOOKBACK_DAYS,
+                   help=f"Window in days (default: {META_LOOKBACK_DAYS})")
+    p.add_argument("--min-digests", type=int, default=META_MIN_DIGESTS,
+                   help=f"Skip if fewer than this many recent digests (default: {META_MIN_DIGESTS})")
+    p.add_argument("--model", default=META_MODEL_DEFAULT,
+                   help=f"Claude model (default: {META_MODEL_DEFAULT})")
+    p.set_defaults(func=cmd_meta_run)
+
+    schedule = sub.add_parser("schedule", help="Install/uninstall launchd jobs")
+    sched_sub = schedule.add_subparsers(dest="schedule_cmd", required=True)
+    p = sched_sub.add_parser("install", help="Install both launchd jobs")
+    p.set_defaults(func=cmd_schedule_install)
+    p = sched_sub.add_parser("uninstall", help="Remove both launchd jobs")
+    p.set_defaults(func=cmd_schedule_uninstall)
+    p = sched_sub.add_parser("status", help="Show launchd job status")
+    p.set_defaults(func=cmd_schedule_status)
+
+    args = ap.parse_args(argv)
+    return args.func(args)
+
+
 # ---------- Main ----------
 
 def main():
+    # Subcommand dispatch — short-circuit the single-video flow when the user
+    # invokes yt2md watch / meta / schedule.
+    if len(sys.argv) > 1 and sys.argv[1] in ("watch", "meta", "schedule"):
+        load_env_files()
+        sys.exit(_subcommand_main(sys.argv[1:]))
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("video", help="Input MP4 file path OR a YouTube URL (auto-downloads mp4 + SRT)")
     ap.add_argument("srt", nargs="?", default=None,
