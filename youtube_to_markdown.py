@@ -980,7 +980,54 @@ def _launchd_path_value() -> str:
     ])
 
 
-def _make_poll_plist(yt2md_path: str, data_dir: Path) -> str:
+DEFAULT_SCHEDULE_CONFIG = {
+    "poll_interval_hours": 6,
+    "meta_frequency": "weekly",   # "daily" or "weekly"
+    "meta_weekday": 0,            # 0=Sun ... 6=Sat (only used when weekly)
+    "meta_hour": 9,
+    "meta_minute": 0,
+}
+
+
+def _schedule_config_file() -> Path:
+    return get_data_dir() / "schedule.json"
+
+
+def load_schedule_config() -> dict:
+    p = _schedule_config_file()
+    if not p.exists():
+        return dict(DEFAULT_SCHEDULE_CONFIG)
+    try:
+        cfg = json.loads(p.read_text())
+        merged = dict(DEFAULT_SCHEDULE_CONFIG)
+        merged.update({k: v for k, v in cfg.items() if k in DEFAULT_SCHEDULE_CONFIG})
+        return merged
+    except Exception:
+        return dict(DEFAULT_SCHEDULE_CONFIG)
+
+
+def save_schedule_config(cfg: dict) -> None:
+    get_data_dir().mkdir(parents=True, exist_ok=True)
+    _schedule_config_file().write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def _format_schedule_summary(cfg: dict) -> str:
+    """Human-readable description of the schedule config."""
+    poll = cfg["poll_interval_hours"]
+    poll_str = f"every {poll} hour{'s' if poll != 1 else ''}"
+    weekday_names = ["Sundays", "Mondays", "Tuesdays", "Wednesdays",
+                     "Thursdays", "Fridays", "Saturdays"]
+    time_str = f"{cfg['meta_hour']:02d}:{cfg['meta_minute']:02d}"
+    if cfg["meta_frequency"] == "daily":
+        meta_str = f"daily at {time_str} local"
+    else:
+        meta_str = f"{weekday_names[cfg['meta_weekday']]} at {time_str} local"
+    return f"polling {poll_str}, meta-digest {meta_str}"
+
+
+def _make_poll_plist(yt2md_path: str, data_dir: Path, cfg: dict = None) -> str:
+    cfg = cfg or DEFAULT_SCHEDULE_CONFIG
+    interval_seconds = max(60, int(cfg["poll_interval_hours"] * 3600))
     log_path = data_dir / "logs" / "poll.log"
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -997,7 +1044,7 @@ def _make_poll_plist(yt2md_path: str, data_dir: Path) -> str:
     </array>
 
     <key>StartInterval</key>
-    <integer>21600</integer>
+    <integer>{interval_seconds}</integer>
 
     <key>RunAtLoad</key>
     <true/>
@@ -1023,8 +1070,20 @@ def _make_poll_plist(yt2md_path: str, data_dir: Path) -> str:
 """
 
 
-def _make_meta_plist(yt2md_path: str, data_dir: Path) -> str:
+def _make_meta_plist(yt2md_path: str, data_dir: Path, cfg: dict = None) -> str:
+    cfg = cfg or DEFAULT_SCHEDULE_CONFIG
     log_path = data_dir / "logs" / "meta.log"
+    if cfg["meta_frequency"] == "daily":
+        cal_inner = (
+            f"        <key>Hour</key>\n        <integer>{int(cfg['meta_hour'])}</integer>\n"
+            f"        <key>Minute</key>\n        <integer>{int(cfg['meta_minute'])}</integer>"
+        )
+    else:
+        cal_inner = (
+            f"        <key>Weekday</key>\n        <integer>{int(cfg['meta_weekday'])}</integer>\n"
+            f"        <key>Hour</key>\n        <integer>{int(cfg['meta_hour'])}</integer>\n"
+            f"        <key>Minute</key>\n        <integer>{int(cfg['meta_minute'])}</integer>"
+        )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1041,12 +1100,7 @@ def _make_meta_plist(yt2md_path: str, data_dir: Path) -> str:
 
     <key>StartCalendarInterval</key>
     <dict>
-        <key>Weekday</key>
-        <integer>0</integer>
-        <key>Hour</key>
-        <integer>9</integer>
-        <key>Minute</key>
-        <integer>0</integer>
+{cal_inner}
     </dict>
 
     <key>StandardOutPath</key>
@@ -1070,8 +1124,10 @@ def _make_meta_plist(yt2md_path: str, data_dir: Path) -> str:
 """
 
 
-def _do_schedule_install():
-    """Install both launchd jobs. Returns (success, list_of_messages)."""
+def _do_schedule_install(cfg: dict = None):
+    """Install both launchd jobs using cfg (or saved config). Returns (success, messages)."""
+    if cfg is None:
+        cfg = load_schedule_config()
     yt2md_path = shutil.which("yt2md")
     if not yt2md_path:
         return False, ["yt2md not found on PATH (install with `uv tool install ...`)"]
@@ -1083,10 +1139,19 @@ def _do_schedule_install():
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "logs").mkdir(parents=True, exist_ok=True)
     LAUNCHD_DIR.mkdir(parents=True, exist_ok=True)
+    save_schedule_config(cfg)
+
+    poll_desc = f"polling every {cfg['poll_interval_hours']}h"
+    if cfg["meta_frequency"] == "daily":
+        meta_desc = f"meta-digest daily at {cfg['meta_hour']:02d}:{cfg['meta_minute']:02d}"
+    else:
+        weekday_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        meta_desc = (f"meta-digest {weekday_names[cfg['meta_weekday']]}s "
+                     f"at {cfg['meta_hour']:02d}:{cfg['meta_minute']:02d}")
 
     plists = [
-        (SCHEDULE_LABEL_POLL, _make_poll_plist(yt2md_path, data_dir), "polling job (every 6 hours)"),
-        (SCHEDULE_LABEL_META, _make_meta_plist(yt2md_path, data_dir), "meta-digest (Sundays at 9am local)"),
+        (SCHEDULE_LABEL_POLL, _make_poll_plist(yt2md_path, data_dir, cfg), poll_desc),
+        (SCHEDULE_LABEL_META, _make_meta_plist(yt2md_path, data_dir, cfg), meta_desc),
     ]
     messages = []
     for label, content, desc in plists:
@@ -1207,13 +1272,29 @@ def _tail_log(path: Path, n: int = 20) -> str:
 
 
 def cmd_schedule_install(args) -> int:
-    success, messages = _do_schedule_install()
+    cfg = load_schedule_config()
+    if args.poll_hours is not None:
+        cfg["poll_interval_hours"] = args.poll_hours
+    if args.meta_frequency is not None:
+        cfg["meta_frequency"] = args.meta_frequency
+    if args.meta_time is not None:
+        try:
+            h, m = args.meta_time.split(":")
+            cfg["meta_hour"] = int(h)
+            cfg["meta_minute"] = int(m)
+        except Exception:
+            sys.exit(f"--meta-time must be HH:MM, got: {args.meta_time}")
+    if args.meta_weekday is not None:
+        cfg["meta_weekday"] = args.meta_weekday
+
+    success, messages = _do_schedule_install(cfg)
     if not success:
         sys.exit(messages[0])
     data_dir = get_data_dir()
     print(f"Installed 2 launchd jobs (data dir = {data_dir})")
     for m in messages:
         print(f"  ✓ {m}")
+    print(f"\nSchedule config saved to {_schedule_config_file()}")
     print(
         f"\nLogs:\n"
         f"  tail -f {data_dir/'logs'/'poll.log'}\n"
@@ -1493,6 +1574,28 @@ main sub { color: var(--muted); font-size: 0.85em; }
 }
 .next-step strong { color: var(--accent); }
 .next-step a { color: var(--accent); }
+.schedule-form {
+  background: var(--sidebar-bg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 16px 20px; margin: 16px 0;
+}
+.schedule-fields {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px 20px; margin-bottom: 16px;
+}
+.schedule-fields label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 12px; color: var(--muted); text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.schedule-fields input, .schedule-fields select {
+  padding: 8px 10px; font-size: 14px; border: 1px solid var(--border);
+  border-radius: 4px; background: var(--bg); color: var(--fg);
+  font-family: inherit; text-transform: none; letter-spacing: normal;
+}
+.schedule-fields .suffix {
+  position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+  color: var(--muted); font-size: 12px; pointer-events: none;
+}
 .status-table { width: 100%; border-collapse: collapse; font-size: 13px;
   margin: 12px 0 16px; }
 .status-table td { padding: 6px 12px; border-bottom: 1px solid var(--border); }
@@ -1895,6 +1998,7 @@ def cmd_serve(args) -> int:
         from flask import request
         from html import escape as h
         flash = request.args.get("msg", "")
+        cfg = load_schedule_config()
         poll_status = _job_status(SCHEDULE_LABEL_POLL)
         meta_status = _job_status(SCHEDULE_LABEL_META)
         any_loaded = poll_status["loaded"] or meta_status["loaded"]
@@ -1903,21 +2007,48 @@ def cmd_serve(args) -> int:
         if flash:
             body += f'<div class="flash">{h(flash)}</div>'
 
-        # Top-level install/uninstall
+        # Configurable schedule form — same form for install and reconfigure.
+        weekday_opts = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        body += '<form method="post" action="/schedule/install" class="schedule-form">'
+        body += '<div class="schedule-fields">'
+        body += '<label>Polling interval'
+        body += f'  <input type="number" name="poll_hours" value="{cfg["poll_interval_hours"]}" min="0.1" step="0.1" required>'
+        body += '  <span class="suffix">hours</span>'
+        body += '</label>'
+
+        body += '<label>Meta-digest frequency'
+        body += '  <select name="meta_frequency">'
+        for opt in ("daily", "weekly"):
+            sel = ' selected' if cfg["meta_frequency"] == opt else ''
+            body += f'    <option value="{opt}"{sel}>{opt}</option>'
+        body += '  </select>'
+        body += '</label>'
+
+        body += '<label class="weekday-label">Day of week'
+        body += '  <select name="meta_weekday">'
+        for i, name in enumerate(weekday_opts):
+            sel = ' selected' if cfg["meta_weekday"] == i else ''
+            body += f'    <option value="{i}"{sel}>{name}</option>'
+        body += '  </select>'
+        body += '</label>'
+
+        body += '<label>Time'
+        body += f'  <input type="time" name="meta_time" value="{cfg["meta_hour"]:02d}:{cfg["meta_minute"]:02d}" required>'
+        body += '</label>'
+        body += '</div>'  # schedule-fields
+
+        action = "Save & reinstall" if any_loaded else "Install both jobs"
+        body += f'<button type="submit" class="primary">{action}</button>'
         if any_loaded:
             body += (
-                '<form method="post" action="/schedule/uninstall" style="margin-bottom: 8px;">'
-                '<button type="submit" class="primary">Uninstall both jobs</button>'
-                '</form>'
-                '<p class="meta-info">Removes both launchd jobs. Stops scheduled polling and meta-digest runs.</p>'
+                '<form method="post" action="/schedule/uninstall" style="display:inline; margin-left: 8px;">'
+                '<button type="submit">Uninstall</button></form>'
             )
-        else:
-            body += (
-                '<form method="post" action="/schedule/install" style="margin-bottom: 8px;">'
-                '<button type="submit" class="primary">Install both jobs</button>'
-                '</form>'
-                '<p class="meta-info">Adds two launchd agents: polling every 6h, meta-digest Sundays at 9am local time.</p>'
-            )
+        body += '</form>'
+
+        body += (
+            f'<p class="meta-info">Current schedule: {h(_format_schedule_summary(cfg))}.</p>'
+        )
 
         for label, status, run_key, friendly, desc in [
             (SCHEDULE_LABEL_POLL, poll_status, "poll", "Polling",
@@ -1961,8 +2092,23 @@ def cmd_serve(args) -> int:
 
     @app.route("/schedule/install", methods=["POST"])
     def schedule_install():
-        from flask import redirect
-        success, messages = _do_schedule_install()
+        from flask import redirect, request
+        cfg = load_schedule_config()
+        # Form fields override the saved config (when present).
+        try:
+            if request.form.get("poll_hours"):
+                cfg["poll_interval_hours"] = float(request.form["poll_hours"])
+            if request.form.get("meta_frequency") in ("daily", "weekly"):
+                cfg["meta_frequency"] = request.form["meta_frequency"]
+            if request.form.get("meta_weekday"):
+                cfg["meta_weekday"] = int(request.form["meta_weekday"])
+            if request.form.get("meta_time"):
+                h_, m_ = request.form["meta_time"].split(":")
+                cfg["meta_hour"] = int(h_)
+                cfg["meta_minute"] = int(m_)
+        except Exception as e:
+            return redirect(f"/schedule?msg=Invalid+input:+{e}")
+        success, messages = _do_schedule_install(cfg)
         _invalidate_status_cache()
         msg = ("Installed: " + "; ".join(messages)) if success else f"Install failed: {messages[0]}"
         return redirect(f"/schedule?msg={msg}")
@@ -2080,7 +2226,15 @@ def _subcommand_main(argv: List[str]) -> int:
 
     schedule = sub.add_parser("schedule", help="Install/uninstall launchd jobs")
     sched_sub = schedule.add_subparsers(dest="schedule_cmd", required=True)
-    p = sched_sub.add_parser("install", help="Install both launchd jobs")
+    p = sched_sub.add_parser("install", help="Install both launchd jobs (saves config to ~/yt2md/schedule.json)")
+    p.add_argument("--poll-hours", type=float, default=None, metavar="N",
+                   help="Polling interval in hours (default: 6, or last saved value)")
+    p.add_argument("--meta-frequency", choices=["daily", "weekly"], default=None,
+                   help="Meta-digest cadence (default: weekly)")
+    p.add_argument("--meta-weekday", type=int, choices=range(7), default=None, metavar="N",
+                   help="Day of week for weekly meta-digest: 0=Sun ... 6=Sat (default: 0)")
+    p.add_argument("--meta-time", type=str, default=None, metavar="HH:MM",
+                   help="Time of day for meta-digest (default: 09:00)")
     p.set_defaults(func=cmd_schedule_install)
     p = sched_sub.add_parser("uninstall", help="Remove both launchd jobs")
     p.set_defaults(func=cmd_schedule_uninstall)
