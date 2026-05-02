@@ -1323,6 +1323,36 @@ def cmd_schedule_status(args) -> int:
     return 0
 
 
+# ---- one-off digest jobs (in-memory tracking; cheap) ----
+
+# Module-level dict: PID -> {"video_id": str, "started": float, "url": str}.
+# Lost on server restart, which is fine — the digest still completes (detached
+# subprocess) and shows up in the sidebar when done.
+_oneoff_jobs: dict = {}
+
+
+_VIDEO_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})")
+
+
+def extract_video_id(url: str) -> str:
+    """Pull a YouTube video ID from common URL forms. Returns '' if not found."""
+    m = _VIDEO_ID_RE.search(url)
+    return m.group(1) if m else ""
+
+
+def _list_active_oneoff_jobs() -> list:
+    """Return one-off jobs whose subprocesses are still alive."""
+    active = []
+    for pid in list(_oneoff_jobs.keys()):
+        try:
+            os.kill(pid, 0)  # zero-signal probes liveness without killing
+            info = _oneoff_jobs[pid]
+            active.append({"pid": pid, **info})
+        except (ProcessLookupError, PermissionError):
+            del _oneoff_jobs[pid]
+    return active
+
+
 # ---- read-state library (SQLite-backed) ----
 
 def _library_path() -> Path:
@@ -1680,6 +1710,7 @@ details[open] summary { margin-bottom: 8px; }
   <h2>Manage</h2>
   <ul>
     <li{% if current == 'channels' %} class="active"{% endif %}><a href="/channels">Subscriptions ({{ channel_count }})</a></li>
+    <li{% if current == 'one-off' %} class="active"{% endif %}><a href="/one-off">One-off digest</a></li>
     <li{% if current == 'schedule' %} class="active"{% endif %}><a href="/schedule">Schedule</a></li>
   </ul>
   </nav>
@@ -2137,6 +2168,113 @@ def cmd_serve(args) -> int:
             return redirect(f"/schedule?msg=Failed+to+trigger+{job}:+{result.stderr.strip()}")
         return redirect(
             f"/schedule?msg=Triggered+{job}+(refresh+in+a+few+seconds+to+see+log+update)"
+        )
+
+    @app.route("/one-off", methods=["GET"])
+    def one_off_page():
+        from flask import request
+        from html import escape as h
+        flash = request.args.get("msg", "")
+        active = _list_active_oneoff_jobs()
+
+        body = "<h1>One-off digest</h1>"
+        if flash:
+            body += f'<div class="flash">{h(flash)}</div>'
+        body += (
+            '<p class="meta-info">Paste a YouTube video URL. The digest runs in the '
+            'background and lands in your library when complete (1–25 min depending on '
+            'video length and the vision pass). You can close this tab — it keeps running.</p>'
+        )
+        body += (
+            '<form method="post" action="/one-off" class="add-form">'
+            '<label for="video-url" class="sr-only">YouTube video URL</label>'
+            '<input id="video-url" type="text" name="url" '
+            'placeholder="https://youtu.be/... (or full watch URL)" '
+            'autofocus required>'
+            '<button type="submit">Digest</button>'
+            '</form>'
+        )
+
+        if active:
+            body += "<h2>In progress</h2><ul class='channel-list'>"
+            import time as _t
+            for j in active:
+                elapsed = int(_t.time() - j["started"])
+                body += (
+                    '<li>'
+                    f'<span class="url"><strong>{h(j["video_id"])}</strong> · '
+                    f'{h(j["url"])}</span>'
+                    f'<span style="color: var(--muted); font-size: 12px;">{elapsed//60}m {elapsed%60}s</span>'
+                    '</li>'
+                )
+            body += "</ul>"
+
+        body += (
+            "<p class='meta-info' style='margin-top: 32px;'>"
+            "One-off digests share the same library as subscription mode. "
+            "They appear in the sidebar's <strong>Digests</strong> section once ready."
+            "</p>"
+        )
+        return page(body, title="One-off digest", current="one-off")
+
+    @app.route("/one-off", methods=["POST"])
+    def one_off_submit():
+        from flask import redirect, request
+        import time as _t
+        url = request.form.get("url", "").strip()
+        if not url:
+            return redirect("/one-off?msg=URL+is+required")
+
+        video_id = extract_video_id(url)
+        if not video_id:
+            return redirect(
+                f"/one-off?msg=Couldn%27t+extract+a+YouTube+video+ID+from:+{url}"
+            )
+
+        # Already in library? Send them straight to the existing digest.
+        existing = digests_dir / video_id / "digest.md"
+        if existing.exists():
+            return redirect(f"/digests/{video_id}/")
+
+        # Already in progress? Show the page with a message rather than re-firing.
+        for active in _list_active_oneoff_jobs():
+            if active["video_id"] == video_id:
+                return redirect(f"/one-off?msg=Already+digesting+{video_id}")
+
+        # Fire and forget. start_new_session=True detaches the child so it survives
+        # if the web server is killed. stdout/stderr go to oneoff.log.
+        digest_path = digests_dir / video_id / "digest.md"
+        digest_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path = data_dir / "logs" / "oneoff.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_fd = open(log_path, "a")
+        log_fd.write(f"\n===== {_t.strftime('%Y-%m-%d %H:%M:%S')} starting {video_id} ({url}) =====\n")
+        log_fd.flush()
+
+        yt2md_path = shutil.which("yt2md")
+        if not yt2md_path:
+            log_fd.close()
+            return redirect("/one-off?msg=yt2md+not+on+PATH")
+
+        try:
+            proc = subprocess.Popen(
+                [yt2md_path, url, "-o", str(digest_path)],
+                cwd=digest_path.parent,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            # Subprocess holds its own copy of the fd; safe for us to close.
+            log_fd.close()
+
+        _oneoff_jobs[proc.pid] = {
+            "video_id": video_id,
+            "started": _t.time(),
+            "url": url,
+        }
+        return redirect(
+            f"/one-off?msg=Started+digesting+{video_id}+(check+sidebar+in+a+few+minutes)"
         )
 
     @app.route("/digests/<video_id>/")
