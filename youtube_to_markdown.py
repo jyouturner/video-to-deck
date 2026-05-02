@@ -679,7 +679,10 @@ def write_markdown_digest(
         lines.append(f"## {topic.title}  <sub>*{ts}*</sub>")
         lines.append("")
         if topic_images[i] is not None:
-            lines.append(f'<img src="{rel_dir}/{topic_images[i].name}" width="800">')
+            # Use the topic title as alt text — accessible to screen readers and
+            # readable as a fallback if the image fails to load.
+            alt = topic.title.replace('"', "'")
+            lines.append(f'<img src="{rel_dir}/{topic_images[i].name}" alt="{alt}" width="800">')
             lines.append("")
         lines.append(topic.summary)
         lines.append("")
@@ -1120,8 +1123,27 @@ def _do_schedule_uninstall():
     return results
 
 
+_STATUS_CACHE: dict = {}  # label -> (expires_at, info_dict)
+_STATUS_TTL = 30.0  # seconds
+
+
+def _invalidate_status_cache() -> None:
+    _STATUS_CACHE.clear()
+
+
 def _job_status(label: str) -> dict:
-    """Return loaded/state/runs/last_exit for a launchd label."""
+    """Return loaded/state/runs/last_exit for a launchd label.
+
+    Cached for ~30 seconds — `launchctl print` shells out and is the slowest
+    thing the schedule page does. Mutating actions (install/uninstall/run-now)
+    must call _invalidate_status_cache() so users see fresh data after acting.
+    """
+    import time
+    now = time.time()
+    cached = _STATUS_CACHE.get(label)
+    if cached and cached[0] > now:
+        return cached[1]
+
     plist_path = LAUNCHD_DIR / f"{label}.plist"
     info = {
         "label": label,
@@ -1136,19 +1158,20 @@ def _job_status(label: str) -> dict:
         ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
         capture_output=True, text=True,
     )
-    if result.returncode != 0:
-        return info
-    info["loaded"] = True
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("state ="):
-            info["state"] = line.split("=", 1)[1].strip()
-        elif line.startswith("runs ="):
-            info["runs"] = line.split("=", 1)[1].strip()
-        elif line.startswith("last exit code ="):
-            info["last_exit"] = line.split("=", 1)[1].strip()
-        elif line.startswith("pid ="):
-            info["pid"] = line.split("=", 1)[1].strip()
+    if result.returncode == 0:
+        info["loaded"] = True
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("state ="):
+                info["state"] = line.split("=", 1)[1].strip()
+            elif line.startswith("runs ="):
+                info["runs"] = line.split("=", 1)[1].strip()
+            elif line.startswith("last exit code ="):
+                info["last_exit"] = line.split("=", 1)[1].strip()
+            elif line.startswith("pid ="):
+                info["pid"] = line.split("=", 1)[1].strip()
+
+    _STATUS_CACHE[label] = (now + _STATUS_TTL, info)
     return info
 
 
@@ -1219,6 +1242,60 @@ def cmd_schedule_status(args) -> int:
     return 0
 
 
+# ---- read-state library (SQLite-backed) ----
+
+def _library_path() -> Path:
+    return get_data_dir() / "library.db"
+
+
+def _library_connect():
+    """Open (and lazily migrate) the read-state SQLite database."""
+    import sqlite3
+    get_data_dir().mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(_library_path())
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS digest_reads (
+            digest_id TEXT PRIMARY KEY,
+            opened_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS meta_reads (
+            week TEXT PRIMARY KEY,
+            opened_at INTEGER NOT NULL
+        );
+    """)
+    return conn
+
+
+def _mark_digest_read(digest_id: str) -> None:
+    import time
+    with _library_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO digest_reads(digest_id, opened_at) VALUES (?, ?)",
+            (digest_id, int(time.time())),
+        )
+
+
+def _mark_meta_read(week: str) -> None:
+    import time
+    with _library_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta_reads(week, opened_at) VALUES (?, ?)",
+            (week, int(time.time())),
+        )
+
+
+def _read_digest_ids() -> set:
+    with _library_connect() as conn:
+        rows = conn.execute("SELECT digest_id FROM digest_reads").fetchall()
+        return {r[0] for r in rows}
+
+
+def _read_meta_weeks() -> set:
+    with _library_connect() as conn:
+        rows = conn.execute("SELECT week FROM meta_reads").fetchall()
+        return {r[0] for r in rows}
+
+
 # ---- serve subcommand (local reader UI) ----
 
 SERVE_PAGE_TEMPLATE = """<!doctype html>
@@ -1228,6 +1305,12 @@ SERVE_PAGE_TEMPLATE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ title }} — yt2md</title>
 {% if base_href %}<base href="{{ base_href }}">{% endif %}
+<script>
+(function() {
+  const stored = localStorage.getItem('yt2md-theme');
+  if (stored) document.documentElement.setAttribute('data-theme', stored);
+})();
+</script>
 <style>
 :root {
   --bg: #fafaf7;
@@ -1239,7 +1322,7 @@ SERVE_PAGE_TEMPLATE = """<!doctype html>
   --code-bg: #ececea;
 }
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #1a1a1a;
     --fg: #e8e8e8;
     --muted: #999;
@@ -1248,6 +1331,15 @@ SERVE_PAGE_TEMPLATE = """<!doctype html>
     --sidebar-bg: #141414;
     --code-bg: #232323;
   }
+}
+:root[data-theme="dark"] {
+  --bg: #1a1a1a;
+  --fg: #e8e8e8;
+  --muted: #999;
+  --accent: #d97a4d;
+  --border: #2e2e2e;
+  --sidebar-bg: #141414;
+  --code-bg: #232323;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; }
@@ -1296,7 +1388,19 @@ aside li a:hover { background: rgba(0,0,0,0.05); }
   aside li a:hover { background: rgba(255,255,255,0.05); }
 }
 aside li.active a { background: var(--accent); color: white; }
+aside li.unread a { font-weight: 600; }
 aside .empty { color: var(--muted); font-size: 13px; padding: 6px 8px; }
+aside .unread-count {
+  display: inline-block; padding: 2px 7px; background: var(--accent); color: white;
+  border-radius: 10px; font-size: 11px; font-weight: 600;
+  text-transform: none; letter-spacing: 0; margin-left: 4px;
+}
+aside .unread-dot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); margin-right: 6px; vertical-align: middle;
+}
+aside .meta-card.unread { border-color: var(--accent); }
+aside .meta-card.unread .week { font-weight: 700; }
 aside .meta-card {
   display: block; padding: 10px 12px; border-radius: 4px;
   border: 1px solid var(--border); margin-bottom: 6px;
@@ -1374,6 +1478,13 @@ main sub { color: var(--muted); font-size: 0.85em; }
 .channel-list button:hover { color: var(--accent); border-color: var(--accent); }
 .flash { padding: 10px 14px; border-radius: 4px; margin: 16px 0;
   background: var(--code-bg); border-left: 3px solid var(--accent); }
+.next-step {
+  padding: 14px 18px; border-radius: 6px; margin: 16px 0 24px;
+  background: var(--sidebar-bg); border: 1px solid var(--border);
+  border-left: 3px solid var(--accent); font-size: 14px; line-height: 1.5;
+}
+.next-step strong { color: var(--accent); }
+.next-step a { color: var(--accent); }
 .status-table { width: 100%; border-collapse: collapse; font-size: 13px;
   margin: 12px 0 16px; }
 .status-table td { padding: 6px 12px; border-bottom: 1px solid var(--border); }
@@ -1409,38 +1520,80 @@ details[open] summary { margin-bottom: 8px; }
 .dot-on { background: #4caf50; }
 .dot-off { background: #999; }
 .dot-warn { background: #d97a4d; }
+
+/* Accessibility: skip to content for keyboard users */
+.skip-link {
+  position: absolute; left: -1000px; top: 0; padding: 8px 12px;
+  background: var(--accent); color: white; text-decoration: none;
+  border-radius: 0 0 4px 0; z-index: 100;
+}
+.skip-link:focus { left: 0; }
+
+/* Form labels (visually hidden, exposed to screen readers) */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+}
+
+/* Theme toggle button */
+.theme-toggle {
+  position: fixed; top: 16px; right: 16px; z-index: 50;
+  background: var(--sidebar-bg); color: var(--fg); border: 1px solid var(--border);
+  padding: 6px 10px; border-radius: 4px; font-size: 13px; cursor: pointer;
+  font-family: inherit;
+}
+.theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
+
+/* Mobile: stack sidebar above main, slimmer padding */
+@media (max-width: 720px) {
+  body { flex-direction: column; }
+  aside { width: 100%; height: auto; max-height: 40vh; border-right: none; border-bottom: 1px solid var(--border); }
+  main { height: auto; padding: 24px 20px 60px; }
+  main .reader { max-width: 100%; }
+  .theme-toggle { top: 8px; right: 8px; }
+}
 </style>
 </head>
 <body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<button class="theme-toggle" type="button" onclick="(function(){var e=document.documentElement,c=e.getAttribute('data-theme'),sysDark=matchMedia('(prefers-color-scheme: dark)').matches,cur=c||(sysDark?'dark':'light'),next=cur==='dark'?'light':'dark';e.setAttribute('data-theme',next);localStorage.setItem('yt2md-theme',next);})()" aria-label="Toggle dark mode">🌓</button>
 <aside>
   <h1><a href="/">yt2md</a></h1>
 
+  <nav aria-label="Manage">
   <h2>Manage</h2>
   <ul>
     <li{% if current == 'channels' %} class="active"{% endif %}><a href="/channels">Subscriptions ({{ channel_count }})</a></li>
     <li{% if current == 'schedule' %} class="active"{% endif %}><a href="/schedule">Schedule</a></li>
   </ul>
+  </nav>
 
-  <h2>Meta-digests ({{ metas|length }})</h2>
+  <nav aria-label="Weekly meta-digests">
+  <h2>Meta-digests {% if unread_meta_count %}<span class="unread-count">{{ unread_meta_count }} new</span>{% else %}({{ metas|length }}){% endif %}</h2>
   {% for m in metas %}
-  <a class="meta-card{% if current == 'meta:' + m.week %} active{% endif %}" href="/meta/{{ m.week }}/">
-    <div class="week">{{ m.week }}</div>
+  <a class="meta-card{% if current == 'meta:' + m.week %} active{% endif %}{% if m.unread %} unread{% endif %}" href="/meta/{{ m.week }}/">
+    <div class="week">{% if m.unread %}<span class="unread-dot" aria-label="unread"></span>{% endif %}{{ m.week }}</div>
     <div class="count">{% if m.count %}covers {{ m.count }} video{{ 's' if m.count != 1 else '' }}{% else %}meta-digest{% endif %}</div>
   </a>
   {% else %}
   <p class="empty">none yet</p>
   {% endfor %}
+  </nav>
 
-  <h2>Digests ({{ digests|length }})</h2>
+  <nav aria-label="Per-video digests">
+  <h2>Digests {% if unread_digest_count %}<span class="unread-count">{{ unread_digest_count }} new</span>{% else %}({{ digests|length }}){% endif %}</h2>
   <ul>
     {% for d in digests %}
-    <li{% if current == 'digest:' + d.id %} class="active"{% endif %}><a href="/digests/{{ d.id }}/">{{ d.title }}</a></li>
+    <li{% if current == 'digest:' + d.id %} class="active"{% endif %}{% if d.unread %} class="unread"{% endif %}>
+      <a href="/digests/{{ d.id }}/">{% if d.unread %}<span class="unread-dot" aria-label="unread"></span>{% endif %}{{ d.title }}</a>
+    </li>
     {% else %}
     <li class="empty">none yet</li>
     {% endfor %}
   </ul>
+  </nav>
 </aside>
-<main>
+<main id="main-content" tabindex="-1">
   <div class="reader">
     {{ body|safe }}
   </div>
@@ -1512,15 +1665,31 @@ def cmd_serve(args) -> int:
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
     def page(body: str, *, title: str, current: str, base_href: str = None):
+        # Annotate listing items with read state so the sidebar can show "new" markers.
+        digests = _list_digests(digests_dir)
+        metas = _list_metas(meta_dir)
+        try:
+            read_digests = _read_digest_ids()
+            read_metas = _read_meta_weeks()
+        except Exception:
+            read_digests, read_metas = set(), set()
+        for d in digests:
+            d["unread"] = d["id"] not in read_digests
+        for m in metas:
+            m["unread"] = m["week"] not in read_metas
+        unread_digest_count = sum(1 for d in digests if d["unread"])
+        unread_meta_count = sum(1 for m in metas if m["unread"])
         return render_template_string(
             SERVE_PAGE_TEMPLATE,
             body=body,
             title=title,
             current=current,
             base_href=base_href,
-            digests=_list_digests(digests_dir),
-            metas=_list_metas(meta_dir),
+            digests=digests,
+            metas=metas,
             channel_count=len(read_channels()),
+            unread_digest_count=unread_digest_count,
+            unread_meta_count=unread_meta_count,
         )
 
     @app.route("/")
@@ -1550,6 +1719,10 @@ def cmd_serve(args) -> int:
         if metas:
             featured = metas[0]
             featured_md = (meta_dir / f"{featured['week']}.md").read_text()
+            try:
+                _mark_meta_read(featured["week"])
+            except Exception:
+                pass
             body = (
                 f'<p class="featured-eyebrow">Latest weekly meta-digest · '
                 f'<a href="/meta/{featured["week"]}/">{featured["week"]}</a> · '
@@ -1580,13 +1753,39 @@ def cmd_serve(args) -> int:
     def channels_page():
         from flask import request
         channels = read_channels()
+        digests = _list_digests(digests_dir)
+        poll_status = _job_status(SCHEDULE_LABEL_POLL)
         flash = request.args.get("msg", "")
+
         body = "<h1>Subscriptions</h1>"
         if flash:
             body += f'<div class="flash">{flash}</div>'
+
+        # "What's next" guidance — adapts to current state. Only shown until the
+        # user has at least one digest, then disappears.
+        next_step = None
+        if not channels:
+            next_step = (
+                "Paste a YouTube channel URL below to get started. "
+                "Each new video on this channel will be auto-digested."
+            )
+        elif not poll_status["loaded"]:
+            next_step = (
+                'You\'re subscribed but the polling schedule isn\'t set up yet. '
+                '<a href="/schedule">Install the schedule</a> to start auto-digesting new videos every 6 hours.'
+            )
+        elif not digests:
+            next_step = (
+                "Polling fires every 6 hours. Your first digest will land after the next run "
+                '— or fire one now from the <a href="/schedule">Schedule page</a>.'
+            )
+        if next_step:
+            body += f'<div class="next-step"><strong>Next step:</strong> {next_step}</div>'
+
         body += (
             '<form method="post" action="/channels" class="add-form">'
-            '<input type="text" name="url" '
+            '<label for="channel-url" class="sr-only">YouTube channel URL</label>'
+            '<input id="channel-url" type="text" name="url" '
             'placeholder="https://www.youtube.com/@channel/videos  (or @handle)" '
             'autofocus required>'
             '<button type="submit">Add</button>'
@@ -1609,8 +1808,7 @@ def cmd_serve(args) -> int:
             body += "<p class='empty-state'>No subscriptions yet. Paste a YouTube channel URL above.</p>"
         body += (
             "<p class='meta-info' style='margin-top:32px'>"
-            "Stored in <code>~/yt2md/channels.txt</code>. "
-            "Polling fires every 6h once <code>yt2md schedule install</code> is set up."
+            "Stored in <code>~/yt2md/channels.txt</code>."
             "</p>"
         )
         return page(body, title="Subscriptions", current="channels")
@@ -1709,6 +1907,7 @@ def cmd_serve(args) -> int:
     def schedule_install():
         from flask import redirect
         success, messages = _do_schedule_install()
+        _invalidate_status_cache()
         msg = ("Installed: " + "; ".join(messages)) if success else f"Install failed: {messages[0]}"
         return redirect(f"/schedule?msg={msg}")
 
@@ -1716,6 +1915,7 @@ def cmd_serve(args) -> int:
     def schedule_uninstall():
         from flask import redirect
         results = _do_schedule_uninstall()
+        _invalidate_status_cache()
         msg = "Uninstalled: " + "; ".join(f"{lbl} ({act})" for lbl, act in results)
         return redirect(f"/schedule?msg={msg}")
 
@@ -1730,6 +1930,7 @@ def cmd_serve(args) -> int:
             ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
             capture_output=True, text=True,
         )
+        _invalidate_status_cache()
         if result.returncode != 0:
             return redirect(f"/schedule?msg=Failed+to+trigger+{job}:+{result.stderr.strip()}")
         return redirect(
@@ -1741,6 +1942,10 @@ def cmd_serve(args) -> int:
         digest_md = digests_dir / video_id / "digest.md"
         if not digest_md.exists():
             abort(404)
+        try:
+            _mark_digest_read(video_id)
+        except Exception:
+            pass  # never block reading on a DB error
         html = _render_markdown(digest_md.read_text())
         return page(html, title=video_id, current=f"digest:{video_id}",
                     base_href=f"/digests/{video_id}/")
@@ -1754,6 +1959,10 @@ def cmd_serve(args) -> int:
         meta_md = meta_dir / f"{week}.md"
         if not meta_md.exists():
             abort(404)
+        try:
+            _mark_meta_read(week)
+        except Exception:
+            pass
         html = _render_markdown(meta_md.read_text())
         return page(html, title=f"Meta-digest {week}", current=f"meta:{week}",
                     base_href="/meta/")
