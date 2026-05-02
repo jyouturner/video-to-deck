@@ -1308,7 +1308,7 @@ SERVE_PAGE_TEMPLATE = """<!doctype html>
 <script>
 (function() {
   const stored = localStorage.getItem('yt2md-theme');
-  if (stored) document.documentElement.setAttribute('data-theme', stored);
+  if (stored && stored !== 'auto') document.documentElement.setAttribute('data-theme', stored);
 })();
 </script>
 <style>
@@ -1317,6 +1317,7 @@ SERVE_PAGE_TEMPLATE = """<!doctype html>
   --fg: #1a1a1a;
   --muted: #6b6b6b;
   --accent: #b65a2c;
+  --unread: #2563eb;
   --border: #e5e3dc;
   --sidebar-bg: #f0eee6;
   --code-bg: #ececea;
@@ -1327,6 +1328,7 @@ SERVE_PAGE_TEMPLATE = """<!doctype html>
     --fg: #e8e8e8;
     --muted: #999;
     --accent: #d97a4d;
+    --unread: #60a5fa;
     --border: #2e2e2e;
     --sidebar-bg: #141414;
     --code-bg: #232323;
@@ -1337,6 +1339,7 @@ SERVE_PAGE_TEMPLATE = """<!doctype html>
   --fg: #e8e8e8;
   --muted: #999;
   --accent: #d97a4d;
+  --unread: #60a5fa;
   --border: #2e2e2e;
   --sidebar-bg: #141414;
   --code-bg: #232323;
@@ -1391,16 +1394,21 @@ aside li.active a { background: var(--accent); color: white; }
 aside li.unread a { font-weight: 600; }
 aside .empty { color: var(--muted); font-size: 13px; padding: 6px 8px; }
 aside .unread-count {
-  display: inline-block; padding: 2px 7px; background: var(--accent); color: white;
+  display: inline-block; padding: 2px 7px; background: var(--unread); color: white;
   border-radius: 10px; font-size: 11px; font-weight: 600;
   text-transform: none; letter-spacing: 0; margin-left: 4px;
 }
 aside .unread-dot {
   display: inline-block; width: 6px; height: 6px; border-radius: 50%;
-  background: var(--accent); margin-right: 6px; vertical-align: middle;
+  background: var(--unread); margin-right: 6px; vertical-align: middle;
 }
-aside .meta-card.unread { border-color: var(--accent); }
+aside .meta-card.unread { border-color: var(--unread); }
 aside .meta-card.unread .week { font-weight: 700; }
+/* When an item is the currently-viewed one, suppress the unread signals
+   to avoid two competing color cues. */
+aside li.active .unread-dot,
+aside .meta-card.active .unread-dot { display: none; }
+aside .meta-card.active.unread { border-color: var(--accent); }
 aside .meta-card {
   display: block; padding: 10px 12px; border-radius: 4px;
   border: 1px solid var(--border); margin-bottom: 6px;
@@ -1535,14 +1543,18 @@ details[open] summary { margin-bottom: 8px; }
   overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
 }
 
-/* Theme toggle button */
-.theme-toggle {
-  position: fixed; top: 16px; right: 16px; z-index: 50;
-  background: var(--sidebar-bg); color: var(--fg); border: 1px solid var(--border);
-  padding: 6px 10px; border-radius: 4px; font-size: 13px; cursor: pointer;
-  font-family: inherit;
+/* Sidebar header (yt2md title + theme toggle inline) */
+.sidebar-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 16px;
 }
-.theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
+.sidebar-header h1 { margin: 0; }
+.theme-toggle {
+  background: transparent; border: 1px solid var(--border); border-radius: 4px;
+  padding: 4px 8px; font-size: 14px; cursor: pointer; color: var(--fg);
+  font-family: inherit; line-height: 1;
+}
+.theme-toggle:hover { border-color: var(--accent); }
 
 /* Mobile: stack sidebar above main, slimmer padding */
 @media (max-width: 720px) {
@@ -1550,15 +1562,16 @@ details[open] summary { margin-bottom: 8px; }
   aside { width: 100%; height: auto; max-height: 40vh; border-right: none; border-bottom: 1px solid var(--border); }
   main { height: auto; padding: 24px 20px 60px; }
   main .reader { max-width: 100%; }
-  .theme-toggle { top: 8px; right: 8px; }
 }
 </style>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to main content</a>
-<button class="theme-toggle" type="button" onclick="(function(){var e=document.documentElement,c=e.getAttribute('data-theme'),sysDark=matchMedia('(prefers-color-scheme: dark)').matches,cur=c||(sysDark?'dark':'light'),next=cur==='dark'?'light':'dark';e.setAttribute('data-theme',next);localStorage.setItem('yt2md-theme',next);})()" aria-label="Toggle dark mode">🌓</button>
 <aside>
-  <h1><a href="/">yt2md</a></h1>
+  <div class="sidebar-header">
+    <h1><a href="/">yt2md</a></h1>
+    <button class="theme-toggle" type="button" onclick="cycleTheme()" aria-label="Cycle theme: auto / light / dark">🌓</button>
+  </div>
 
   <nav aria-label="Manage">
   <h2>Manage</h2>
@@ -1572,7 +1585,7 @@ details[open] summary { margin-bottom: 8px; }
   <h2>Meta-digests {% if unread_meta_count %}<span class="unread-count">{{ unread_meta_count }} new</span>{% else %}({{ metas|length }}){% endif %}</h2>
   {% for m in metas %}
   <a class="meta-card{% if current == 'meta:' + m.week %} active{% endif %}{% if m.unread %} unread{% endif %}" href="/meta/{{ m.week }}/">
-    <div class="week">{% if m.unread %}<span class="unread-dot" aria-label="unread"></span>{% endif %}{{ m.week }}</div>
+    <div class="week">{% if m.unread %}<span class="unread-dot" aria-label="unread"></span>{% endif %}{{ m.date_range }}</div>
     <div class="count">{% if m.count %}covers {{ m.count }} video{{ 's' if m.count != 1 else '' }}{% else %}meta-digest{% endif %}</div>
   </a>
   {% else %}
@@ -1598,6 +1611,27 @@ details[open] summary { margin-bottom: 8px; }
     {{ body|safe }}
   </div>
 </main>
+<script>
+function applyTheme() {
+  const stored = localStorage.getItem('yt2md-theme') || 'auto';
+  const root = document.documentElement;
+  if (stored === 'auto') root.removeAttribute('data-theme');
+  else root.setAttribute('data-theme', stored);
+  const btn = document.querySelector('.theme-toggle');
+  if (btn) {
+    const icons = {auto: '🌓', light: '☀️', dark: '🌙'};
+    btn.textContent = icons[stored];
+    btn.title = 'Theme: ' + stored + ' (click to cycle)';
+  }
+}
+function cycleTheme() {
+  const cur = localStorage.getItem('yt2md-theme') || 'auto';
+  const next = {auto: 'light', light: 'dark', dark: 'auto'}[cur];
+  localStorage.setItem('yt2md-theme', next);
+  applyTheme();
+}
+applyTheme();
+</script>
 </body>
 </html>
 """
@@ -1623,6 +1657,27 @@ def _list_digests(digests_dir: Path) -> List[dict]:
     return results
 
 
+def _iso_week_display(stem: str) -> str:
+    """Convert '2026-W18' into a friendly date range like 'Apr 27 – May 3'."""
+    import datetime as _dt
+    try:
+        year_str, week_str = stem.split("-W")
+        year, week = int(year_str), int(week_str)
+        jan4 = _dt.date(year, 1, 4)
+        week1_monday = jan4 - _dt.timedelta(days=jan4.isoweekday() - 1)
+        monday = week1_monday + _dt.timedelta(weeks=week - 1)
+        sunday = monday + _dt.timedelta(days=6)
+    except Exception:
+        return stem
+    # %-d not portable; use .day directly.
+    if monday.year == sunday.year:
+        return f"{monday.strftime('%b')} {monday.day} – {sunday.strftime('%b')} {sunday.day}"
+    return (
+        f"{monday.strftime('%b')} {monday.day}, {monday.year} – "
+        f"{sunday.strftime('%b')} {sunday.day}, {sunday.year}"
+    )
+
+
 def _list_metas(meta_dir: Path) -> List[dict]:
     if not meta_dir.exists():
         return []
@@ -1634,7 +1689,12 @@ def _list_metas(meta_dir: Path) -> List[dict]:
             count = len(set(re.findall(r"digests/([^/)\"\s]+)/digest\.md", text)))
         except Exception:
             count = 0
-        results.append({"week": f.stem, "mtime": f.stat().st_mtime, "count": count})
+        results.append({
+            "week": f.stem,
+            "date_range": _iso_week_display(f.stem),
+            "mtime": f.stat().st_mtime,
+            "count": count,
+        })
     return results
 
 
@@ -1724,8 +1784,8 @@ def cmd_serve(args) -> int:
             except Exception:
                 pass
             body = (
-                f'<p class="featured-eyebrow">Latest weekly meta-digest · '
-                f'<a href="/meta/{featured["week"]}/">{featured["week"]}</a> · '
+                f'<p class="featured-eyebrow">Weekly meta-digest · '
+                f'<a href="/meta/{featured["week"]}/">{featured["date_range"]}</a> · '
                 f'covers {featured["count"]} video{"s" if featured["count"] != 1 else ""}</p>'
             )
             body += _render_markdown(featured_md)
@@ -1740,12 +1800,8 @@ def cmd_serve(args) -> int:
             body += _render_markdown(featured_md)
             base_href = f"/digests/{featured['id']}/"
 
-        # Footer nav: quick scan of recent digests.
-        if digests:
-            body += '<hr><h3 style="margin-top: 32px;">More digests</h3><ul class="recent-list">'
-            for d in digests[:8]:
-                body += f'<li><a href="/digests/{d["id"]}/">{d["title"]}</a></li>'
-            body += '</ul>'
+        # No "More digests" footer here — sidebar is the navigation surface;
+        # showing the same list twice is just noise.
 
         return page(body, title="Home", current="home", base_href=base_href)
 
@@ -1964,8 +2020,8 @@ def cmd_serve(args) -> int:
         except Exception:
             pass
         html = _render_markdown(meta_md.read_text())
-        return page(html, title=f"Meta-digest {week}", current=f"meta:{week}",
-                    base_href="/meta/")
+        return page(html, title=f"Meta-digest · {_iso_week_display(week)}",
+                    current=f"meta:{week}", base_href="/meta/")
 
     @app.errorhandler(404)
     def not_found(e):
