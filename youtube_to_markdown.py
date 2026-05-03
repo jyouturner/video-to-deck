@@ -94,22 +94,40 @@ def merge_frames(*frame_lists: List[Tuple[Path, float]]) -> List[Tuple[Path, flo
 # ---------- Step 2: Perceptual-hash dedup (consecutive only) ----------
 
 def dedupe_frames(frames: List[Tuple[Path, float]], hash_distance: int = 4) -> List[Tuple[Path, float]]:
+    """Cluster runs of near-identical consecutive frames; keep the LAST of each cluster.
+
+    Animated slide reveals (bullets / diagram elements appearing over time) and slow
+    pans both hit this case: each intermediate frame is similar to its neighbor, but
+    only the final frame shows the fully-revealed / settled state. Keeping the last
+    frame of the cluster preserves that state rather than the partial opening one.
+
+    Discrete scene changes (dist > threshold between neighbors) break the cluster,
+    so recurring views — e.g. switching to an editor and back to slides — still
+    survive as separate kept frames.
     """
-    Drop a frame only if it's near-identical to the *previous kept* frame.
-    Comparing only consecutively preserves recurring views (e.g., returning to an editor).
-    """
+    if not frames:
+        return []
+
     import imagehash
     from PIL import Image
 
-    kept: List[Tuple[Path, float]] = []
-    prev_hash = None
+    hashed: List[Tuple[Path, float, "imagehash.ImageHash"]] = []
     for path, ts in frames:
-        h = imagehash.phash(Image.open(path))
-        if prev_hash is not None and (h - prev_hash) <= hash_distance:
+        with Image.open(path) as im:
+            hashed.append((path, ts, imagehash.phash(im)))
+
+    clusters: List[List[Tuple[Path, float, "imagehash.ImageHash"]]] = [[hashed[0]]]
+    for i in range(1, len(hashed)):
+        if (hashed[i][2] - hashed[i - 1][2]) <= hash_distance:
+            clusters[-1].append(hashed[i])
+        else:
+            clusters.append([hashed[i]])
+
+    kept: List[Tuple[Path, float]] = []
+    for cluster in clusters:
+        for path, _, _ in cluster[:-1]:
             path.unlink(missing_ok=True)
-            continue
-        kept.append((path, ts))
-        prev_hash = h
+        kept.append((cluster[-1][0], cluster[-1][1]))
     return kept
 
 
@@ -356,45 +374,310 @@ def is_url(s: str) -> bool:
     return bool(URL_RE.match(s))
 
 
-def fetch_youtube(url: str, cache_root: Path) -> Tuple[Path, Path]:
-    """Download mp4 + English SRT from YouTube. Cached by video ID under cache_root.
+DEFAULT_WHISPER_MODEL = "medium"
 
-    Returns (mp4_path, srt_path).
+
+def _whisper_secs_to_srt(secs: float) -> str:
+    """Convert seconds to SRT-style HH:MM:SS,mmm timestamp."""
+    if secs < 0:
+        secs = 0.0
+    h = int(secs // 3600)
+    m = int((secs % 3600) // 60)
+    s = int(secs % 60)
+    ms = int(round((secs - int(secs)) * 1000))
+    if ms == 1000:  # rounding can push us a full ms over
+        s += 1
+        ms = 0
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _transcribe_with_whisper(
+    media_path: Path,
+    out_dir: Path,
+    video_id: str,
+    model_name: str = DEFAULT_WHISPER_MODEL,
+) -> Tuple[Path, str]:
+    """Transcribe a media file with faster-whisper, write an SRT, return (srt_path, lang).
+
+    Model weights are downloaded on first use to ~/.cache/huggingface and reused
+    afterwards. Detected language is used as the SRT filename suffix so the
+    existing cache-by-glob logic in fetch_youtube picks it up on re-runs.
+    """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as e:
+        raise RuntimeError(
+            "Whisper transcription needed but faster-whisper is not installed. "
+            "Run `uv sync` (or `pip install faster-whisper`) and try again."
+        ) from e
+
+    print(f"      loading whisper model '{model_name}' (first run downloads weights)")
+    # int8 keeps memory low and runs well on CPU; faster-whisper picks Metal/CUDA
+    # automatically when device='auto'.
+    model = WhisperModel(model_name, device="auto", compute_type="int8")
+
+    print(f"      transcribing audio with whisper ({media_path.name})...")
+    segments_iter, info = model.transcribe(
+        str(media_path),
+        beam_size=5,
+        vad_filter=True,  # cuts long silences so the transcript stays tight
+    )
+
+    lang = info.language or "und"
+    srt_path = out_dir / f"{video_id}.{lang}.srt"
+
+    n = 0
+    with srt_path.open("w") as fh:
+        for seg in segments_iter:
+            n += 1
+            text = seg.text.strip().replace("\n", " ")
+            if not text:
+                continue
+            fh.write(
+                f"{n}\n"
+                f"{_whisper_secs_to_srt(seg.start)} --> {_whisper_secs_to_srt(seg.end)}\n"
+                f"{text}\n\n"
+            )
+
+    print(
+        f"      whisper: {n} segments, language='{lang}' "
+        f"(prob={info.language_probability:.2f})"
+    )
+    return srt_path, lang
+
+
+def _ensure_js_runtime_available() -> Optional[str]:
+    """Find a JS runtime usable for yt-dlp's n-challenge solver.
+
+    yt-dlp accepts deno / node / bun. As of 2026, it marks Node <20 as
+    'unsupported' — silently failing the n-challenge and producing only
+    storyboard formats. So for Node we collect all candidates (PATH match +
+    common version-manager locations: nvm, fnm, asdf, volta), version-rank
+    them, and prepend the dir of the highest version to os.environ['PATH']
+    so yt-dlp's internal lookups pick the right one.
+    """
+    # deno / bun: trust the first PATH match (no version-rank needed).
+    for rt in ("deno", "bun"):
+        if shutil.which(rt):
+            return rt
+
+    home = Path.home()
+    seen: set = set()
+    node_candidates: List[Path] = []
+
+    def _add(p: Optional[Path]):
+        if p and p.is_file() and str(p) not in seen:
+            seen.add(str(p))
+            node_candidates.append(p)
+
+    path_node = shutil.which("node")
+    if path_node:
+        _add(Path(path_node))
+    for p in sorted((home / ".nvm" / "versions" / "node").glob("*/bin/node"), reverse=True):
+        _add(p)
+    for p in sorted(
+        (home / ".local" / "share" / "fnm" / "node-versions").glob("*/installation/bin/node"),
+        reverse=True,
+    ):
+        _add(p)
+    for p in sorted((home / ".asdf" / "installs" / "nodejs").glob("*/bin/node"), reverse=True):
+        _add(p)
+    _add(home / ".volta" / "bin" / "node")
+
+    best_path: Optional[Path] = None
+    best_version: Tuple[int, ...] = (0, 0, 0)
+    for c in node_candidates:
+        try:
+            r = subprocess.run(
+                [str(c), "--version"], capture_output=True, text=True, timeout=5
+            )
+            v = tuple(int(p) for p in r.stdout.strip().lstrip("v").split(".")[:3])
+        except Exception:
+            continue
+        if v > best_version:
+            best_version = v
+            best_path = c
+
+    if best_path is None:
+        return None
+
+    # Prepend its dir so yt-dlp's shutil.which lookups pick this one.
+    bin_dir = str(best_path.parent)
+    current = shutil.which("node")
+    if current != str(best_path):
+        os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+        print(
+            f"[yt2md] using node v{'.'.join(map(str, best_version))} at "
+            f"{best_path} for yt-dlp"
+        )
+
+    if best_version < (20, 0, 0):
+        print(
+            f"[yt2md] warning: node v{'.'.join(map(str, best_version))} is below "
+            "yt-dlp's required v20+ for YouTube JS challenges. Install a newer "
+            "node (`nvm install 20`) or deno (`brew install deno`).",
+            file=sys.stderr,
+        )
+
+    return "node"
+
+
+def _pick_caption_lang(info: dict) -> Optional[Tuple[str, bool]]:
+    """Choose best caption track from a yt-dlp info dict.
+
+    Returns (lang_code, is_manual) or None if no captions exist at all.
+
+    Priority:
+      1. Manual English (any en-* code)
+      2. Manual matching the audio language (info['language'])
+      3. Any manual track
+      4. Auto matching the audio language
+      5. Auto English
+      6. Any auto track
+
+    Manual is preferred over auto everywhere. Within auto, we prefer the
+    original audio language over English: YouTube's auto-EN on a non-English
+    video is translation-of-auto-caption (double degradation), whereas
+    Claude translating the auto-caption-of-original-audio is single degradation
+    and produces better digests.
+    """
+    manual = info.get("subtitles") or {}
+    auto = info.get("automatic_captions") or {}
+    audio_lang = (info.get("language") or "").lower()
+
+    def first_starts_with(d, prefix):
+        if not prefix:
+            return None
+        for k in d:
+            if k.lower().startswith(prefix):
+                return k
+        return None
+
+    def first_any(d):
+        return next(iter(d), None)
+
+    for picker, source, is_manual in (
+        (lambda d: first_starts_with(d, "en"), manual, True),
+        (lambda d: first_starts_with(d, audio_lang), manual, True),
+        (first_any, manual, True),
+        (lambda d: first_starts_with(d, audio_lang), auto, False),
+        (lambda d: first_starts_with(d, "en"), auto, False),
+        (first_any, auto, False),
+    ):
+        k = picker(source)
+        if k:
+            return (k, is_manual)
+    return None
+
+
+def fetch_youtube(
+    url: str,
+    cache_root: Path,
+    whisper_model: str = DEFAULT_WHISPER_MODEL,
+    allow_whisper: bool = True,
+    cookies_from_browser: Optional[str] = None,
+) -> dict:
+    """Download mp4 + best-available SRT from YouTube. Cached by video ID under cache_root.
+
+    Returns a dict with:
+      mp4 (Path), srt (Path), lang (str),
+      download_secs (float), whisper_secs (float),
+      used_whisper (bool), whisper_model (Optional[str]).
+
+    Falls back to local Whisper transcription when YouTube has no captions.
+    Set allow_whisper=False to fail fast instead of falling back.
     """
     import yt_dlp
+    import time as _time
 
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    # Probe first to get the video ID for stable cache layout
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+    # YouTube increasingly requires logged-in cookies to bypass the bot challenge.
+    # yt-dlp accepts `cookiesfrombrowser` as a tuple — single-item is the simplest
+    # form (no profile / domain filter).
+    cookie_opt: dict = {}
+    if cookies_from_browser:
+        cookie_opt["cookiesfrombrowser"] = (cookies_from_browser,)
+
+    # YouTube's "n challenge" obfuscates real format URLs behind a JavaScript
+    # function that yt-dlp must execute to deobfuscate. Without a JS runtime +
+    # the challenge solver scripts, only thumbnail storyboards come back.
+    rt = _ensure_js_runtime_available()
+    yt_dlp_runtime_opt: dict = {}
+    if rt is not None:
+        yt_dlp_runtime_opt["js_runtimes"] = {rt: {}}
+        yt_dlp_runtime_opt["remote_components"] = ["ejs:github"]
+
+    base_opts = {**cookie_opt, **yt_dlp_runtime_opt}
+
+    # Probe first to get the video ID for stable cache layout. We use the same
+    # format selector as the download below so probe doesn't reject videos whose
+    # default yt-dlp selector ('bestvideo*+bestaudio') happens to match nothing
+    # (some YouTube videos return a format pool that the default doesn't span).
+    probe_opts = {
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "quiet": True,
+        "no_warnings": True,
+        **base_opts,
+    }
+    with yt_dlp.YoutubeDL(probe_opts) as ydl:
         info = ydl.extract_info(url, download=False)
     video_id = info["id"]
     out_dir = cache_root / video_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     mp4_path = out_dir / f"{video_id}.mp4"
-    srt_path = out_dir / f"{video_id}.en.srt"
 
-    if mp4_path.exists() and srt_path.exists():
-        print(f"      using cached {out_dir}/")
-        return mp4_path, srt_path
+    # Cache hit: lang is in the filename (works for legacy *.en.srt too).
+    existing_srt = next(iter(out_dir.glob(f"{video_id}.*.srt")), None)
+    if mp4_path.exists() and existing_srt is not None:
+        lang = existing_srt.stem[len(video_id) + 1:]
+        print(f"      using cached {out_dir}/ (lang: {lang})")
+        return {
+            "mp4": mp4_path, "srt": existing_srt, "lang": lang,
+            "download_secs": 0.0, "whisper_secs": 0.0,
+            "used_whisper": False, "whisper_model": None,
+        }
 
-    ydl_opts = {
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "merge_output_format": "mp4",
-        "outtmpl": str(out_dir / f"{video_id}.%(ext)s"),
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": ["en", "en-US", "en-GB"],
-        "subtitlesformat": "srt/vtt/best",
-        "postprocessors": [{"key": "FFmpegSubtitlesConvertor", "format": "srt"}],
-        "quiet": True,
-        "no_warnings": True,
-    }
+    picked = _pick_caption_lang(info)
+
+    if picked is not None:
+        picked_lang, _is_manual = picked
+        ydl_opts = {
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "merge_output_format": "mp4",
+            "outtmpl": str(out_dir / f"{video_id}.%(ext)s"),
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": [picked_lang],
+            "subtitlesformat": "srt/vtt/best",
+            "postprocessors": [{"key": "FFmpegSubtitlesConvertor", "format": "srt"}],
+            "quiet": True,
+            "no_warnings": True,
+            **base_opts,
+        }
+    else:
+        # No captions of any kind. Download just the mp4 and transcribe locally.
+        if not allow_whisper:
+            raise RuntimeError(
+                f"No subtitles available for {url} in any language and "
+                "Whisper fallback is disabled."
+            )
+        print("      no captions on YouTube; will transcribe with Whisper after download")
+        ydl_opts = {
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "merge_output_format": "mp4",
+            "outtmpl": str(out_dir / f"{video_id}.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            **base_opts,
+        }
+
+    download_t0 = _time.monotonic()
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
+    download_secs = _time.monotonic() - download_t0
 
-    # Resolve actual filenames yt-dlp produced (lang suffix can vary)
     candidates_mp4 = list(out_dir.glob(f"{video_id}.*"))
     mp4_found = next((p for p in candidates_mp4 if p.suffix in (".mp4", ".mkv", ".webm")), None)
     if mp4_found and mp4_found != mp4_path:
@@ -402,15 +685,29 @@ def fetch_youtube(url: str, cache_root: Path) -> Tuple[Path, Path]:
     elif not mp4_path.exists():
         raise RuntimeError(f"yt-dlp finished but no video file found in {out_dir}")
 
-    srt_found = next((p for p in out_dir.glob(f"{video_id}.*.srt")), None)
-    if srt_found and srt_found != srt_path:
-        srt_found.rename(srt_path)
-    elif not srt_path.exists():
-        raise RuntimeError(
-            f"No English subtitles available for {url} (neither manual nor auto-captions)."
-        )
+    if picked is not None:
+        # Re-derive lang from the filename yt-dlp actually wrote (it normalizes
+        # codes like en-US -> en, so the picked code may differ from the result).
+        srt_found = next(iter(out_dir.glob(f"{video_id}.*.srt")), None)
+        if srt_found is None:
+            raise RuntimeError(
+                f"yt-dlp claimed '{picked[0]}' subtitles for {url} but produced no SRT."
+            )
+        lang = srt_found.stem[len(video_id) + 1:]
+        return {
+            "mp4": mp4_path, "srt": srt_found, "lang": lang,
+            "download_secs": download_secs, "whisper_secs": 0.0,
+            "used_whisper": False, "whisper_model": None,
+        }
 
-    return mp4_path, srt_path
+    whisper_t0 = _time.monotonic()
+    srt_path, lang = _transcribe_with_whisper(mp4_path, out_dir, video_id, model_name=whisper_model)
+    whisper_secs = _time.monotonic() - whisper_t0
+    return {
+        "mp4": mp4_path, "srt": srt_path, "lang": lang,
+        "download_secs": download_secs, "whisper_secs": whisper_secs,
+        "used_whisper": True, "whisper_model": whisper_model,
+    }
 
 
 # ---------- Markdown digest (transcript-primary, LLM-summarized) ----------
@@ -439,8 +736,14 @@ def generate_digest(
     segments: List[TranscriptSegment],
     video_title: str,
     model: str,
+    source_lang: str = "en",
+    output_language: str = "auto",
 ):
-    """Call Claude to segment the transcript into topics. Returns a parsed VideoDigest."""
+    """Call Claude to segment the transcript into topics. Returns a parsed VideoDigest.
+
+    source_lang is the BCP-47 language code of the transcript (e.g. 'en', 'zh-Hans').
+    output_language: 'auto' (write in source language) or 'en' (force English).
+    """
     import anthropic
     from pydantic import BaseModel
     from typing import List as TList
@@ -460,7 +763,28 @@ def generate_digest(
         f"[{format_timestamp(seg.start)}] {seg.text}" for seg in segments
     )
 
+    is_english_source = (source_lang or "").lower().startswith("en")
+    lang_note = ""
+    if not is_english_source:
+        if output_language == "en":
+            lang_note = (
+                f"NOTE: This transcript is in language code '{source_lang}', not English. "
+                "Translate to English while distilling. Title, overview, topic titles, "
+                "summaries, and key points must all be written in English regardless of "
+                "the source language. Preserve proper nouns (people, places, products) in "
+                "their original form when there is no established English rendering.\n\n"
+            )
+        else:  # "auto" — match the source language
+            lang_note = (
+                f"NOTE: This transcript is in language code '{source_lang}'. Write the "
+                "digest in the SAME language as the transcript. Title, overview, topic "
+                "titles, summaries, and key points must all be in the source language. "
+                "Preserve proper nouns and established technical terms in their original "
+                "form (including English technical jargon when the field uses it that way).\n\n"
+            )
+
     user_text = (
+        f"{lang_note}"
         f"Video title: {video_title}\n\n"
         f"Total duration: {format_timestamp(segments[-1].end if segments else 0)}\n\n"
         f"Timestamped transcript:\n\n{transcript}"
@@ -482,6 +806,122 @@ def generate_digest(
         output_format=VideoDigest,
     )
     return response.parsed_output, response.usage
+
+
+DEFAULT_PANEL_MODEL = "claude-opus-4-7"
+
+
+PANEL_SYSTEM_PROMPT = (
+    "You facilitate a panel of domain experts critically analyzing video content. "
+    "Read the digest and transcript carefully, then:\n\n"
+    "1. Infer 3–5 experts whose perspectives would best illuminate this material. "
+    "Choose them from the actual domain of the video — a neuroscientist for a brain "
+    "talk, a hardware engineer + an ML practitioner for a chip-design talk, a historian "
+    "of science + a contemporary researcher for a science-history piece. Avoid generic "
+    "labels (\"a thoughtful generalist\"); make each expert's specialty concrete enough "
+    "that their angle on this material is distinct.\n\n"
+    "2. Run a 1500–2500 word panel discussion in markdown. Open with one short paragraph "
+    "introducing each panelist (name, role, one credential or claim-to-relevance). Then "
+    "the discussion proper, with each turn labeled by the speaker's name.\n\n"
+    "Goals for the discussion:\n"
+    "- Surface what the speaker glossed over, hand-waved, or assumed without arguing.\n"
+    "- Bring contrary readings — where would a competing school of thought disagree?\n"
+    "- Connect to adjacent domains the speaker didn't mention.\n"
+    "- Examine concrete claims (numbers, names, mechanisms) for how robust they actually are.\n"
+    "- Synthesize, but don't paper over disagreements: if two panelists land in "
+    "different places, leave them there.\n\n"
+    "Style: skip restating the digest — the reader already read it. Open directly with "
+    "the moderator framing the first question. No conclusion-summary at the end; let "
+    "the discussion close naturally."
+)
+
+
+def generate_panel_discussion(
+    digest_md_text: str,
+    segments: List["TranscriptSegment"],
+    model: str,
+    source_lang: str = "en",
+    output_language: str = "auto",
+):
+    """Call Claude to simulate a panel of domain-relevant experts discussing a video.
+    Returns (markdown_text, usage).
+
+    source_lang / output_language follow the same convention as generate_digest:
+    'auto' writes the panel in the transcript's language; 'en' forces English.
+
+    Costs ~one Opus call per click (≈ 4–8k input + 2–4k output tokens). Output is
+    one markdown document the caller writes to digests/<id>/panel.md.
+    """
+    import anthropic
+
+    transcript_str = "\n".join(
+        f"[{format_timestamp(seg.start)}] {seg.text}" for seg in segments
+    )
+
+    is_english_source = (source_lang or "").lower().startswith("en")
+    lang_directive = ""
+    if not is_english_source and output_language == "auto":
+        lang_directive = (
+            f"\n\nIMPORTANT: The transcript is in language code '{source_lang}'. "
+            "Write the entire panel discussion in the SAME language — expert names "
+            "(transliterated when appropriate), credentials, the moderator's "
+            "questions, every speaker's turns. Preserve proper nouns and technical "
+            "terms in their original form when the field uses them that way."
+        )
+    # output_language == "en" with non-English source: rely on the existing
+    # system prompt (no explicit translate directive needed; English is the
+    # default Claude output style for this prompt).
+
+    user_text = (
+        "## Existing digest (the reader has already seen this)\n\n"
+        f"{digest_md_text}\n\n"
+        "## Full timestamped transcript\n\n"
+        f"{transcript_str}"
+        f"{lang_directive}\n\n"
+        "Now: introduce the panelists, then run the discussion."
+    )
+
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model=model,
+        max_tokens=8000,
+        system=PANEL_SYSTEM_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": [{
+                "type": "text", "text": user_text,
+                "cache_control": {"type": "ephemeral"},
+            }],
+        }],
+    )
+    text = next(b.text for b in response.content if b.type == "text")
+    return text, response.usage
+
+
+def _transcript_slice(
+    segments: List["TranscriptSegment"],
+    topic_start: float,
+    topic_end: float,
+) -> str:
+    """Render the transcript segments inside [topic_start, topic_end) as one timestamped string.
+
+    Used by vision_pick_frames to ground picks against what the narrator is saying
+    at a candidate frame's timestamp. Truncates very long topics to keep token cost
+    bounded — first 30 + last 30 segments with a marker between, which captures the
+    narrator's framing at start and conclusion at end.
+    """
+    in_window = [s for s in segments if topic_start <= s.start < topic_end]
+    if len(in_window) > 70:
+        head = in_window[:30]
+        tail = in_window[-30:]
+        in_window = head + [None] + tail  # type: ignore[list-item]
+    lines: List[str] = []
+    for seg in in_window:
+        if seg is None:
+            lines.append("[…]")
+            continue
+        lines.append(f"[{format_timestamp(seg.start)}] {seg.text}")
+    return "\n".join(lines)
 
 
 def _candidates_for_topic(
@@ -524,11 +964,16 @@ def vision_pick_frames(
     frames: List[Tuple[Path, float]],
     video_duration: float,
     model: str,
+    segments: Optional[List["TranscriptSegment"]] = None,
 ):
     """Use Claude's vision to pick the best frame per topic from in-window candidates.
 
     Returns a dict {topic_index -> chosen_frame_path}, plus the API usage object.
     Topics with no in-window candidates are omitted (caller falls back to timestamp-based pick).
+
+    If `segments` is provided, the per-topic transcript slice is included so vision
+    can ground picks on what the narrator is saying at each candidate's timestamp
+    (e.g. "speaker says 'as you can see in this diagram' at 04:23 → frame at 04:23").
     """
     import anthropic
     from pydantic import BaseModel
@@ -546,16 +991,31 @@ def vision_pick_frames(
 
     # Build per-topic candidate lists and a flat list of (topic_idx, cand_idx, path, ts)
     per_topic: List[List[Tuple[Path, float]]] = []
+    per_topic_transcript: List[str] = []
     for i, topic in enumerate(topics):
         end = topics[i + 1].start_time if i + 1 < len(topics) else video_duration
         per_topic.append(_candidates_for_topic(topic.start_time, end, frames))
+        if segments:
+            per_topic_transcript.append(
+                _transcript_slice(segments, topic.start_time, end)
+            )
+        else:
+            per_topic_transcript.append("")
 
     # Build the message: text intro -> for each topic, label + summary + numbered candidate images
     content: list = []
     intro = (
         "For each topic below, pick the candidate frame that best illustrates what the "
         "narrator is discussing. Prefer frames showing the most informative visual content "
-        "(diagrams, code, distinctive UI) over generic framing or talking-head shots. "
+        "(diagrams, code, distinctive UI) over generic framing or talking-head shots.\n\n"
+        "When multiple candidates show the same scene at different stages of an animation "
+        "or progressive reveal — bullets appearing one at a time, diagram elements being "
+        "added, code typed line by line — prefer the LATEST candidate in the sequence. "
+        "The final state shows the most complete information; partial/early states omit "
+        "content the narrator goes on to add.\n\n"
+        "Use the per-topic transcript to ground your pick: when the narrator says things "
+        "like \"as you can see here\" or refers to a specific element at a specific "
+        "moment, prefer the candidate whose timestamp is closest to that mention.\n\n"
         "Return one choice per topic that has candidates.\n\n"
         f"Total topics: {len(topics)}\n"
     )
@@ -570,13 +1030,15 @@ def vision_pick_frames(
                         f"Title: {topic.title}\n",
             })
             continue
-        header = (
-            f"\n--- Topic {ti} ---\n"
-            f"Title: {topic.title}\n"
-            f"Summary: {topic.summary}\n"
-            f"Candidates ({len(cands)} frames):\n"
-        )
-        content.append({"type": "text", "text": header})
+        header_parts = [
+            f"\n--- Topic {ti} ---",
+            f"Title: {topic.title}",
+            f"Summary: {topic.summary}",
+        ]
+        if per_topic_transcript[ti]:
+            header_parts.append("Transcript:\n" + per_topic_transcript[ti])
+        header_parts.append(f"Candidates ({len(cands)} frames):\n")
+        content.append({"type": "text", "text": "\n".join(header_parts)})
         for ci, (path, ts) in enumerate(cands):
             content.append({
                 "type": "text",
@@ -593,9 +1055,12 @@ def vision_pick_frames(
 
     system = (
         "You select illustrative frames for a video digest. You will be shown a list of "
-        "topics, each with a small set of candidate frames. For each topic with candidates, "
-        "return the (topic_index, candidate_index) pair that best illustrates the topic, "
-        "with a one-sentence rationale. Skip topics that say 'no candidates available'."
+        "topics, each with the topic's title, summary, the transcript spoken during that "
+        "topic (timestamped), and a small set of candidate frames (also timestamped). "
+        "For each topic with candidates, return the (topic_index, candidate_index) pair "
+        "that best illustrates the topic, with a one-sentence rationale. Use the "
+        "transcript to ground your choice on what the narrator is saying when each "
+        "candidate frame was captured. Skip topics that say 'no candidates available'."
     )
 
     client = anthropic.Anthropic()
@@ -694,15 +1159,10 @@ def write_markdown_digest(
     output_md.write_text("\n".join(lines).rstrip() + "\n")
 
 
-# ---------- Subcommands: watch / meta / schedule ----------
+# ---------- Subcommands: watch / meta / serve ----------
 
-SCHEDULE_LABEL_POLL = "com.youtube-to-markdown.poll"
-SCHEDULE_LABEL_META = "com.youtube-to-markdown.meta"
 LATEST_LIMIT = 10
 MAX_NEW_PER_RUN = 3
-META_LOOKBACK_DAYS = 7
-META_MIN_DIGESTS = 2
-META_MODEL_DEFAULT = "claude-sonnet-4-6"
 
 
 def channels_file() -> Path:
@@ -810,15 +1270,53 @@ def _list_channel_videos(url: str, limit: int = LATEST_LIMIT) -> List[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def _digest_video(video_id: str, output_dir: Path) -> None:
+def _digest_video(video_id: str, output_dir: Path) -> Tuple[int, str]:
+    """Run yt2md on a video. Returns (exit_code, combined_stdout_stderr).
+
+    Streams output to the parent's stdout in real time (so poll.log captures
+    it as it happens) AND collects it into a buffer the caller can scan for
+    permanent-failure patterns.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     digest_path = output_dir / "digest.md"
     yt2md = shutil.which("yt2md") or sys.argv[0]
-    subprocess.run(
+    proc = subprocess.Popen(
         [yt2md, f"https://youtu.be/{video_id}", "-o", str(digest_path)],
-        check=True,
         cwd=output_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
+    chunks: list = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        chunks.append(line)
+    proc.wait()
+    return proc.returncode, "".join(chunks)
+
+
+# Substrings (case-insensitive) that indicate a video can never be digested by
+# this account — gating it forever, deleted, etc. Matches mark the video
+# as seen so polling stops re-trying it. Network/transient errors don't match
+# and continue to retry next cycle.
+_PERMANENT_FAILURE_PATTERNS = (
+    "members-only",
+    "join this channel",
+    "private video",
+    "video unavailable",
+    "this video is no longer available",
+    "removed by the uploader",
+    "removed for violating",
+    "sign in to confirm your age",
+    "video has been removed",
+)
+
+
+def _is_permanent_failure(output: str) -> bool:
+    low = output.lower()
+    return any(p in low for p in _PERMANENT_FAILURE_PATTERNS)
 
 
 def cmd_watch_run(args) -> int:
@@ -851,146 +1349,62 @@ def cmd_watch_run(args) -> int:
         print(f"  {len(new_ids)} new: {new_ids}")
         for vid in reversed(new_ids):
             print(f"  processing {vid}...")
-            try:
-                _digest_video(vid, digests_dir / vid)
+            rc, output = _digest_video(vid, digests_dir / vid)
+            if rc == 0:
                 seen.add(vid)
                 state["channels"][channel_url] = {"seen": sorted(seen)}
                 save_state(state)
-            except subprocess.CalledProcessError as e:
-                print(f"  FAILED on {vid}: {e}", file=sys.stderr)
+            elif _is_permanent_failure(output):
+                # Permanent: mark seen so polling stops cycling on it.
+                # Wipe the partial dir (mp4 download, empty digest, etc.) to
+                # keep digests/ tidy.
+                print(f"  PERMANENTLY UNAVAILABLE: {vid} — marking seen and wiping partial dir")
+                shutil.rmtree(digests_dir / vid, ignore_errors=True)
+                seen.add(vid)
+                state["channels"][channel_url] = {"seen": sorted(seen)}
+                save_state(state)
+            else:
+                print(f"  FAILED on {vid} (transient — will retry next poll)", file=sys.stderr)
                 any_failures = True
 
     save_state(state)
     return 1 if any_failures else 0
 
 
-# ---- meta subcommand ----
-
-META_SYSTEM_PROMPT = (
-    "You synthesize multiple video digests into a single readable cross-cutting "
-    "meta-digest. Match the tone of the source digests: direct, concrete, "
-    "reader-first. Quote real claims, name real people and products, cite real "
-    "numbers. This is synthesis, not summary of summaries — find the through-lines."
-)
-
-META_USER_PROMPT_TEMPLATE = """\
-Below are {n} video digests added or modified in the last {days} days. Produce a \
-~600–1000 word meta-digest with:
-
-1. A one-line teaser per video.
-2. 3–5 themes spanning multiple videos. Under each theme, weave together specific points across the digests, with backlinks to source digests using relative paths like `[Spiegel on distribution](../digests/-7Yol5vX5xw/digest.md)`.
-3. An optional final "Standout single-video items" section for anything notable that didn't fit a theme.
-
-Drop a theme rather than padding if it doesn't have substance. The output is the meta-digest itself — no preamble.
-
----
-
-{digests}
-"""
-
-
-def _find_recent_digests(digests_dir: Path, lookback_days: int):
-    """Return list of (video_id, digest_path) for digests modified in lookback window."""
-    if not digests_dir.exists():
-        return []
-    import datetime as _dt
-    cutoff = _dt.datetime.now().timestamp() - lookback_days * 86400
-    results = []
-    for video_dir in sorted(digests_dir.iterdir()):
-        digest = video_dir / "digest.md"
-        if not video_dir.is_dir() or not digest.exists():
-            continue
-        if digest.stat().st_mtime >= cutoff:
-            results.append((video_dir.name, digest))
-    return results
-
-
-def cmd_meta_run(args) -> int:
-    ensure_api_key()
-    import datetime as _dt
-    import anthropic
-
-    data_dir = get_data_dir()
-    digests_dir = data_dir / "digests"
-    meta_dir = data_dir / "meta"
-
-    recent = _find_recent_digests(digests_dir, args.lookback_days)
-    if len(recent) < args.min_digests:
-        print(
-            f"Only {len(recent)} digest(s) modified in the last {args.lookback_days} days "
-            f"(need at least {args.min_digests}). Skipping."
-        )
-        return 0
-
-    sections = []
-    for vid, path in recent:
-        sections.append(
-            f"## Video {vid}\n\nSource path: digests/{vid}/digest.md\n\n{path.read_text()}"
-        )
-    digests_blob = "\n\n---\n\n".join(sections)
-    user_text = META_USER_PROMPT_TEMPLATE.format(
-        n=len(recent), days=args.lookback_days, digests=digests_blob
-    )
-
-    iso_year, iso_week, _ = _dt.datetime.now().isocalendar()
-    out_path = meta_dir / f"{iso_year}-W{iso_week:02d}.md"
-    meta_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Synthesizing {len(recent)} digests with {args.model} -> {out_path}")
-    for vid, _p in recent:
-        print(f"  - {vid}")
-
-    client = anthropic.Anthropic()
-    response = client.messages.create(
-        model=args.model,
-        max_tokens=8000,
-        system=META_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": [{
-            "type": "text",
-            "text": user_text,
-            "cache_control": {"type": "ephemeral"},
-        }]}],
-    )
-    text = next(b.text for b in response.content if b.type == "text")
-    out_path.write_text(text.rstrip() + "\n")
-
-    print(f"Wrote {out_path} ({len(text)} chars)")
-    print(
-        f"Tokens: input={response.usage.input_tokens}, "
-        f"output={response.usage.output_tokens}, "
-        f"cache_read={getattr(response.usage, 'cache_read_input_tokens', 0)}"
-    )
-    return 0
-
-
-# ---- schedule subcommands ----
-
-LAUNCHD_DIR = Path.home() / "Library" / "LaunchAgents"
-
-
-def _launchd_path_value() -> str:
-    """PATH for launchd-spawned processes (HOME-anchored, includes uv-tool bin and brew)."""
-    home = str(Path.home())
-    return ":".join([
-        f"{home}/.local/bin",
-        "/opt/homebrew/bin",
-        "/usr/local/bin",
-        "/usr/bin",
-        "/bin",
-    ])
-
+# ---- in-process scheduler ----
+#
+# Cadenced background runner for `yt2md watch run` (subscription poll). Lives
+# inside `yt2md serve`: a daemon thread ticks every ~30s, fires due jobs as
+# detached subprocesses, tracks pid + exit code in schedule_state.json for
+# the /schedule UI.
+#
+# Tradeoff: scheduling pauses while serve is down — for an interactively-used
+# reader this is fine; missed slots fire on next start (catch-up semantics).
 
 DEFAULT_SCHEDULE_CONFIG = {
     "poll_interval_hours": 6,
-    "meta_frequency": "weekly",   # "daily" or "weekly"
-    "meta_weekday": 0,            # 0=Sun ... 6=Sat (only used when weekly)
-    "meta_hour": 9,
-    "meta_minute": 0,
 }
+
+_SCHED_TICK_SECS = 30
+_scheduler_jobs: dict = {}
+_scheduler_thread = None
+_scheduler_lock_obj = None
+
+
+def _schedule_lock():
+    global _scheduler_lock_obj
+    if _scheduler_lock_obj is None:
+        import threading
+        _scheduler_lock_obj = threading.Lock()
+    return _scheduler_lock_obj
 
 
 def _schedule_config_file() -> Path:
     return get_data_dir() / "schedule.json"
+
+
+def _schedule_state_file() -> Path:
+    return get_data_dir() / "schedule_state.json"
 
 
 def load_schedule_config() -> dict:
@@ -1011,253 +1425,258 @@ def save_schedule_config(cfg: dict) -> None:
     _schedule_config_file().write_text(json.dumps(cfg, indent=2) + "\n")
 
 
+def _load_schedule_state() -> dict:
+    p = _schedule_state_file()
+    default = {"poll": {}}
+    if not p.exists():
+        return default
+    try:
+        s = json.loads(p.read_text())
+        return {"poll": s.get("poll") or {}}
+    except Exception:
+        return default
+
+
+def _save_schedule_state(state: dict) -> None:
+    p = _schedule_state_file()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n")
+    tmp.replace(p)
+
+
+# ---- user-tunable settings (model + tooling choices) ----
+#
+# Lives at ~/yt2md/settings.json. Editable via the /settings page; flows into
+# every subprocess spawn (one-off, scheduled poll) as YT2MD_* env vars, so the
+# digest CLI's argparse defaults pick them up. The /digests/<id>/discuss route
+# reads settings directly (it runs in-process).
+
+DEFAULT_SETTINGS = {
+    "digest_model": "claude-sonnet-4-6",
+    "panel_model": "claude-opus-4-7",
+    "whisper_model": DEFAULT_WHISPER_MODEL,
+    "cookies_from_browser": "",
+    # "auto" = write the digest in the same language as the transcript;
+    # "en" = always translate to English. Applies to both the per-video digest
+    # and the panel discussion.
+    "digest_language": "auto",
+}
+
+
+def _settings_file() -> Path:
+    return get_data_dir() / "settings.json"
+
+
+def load_settings() -> dict:
+    p = _settings_file()
+    if not p.exists():
+        return dict(DEFAULT_SETTINGS)
+    try:
+        s = json.loads(p.read_text())
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update({k: v for k, v in s.items() if k in DEFAULT_SETTINGS})
+        return merged
+    except Exception:
+        return dict(DEFAULT_SETTINGS)
+
+
+def save_settings(s: dict) -> None:
+    get_data_dir().mkdir(parents=True, exist_ok=True)
+    tmp = _settings_file().with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(s, indent=2) + "\n")
+    tmp.replace(_settings_file())
+
+
+def _settings_to_env(settings: dict) -> dict:
+    """Map settings to YT2MD_* env vars for subprocess invocation. Empty values
+    are dropped so the subprocess sees only meaningful overrides."""
+    out: dict = {}
+    if settings.get("digest_model"):
+        out["YT2MD_DIGEST_MODEL"] = settings["digest_model"]
+    if settings.get("whisper_model"):
+        out["YT2MD_WHISPER_MODEL"] = settings["whisper_model"]
+    if settings.get("cookies_from_browser"):
+        out["YT2MD_COOKIES_FROM_BROWSER"] = settings["cookies_from_browser"]
+    if settings.get("panel_model"):
+        out["YT2MD_PANEL_MODEL"] = settings["panel_model"]
+    if settings.get("digest_language"):
+        out["YT2MD_DIGEST_LANGUAGE"] = settings["digest_language"]
+    return out
+
+
 def _format_schedule_summary(cfg: dict) -> str:
     """Human-readable description of the schedule config."""
     poll = cfg["poll_interval_hours"]
     poll_str = f"every {poll} hour{'s' if poll != 1 else ''}"
-    weekday_names = ["Sundays", "Mondays", "Tuesdays", "Wednesdays",
-                     "Thursdays", "Fridays", "Saturdays"]
-    time_str = f"{cfg['meta_hour']:02d}:{cfg['meta_minute']:02d}"
-    if cfg["meta_frequency"] == "daily":
-        meta_str = f"daily at {time_str} local"
-    else:
-        meta_str = f"{weekday_names[cfg['meta_weekday']]} at {time_str} local"
-    return f"polling {poll_str}, meta-digest {meta_str}"
+    return f"polling {poll_str}"
 
 
-def _make_poll_plist(yt2md_path: str, data_dir: Path, cfg: dict = None) -> str:
-    cfg = cfg or DEFAULT_SCHEDULE_CONFIG
-    interval_seconds = max(60, int(cfg["poll_interval_hours"] * 3600))
-    log_path = data_dir / "logs" / "poll.log"
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{SCHEDULE_LABEL_POLL}</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>{yt2md_path}</string>
-        <string>watch</string>
-        <string>run</string>
-    </array>
-
-    <key>StartInterval</key>
-    <integer>{interval_seconds}</integer>
-
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>StandardOutPath</key>
-    <string>{log_path}</string>
-    <key>StandardErrorPath</key>
-    <string>{log_path}</string>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>{_launchd_path_value()}</string>
-        <key>YT2MD_DATA</key>
-        <string>{data_dir}</string>
-        <key>HOME</key>
-        <string>{Path.home()}</string>
-        <key>PYTHONUNBUFFERED</key>
-        <string>1</string>
-    </dict>
-</dict>
-</plist>
-"""
+def _compute_next_poll(cfg: dict, last_started_at: Optional[float]) -> float:
+    """Timestamp of the next scheduled poll. First-run convention: fire ASAP."""
+    interval = max(60.0, float(cfg.get("poll_interval_hours", 6)) * 3600.0)
+    if last_started_at is None:
+        import time as _t
+        return _t.time()
+    return last_started_at + interval
 
 
-def _make_meta_plist(yt2md_path: str, data_dir: Path, cfg: dict = None) -> str:
-    cfg = cfg or DEFAULT_SCHEDULE_CONFIG
-    log_path = data_dir / "logs" / "meta.log"
-    if cfg["meta_frequency"] == "daily":
-        cal_inner = (
-            f"        <key>Hour</key>\n        <integer>{int(cfg['meta_hour'])}</integer>\n"
-            f"        <key>Minute</key>\n        <integer>{int(cfg['meta_minute'])}</integer>"
-        )
-    else:
-        cal_inner = (
-            f"        <key>Weekday</key>\n        <integer>{int(cfg['meta_weekday'])}</integer>\n"
-            f"        <key>Hour</key>\n        <integer>{int(cfg['meta_hour'])}</integer>\n"
-            f"        <key>Minute</key>\n        <integer>{int(cfg['meta_minute'])}</integer>"
-        )
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{SCHEDULE_LABEL_META}</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>{yt2md_path}</string>
-        <string>meta</string>
-        <string>run</string>
-    </array>
-
-    <key>StartCalendarInterval</key>
-    <dict>
-{cal_inner}
-    </dict>
-
-    <key>StandardOutPath</key>
-    <string>{log_path}</string>
-    <key>StandardErrorPath</key>
-    <string>{log_path}</string>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>{_launchd_path_value()}</string>
-        <key>YT2MD_DATA</key>
-        <string>{data_dir}</string>
-        <key>HOME</key>
-        <string>{Path.home()}</string>
-        <key>PYTHONUNBUFFERED</key>
-        <string>1</string>
-    </dict>
-</dict>
-</plist>
-"""
-
-
-def _do_schedule_install(cfg: dict = None):
-    """Install both launchd jobs using cfg (or saved config). Returns (success, messages)."""
-    if cfg is None:
-        cfg = load_schedule_config()
+def _fire_scheduled_job(kind: str) -> Optional[subprocess.Popen]:
+    """Spawn yt2md as a subprocess for the given kind. Returns the running
+    Popen or None if already running / yt2md not on PATH. Caller holds lock."""
+    if kind != "poll":
+        return None
+    existing = _scheduler_jobs.get(kind)
+    if existing is not None and existing.poll() is None:
+        return existing
     yt2md_path = shutil.which("yt2md")
     if not yt2md_path:
-        return False, ["yt2md not found on PATH (install with `uv tool install ...`)"]
-    for tool in ("yt-dlp", "ffmpeg", "ffprobe"):
-        if not shutil.which(tool):
-            return False, [f"required tool '{tool}' is not on PATH"]
-
-    data_dir = get_data_dir()
-    data_dir.mkdir(parents=True, exist_ok=True)
-    (data_dir / "logs").mkdir(parents=True, exist_ok=True)
-    LAUNCHD_DIR.mkdir(parents=True, exist_ok=True)
-    save_schedule_config(cfg)
-
-    poll_desc = f"polling every {cfg['poll_interval_hours']}h"
-    if cfg["meta_frequency"] == "daily":
-        meta_desc = f"meta-digest daily at {cfg['meta_hour']:02d}:{cfg['meta_minute']:02d}"
-    else:
-        weekday_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-        meta_desc = (f"meta-digest {weekday_names[cfg['meta_weekday']]}s "
-                     f"at {cfg['meta_hour']:02d}:{cfg['meta_minute']:02d}")
-
-    plists = [
-        (SCHEDULE_LABEL_POLL, _make_poll_plist(yt2md_path, data_dir, cfg), poll_desc),
-        (SCHEDULE_LABEL_META, _make_meta_plist(yt2md_path, data_dir, cfg), meta_desc),
-    ]
-    messages = []
-    for label, content, desc in plists:
-        plist_path = LAUNCHD_DIR / f"{label}.plist"
-        plist_path.write_text(content)
-        subprocess.run(
-            ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist_path)],
-            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        result = subprocess.run(
-            ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            return False, [f"failed to load {label}: {result.stderr.strip()}"]
-        messages.append(f"{label} — {desc}")
-    return True, messages
-
-
-def _do_schedule_uninstall():
-    """Uninstall both launchd jobs. Returns list of (label, action_taken)."""
-    results = []
-    for label in (SCHEDULE_LABEL_POLL, SCHEDULE_LABEL_META):
-        plist_path = LAUNCHD_DIR / f"{label}.plist"
-        subprocess.run(
-            ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist_path)],
-            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        if plist_path.exists():
-            plist_path.unlink()
-            results.append((label, "removed"))
-        else:
-            results.append((label, "was not installed"))
-    return results
-
-
-_STATUS_CACHE: dict = {}  # label -> (expires_at, info_dict)
-_STATUS_TTL = 30.0  # seconds
-
-
-def _invalidate_status_cache() -> None:
-    _STATUS_CACHE.clear()
-
-
-def _job_status(label: str) -> dict:
-    """Return loaded/state/runs/last_exit for a launchd label.
-
-    Cached for ~30 seconds — `launchctl print` shells out and is the slowest
-    thing the schedule page does. Mutating actions (install/uninstall/run-now)
-    must call _invalidate_status_cache() so users see fresh data after acting.
-    """
-    import time
-    now = time.time()
-    cached = _STATUS_CACHE.get(label)
-    if cached and cached[0] > now:
-        return cached[1]
-
-    plist_path = LAUNCHD_DIR / f"{label}.plist"
-    info = {
-        "label": label,
-        "plist_exists": plist_path.exists(),
-        "loaded": False,
-        "state": None,
-        "runs": None,
-        "last_exit": None,
-        "pid": None,
-    }
-    result = subprocess.run(
-        ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
-        capture_output=True, text=True,
+        print(f"[scheduler] yt2md not on PATH; cannot fire {kind}", file=sys.stderr)
+        return None
+    args = [yt2md_path, "watch", "run"]
+    log_path = get_data_dir() / "logs" / f"{kind}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    import time as _t
+    log_fd = open(log_path, "a")
+    log_fd.write(f"\n===== {_t.strftime('%Y-%m-%d %H:%M:%S')} {kind} run =====\n")
+    log_fd.flush()
+    proc = subprocess.Popen(
+        args,
+        stdout=log_fd,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, **_settings_to_env(load_settings()), "PYTHONUNBUFFERED": "1"},
+        start_new_session=True,
     )
-    if result.returncode == 0:
-        info["loaded"] = True
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("state ="):
-                info["state"] = line.split("=", 1)[1].strip()
-            elif line.startswith("runs ="):
-                info["runs"] = line.split("=", 1)[1].strip()
-            elif line.startswith("last exit code ="):
-                info["last_exit"] = line.split("=", 1)[1].strip()
-            elif line.startswith("pid ="):
-                info["pid"] = line.split("=", 1)[1].strip()
+    log_fd.close()
+    _scheduler_jobs[kind] = proc
 
-    _STATUS_CACHE[label] = (now + _STATUS_TTL, info)
-    return info
+    state = _load_schedule_state()
+    state[kind] = {
+        **(state.get(kind) or {}),
+        "last_started_at": _t.time(),
+        "last_pid": proc.pid,
+        "last_exit_code": None,
+        "last_finished_at": None,
+    }
+    _save_schedule_state(state)
+    return proc
 
 
-def _job_summary(status: dict) -> Tuple[str, str]:
-    """Translate a launchd status dict into a one-sentence English summary.
+def _reap_scheduled_job(kind: str) -> None:
+    """Capture exit code if the kind's subprocess has exited. Caller holds lock."""
+    proc = _scheduler_jobs.get(kind)
+    if proc is None:
+        return
+    rc = proc.poll()
+    if rc is None:
+        return
+    import time as _t
+    state = _load_schedule_state()
+    state[kind] = {
+        **(state.get(kind) or {}),
+        "last_finished_at": _t.time(),
+        "last_exit_code": rc,
+    }
+    _save_schedule_state(state)
+    del _scheduler_jobs[kind]
 
-    Returns (sentence, dot_class) where dot_class is one of dot-on/dot-warn/dot-off.
-    """
-    if not status["loaded"]:
-        return ("Schedule isn't installed yet.", "dot-off")
-    if status["state"] == "running":
-        pid = status.get("pid", "?")
-        return (f"Running now (PID {pid}).", "dot-on")
-    runs = status.get("runs")
-    last = status.get("last_exit")
-    if runs in (None, "0"):
+
+def _scheduler_tick() -> None:
+    with _schedule_lock():
+        _reap_scheduled_job("poll")
+        cfg = load_schedule_config()
+        state = _load_schedule_state()
+        import time as _t
+        now = _t.time()
+        if "poll" not in _scheduler_jobs:
+            if now >= _compute_next_poll(cfg, (state.get("poll") or {}).get("last_started_at")):
+                _fire_scheduled_job("poll")
+
+
+def _scheduler_loop() -> None:
+    import time as _t
+    while True:
+        try:
+            _scheduler_tick()
+        except Exception as e:
+            print(f"[scheduler] tick error: {e}", file=sys.stderr)
+        _t.sleep(_SCHED_TICK_SECS)
+
+
+def start_scheduler() -> None:
+    """Start the daemon scheduler thread. Idempotent."""
+    global _scheduler_thread
+    if _scheduler_thread is not None and _scheduler_thread.is_alive():
+        return
+    import threading
+    _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
+    _scheduler_thread.start()
+    print("[scheduler] started (in-process; ticks every "
+          f"{_SCHED_TICK_SECS}s)")
+
+
+def _cleanup_legacy_launchd() -> None:
+    """Best-effort one-time removal of the old launchctl plists from
+    ~/Library/LaunchAgents — so the user doesn't end up with duplicate
+    scheduling after this migration. Silent if nothing is present."""
+    launchd_dir = Path.home() / "Library" / "LaunchAgents"
+    removed = []
+    for label in ("com.youtube-to-markdown.poll", "com.youtube-to-markdown.meta"):
+        plist = launchd_dir / f"{label}.plist"
+        if plist.exists():
+            subprocess.run(
+                ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            try:
+                plist.unlink()
+                removed.append(label)
+            except OSError:
+                pass
+    if removed:
+        print(f"[scheduler] removed legacy launchd plists: {', '.join(removed)}")
+
+
+def _scheduler_status_summary(kind: str, state: dict) -> Tuple[str, str]:
+    """English summary + dot class for /schedule and /channels surfaces."""
+    s = state.get(kind) or {}
+    if kind in _scheduler_jobs:
+        return ("Running now.", "dot-on")
+    last_started = s.get("last_started_at")
+    last_exit = s.get("last_exit_code")
+    if last_started is None:
         return ("Set up — first run hasn't happened yet.", "dot-warn")
-    if last and last not in ("0", "(never exited)"):
-        return (f"Last run failed (exit code {last}). Check the log.", "dot-warn")
-    n = runs if runs else "?"
-    return (f"Healthy — ran {n} time{'s' if n != '1' else ''}, last run was clean.", "dot-on")
+    if last_exit not in (0, None):
+        return (f"Last run failed (exit code {last_exit}). Check the log.", "dot-warn")
+    import datetime as dt
+    age = dt.datetime.now() - dt.datetime.fromtimestamp(last_started)
+    age_secs = int(age.total_seconds())
+    if age_secs < 60:
+        age_str = f"{age_secs}s ago"
+    elif age_secs < 3600:
+        age_str = f"{age_secs // 60}m ago"
+    elif age_secs < 86400:
+        age_str = f"{age_secs // 3600}h ago"
+    else:
+        age_str = f"{age_secs // 86400}d ago"
+    return (f"Healthy — last run {age_str} (clean).", "dot-on")
+
+
+def _format_next_run(ts: float) -> str:
+    """Render an upcoming-run timestamp as 'in 2h 15m' / 'in 3 days' / 'overdue'."""
+    import time as _t
+    delta = ts - _t.time()
+    if delta < 0:
+        return "due now"
+    if delta < 60:
+        return f"in {int(delta)}s"
+    if delta < 3600:
+        return f"in {int(delta // 60)}m"
+    if delta < 86400:
+        h = int(delta // 3600)
+        m = int((delta % 3600) // 60)
+        return f"in {h}h {m}m"
+    return f"in {int(delta // 86400)}d"
 
 
 def _tail_log(path: Path, n: int = 20) -> str:
@@ -1271,64 +1690,19 @@ def _tail_log(path: Path, n: int = 20) -> str:
     return "\n".join(lines[-n:]) if lines else "(empty)"
 
 
-def cmd_schedule_install(args) -> int:
-    cfg = load_schedule_config()
-    if args.poll_hours is not None:
-        cfg["poll_interval_hours"] = args.poll_hours
-    if args.meta_frequency is not None:
-        cfg["meta_frequency"] = args.meta_frequency
-    if args.meta_time is not None:
-        try:
-            h, m = args.meta_time.split(":")
-            cfg["meta_hour"] = int(h)
-            cfg["meta_minute"] = int(m)
-        except Exception:
-            sys.exit(f"--meta-time must be HH:MM, got: {args.meta_time}")
-    if args.meta_weekday is not None:
-        cfg["meta_weekday"] = args.meta_weekday
-
-    success, messages = _do_schedule_install(cfg)
-    if not success:
-        sys.exit(messages[0])
-    data_dir = get_data_dir()
-    print(f"Installed 2 launchd jobs (data dir = {data_dir})")
-    for m in messages:
-        print(f"  ✓ {m}")
-    print(f"\nSchedule config saved to {_schedule_config_file()}")
-    print(
-        f"\nLogs:\n"
-        f"  tail -f {data_dir/'logs'/'poll.log'}\n"
-        f"  tail -f {data_dir/'logs'/'meta.log'}\n"
-        f"\nUninstall: yt2md schedule uninstall"
-    )
-    return 0
-
-
-def cmd_schedule_uninstall(args) -> int:
-    for label, action in _do_schedule_uninstall():
-        print(f"  {'✓' if action == 'removed' else '-'} {label} {action}")
-    return 0
-
-
-def cmd_schedule_status(args) -> int:
-    for label in (SCHEDULE_LABEL_POLL, SCHEDULE_LABEL_META):
-        info = _job_status(label)
-        print(f"--- {label}")
-        if not info["loaded"]:
-            print("  not loaded")
-            continue
-        for k in ("state", "runs", "last_exit", "pid"):
-            if info.get(k) is not None:
-                print(f"  {k} = {info[k]}")
-    return 0
 
 
 # ---- one-off digest jobs (in-memory tracking; cheap) ----
 
-# Module-level dict: PID -> {"video_id": str, "started": float, "url": str}.
+# Module-level dict: PID -> {"video_id": str, "started": float, "url": str, "proc": Popen}.
 # Lost on server restart, which is fine — the digest still completes (detached
 # subprocess) and shows up in the sidebar when done.
 _oneoff_jobs: dict = {}
+
+# Recent failures, most-recent-first, capped at _ONEOFF_FAILURE_CAP.
+# Lost on server restart (matches _oneoff_jobs lifecycle).
+_oneoff_failures: list = []
+_ONEOFF_FAILURE_CAP = 20
 
 
 _VIDEO_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})")
@@ -1340,17 +1714,252 @@ def extract_video_id(url: str) -> str:
     return m.group(1) if m else ""
 
 
+def _extract_last_error(log_path: Path, video_id: str) -> str:
+    """Pull the most relevant error line from oneoff.log for a given video_id.
+
+    The log uses '===== {ts} starting {video_id} ({url}) =====' as section
+    markers. We bound the section, then prefer 'RuntimeError: ...' / similar
+    summary lines over the bare 'Traceback' header.
+    """
+    try:
+        text = log_path.read_text(errors="replace")
+    except OSError:
+        return ""
+    marker = f"starting {video_id}"
+    idx = text.rfind(marker)
+    if idx < 0:
+        return ""
+    next_idx = text.find("\n===== ", idx + len(marker))
+    section = text[idx:next_idx if next_idx > 0 else len(text)]
+    candidates = [
+        ln.strip() for ln in section.splitlines()
+        if ln.strip()
+        and not ln.lstrip().startswith("[download")
+        and ("Error" in ln or "Traceback" in ln)
+    ]
+    for ln in reversed(candidates):
+        if ":" in ln and not ln.startswith("Traceback"):
+            return ln
+    return candidates[-1] if candidates else ""
+
+
+# Pipeline stage markers, in pipeline order. The status endpoint scans the log
+# section for the LAST matching substring to determine the current stage.
+# Reordering here changes which stage is reported when two markers happen to
+# match — keep this list in pipeline order (later entries override earlier).
+_ONEOFF_STAGE_MARKERS: list = [
+    ("starting",            "starting "),  # section header is always present
+    ("downloading",         "[0/5] Fetching YouTube video"),
+    ("downloading",         "[download]"),
+    ("loading whisper",     "loading whisper model"),
+    ("transcribing",        "transcribing audio with whisper"),
+    ("extracting frames",   "[1/5] Extracting frames"),
+    ("deduping frames",     "[2/5] Deduping"),
+    ("parsing transcript",  "[3/5] Parsing SRT"),
+    ("aligning",            "[4/5] Aligning"),
+    ("building deck",       "[5/5] Building deck"),
+    ("digesting",           "[+] Generating digest"),
+    ("vision pass",         "[+] Vision-picking"),
+    ("writing digest",      "Digest written"),
+]
+
+
+def _describe_job_stage(log_text: str, video_id: str) -> str:
+    """Return a short human-readable label for the latest stage of a job.
+
+    Scans the log section bounded by the start marker for video_id (or EOF /
+    next start marker) and returns the most pipeline-advanced stage whose
+    substring marker appears in that section.
+    """
+    marker = f"starting {video_id}"
+    idx = log_text.rfind(marker)
+    if idx < 0:
+        return "starting"
+    next_idx = log_text.find("\n===== ", idx + len(marker))
+    section = log_text[idx:next_idx if next_idx > 0 else len(log_text)]
+    current = "starting"
+    for label, needle in _ONEOFF_STAGE_MARKERS:
+        if needle in section:
+            current = label
+    return current
+
+
+def _extract_run_summary(log_text: str, video_id: str) -> Optional[dict]:
+    """Pull the last `[summary] {...}` JSON line emitted by the pipeline for a job.
+
+    The pipeline prints one line of the form `[summary] {...}` on successful
+    completion. Returns the parsed dict, or None if absent / malformed.
+    """
+    import json as _json
+    marker = f"starting {video_id}"
+    idx = log_text.rfind(marker)
+    if idx < 0:
+        return None
+    next_idx = log_text.find("\n===== ", idx + len(marker))
+    section = log_text[idx:next_idx if next_idx > 0 else len(log_text)]
+    last = None
+    for ln in section.splitlines():
+        s = ln.lstrip()
+        if s.startswith("[summary] "):
+            last = s[len("[summary] "):]
+    if not last:
+        return None
+    try:
+        return _json.loads(last)
+    except Exception:
+        return None
+
+
+def _runs_jsonl_path() -> Path:
+    return get_data_dir() / "logs" / "runs.jsonl"
+
+
+def _record_run(row: dict) -> None:
+    """Persist a run completion to library.db AND append a JSONL line.
+
+    Two stores by design: SQLite for the activity UI's queries; JSONL for
+    `tail -f` debugging and downstream scripts. Both reflect the same data.
+    """
+    import json as _json
+    cols = (
+        "video_id", "url", "source", "started_at", "ended_at", "duration_secs",
+        "exit_code", "success", "stage_reached", "error", "source_lang",
+        "used_whisper", "whisper_model",
+        "download_secs", "whisper_secs", "frames_secs", "digest_secs", "vision_secs",
+        "digest_input_tokens", "digest_output_tokens",
+        "digest_cache_read_tokens", "digest_cache_creation_tokens",
+        "digest_path",
+    )
+    placeholders = ", ".join("?" for _ in cols)
+    values = tuple(row.get(c) for c in cols)
+    try:
+        with _library_connect() as conn:
+            conn.execute(
+                f"INSERT INTO runs ({', '.join(cols)}) VALUES ({placeholders})",
+                values,
+            )
+    except Exception as e:
+        # DB failure shouldn't bring down the reaper. JSONL still gets written.
+        print(f"[runs] db insert failed: {e}", file=sys.stderr)
+
+    jsonl = _runs_jsonl_path()
+    try:
+        jsonl.parent.mkdir(parents=True, exist_ok=True)
+        with jsonl.open("a") as fh:
+            fh.write(_json.dumps(row) + "\n")
+    except OSError as e:
+        print(f"[runs] jsonl append failed: {e}", file=sys.stderr)
+
+
+def _recent_runs(limit: int = 100) -> list:
+    """Read the last `limit` runs from SQLite, newest first."""
+    try:
+        with _library_connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            rows = conn.execute(
+                "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _build_run_row(info: dict, exit_code: int, log_text: str) -> dict:
+    """Translate a finished job + its log into a row dict suitable for runs table."""
+    import time as _t
+    video_id = info["video_id"]
+    started = info["started"]
+    ended = _t.time()
+    summary = _extract_run_summary(log_text, video_id)
+    success = exit_code == 0 and summary is not None
+    error = "" if success else _extract_last_error(_oneoff_log_path(), video_id)
+    stage = _describe_job_stage(log_text, video_id)
+    timings = (summary or {}).get("timings") or {}
+    tokens = (summary or {}).get("tokens") or {}
+    return {
+        "video_id": video_id,
+        "url": info.get("url"),
+        "source": "oneoff",
+        "started_at": started,
+        "ended_at": ended,
+        "duration_secs": ended - started,
+        "exit_code": exit_code,
+        "success": 1 if success else 0,
+        "stage_reached": stage,
+        "error": error or None,
+        "source_lang": (summary or {}).get("source_lang"),
+        "used_whisper": 1 if (summary or {}).get("used_whisper") else 0,
+        "whisper_model": (summary or {}).get("whisper_model"),
+        "download_secs": timings.get("download"),
+        "whisper_secs": timings.get("whisper"),
+        "frames_secs": timings.get("frames"),
+        "digest_secs": timings.get("digest"),
+        "vision_secs": timings.get("vision"),
+        "digest_input_tokens": tokens.get("input"),
+        "digest_output_tokens": tokens.get("output"),
+        "digest_cache_read_tokens": tokens.get("cache_read"),
+        "digest_cache_creation_tokens": tokens.get("cache_creation"),
+        "digest_path": (summary or {}).get("digest_path"),
+    }
+
+
+def _oneoff_log_path() -> Path:
+    return get_data_dir() / "logs" / "oneoff.log"
+
+
+def _record_oneoff_failure(info: dict, exit_code: int) -> None:
+    import time as _t
+    log_path = _oneoff_log_path()
+    last_error = _extract_last_error(log_path, info["video_id"]) if log_path.exists() else ""
+    _oneoff_failures.insert(0, {
+        "video_id": info["video_id"],
+        "url": info["url"],
+        "exit_code": exit_code,
+        "started": info["started"],
+        "ended": _t.time(),
+        "error": last_error,
+    })
+    del _oneoff_failures[_ONEOFF_FAILURE_CAP:]
+
+
 def _list_active_oneoff_jobs() -> list:
-    """Return one-off jobs whose subprocesses are still alive."""
+    """Return one-off jobs whose subprocesses are still alive.
+
+    Side effect: jobs that have exited are removed from _oneoff_jobs;
+    non-zero exits are appended to _oneoff_failures.
+    """
     active = []
     for pid in list(_oneoff_jobs.keys()):
+        info = _oneoff_jobs[pid]
+        proc = info.get("proc")
+        if proc is None:
+            # legacy entries with no Popen handle — fall back to kill probe
+            try:
+                os.kill(pid, 0)
+                active.append({"pid": pid, **{k: v for k, v in info.items() if k != "proc"}})
+            except (ProcessLookupError, PermissionError):
+                del _oneoff_jobs[pid]
+            continue
+        rc = proc.poll()
+        if rc is None:
+            active.append({"pid": pid, **{k: v for k, v in info.items() if k != "proc"}})
+            continue
+        del _oneoff_jobs[pid]
+        # Treat any non-zero exit, or zero-exit-with-no-digest, as a failure.
+        digest_path = get_data_dir() / "digests" / info["video_id"] / "digest.md"
         try:
-            os.kill(pid, 0)  # zero-signal probes liveness without killing
-            info = _oneoff_jobs[pid]
-            active.append({"pid": pid, **info})
-        except (ProcessLookupError, PermissionError):
-            del _oneoff_jobs[pid]
+            log_text = _oneoff_log_path().read_text(errors="replace")
+        except OSError:
+            log_text = ""
+        if rc != 0 or not digest_path.exists():
+            _record_oneoff_failure(info, rc)
+        _record_run(_build_run_row(info, rc, log_text))
     return active
+
+
+def _list_recent_oneoff_failures() -> list:
+    """Return a copy of recent failures (most recent first)."""
+    return list(_oneoff_failures)
 
 
 # ---- read-state library (SQLite-backed) ----
@@ -1369,10 +1978,33 @@ def _library_connect():
             digest_id TEXT PRIMARY KEY,
             opened_at INTEGER NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS meta_reads (
-            week TEXT PRIMARY KEY,
-            opened_at INTEGER NOT NULL
+        CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id TEXT NOT NULL,
+            url TEXT,
+            source TEXT NOT NULL,           -- 'oneoff' | 'poll' | 'meta'
+            started_at REAL NOT NULL,
+            ended_at REAL NOT NULL,
+            duration_secs REAL NOT NULL,
+            exit_code INTEGER NOT NULL,
+            success INTEGER NOT NULL,
+            stage_reached TEXT,
+            error TEXT,
+            source_lang TEXT,
+            used_whisper INTEGER NOT NULL DEFAULT 0,
+            whisper_model TEXT,
+            download_secs REAL,
+            whisper_secs REAL,
+            frames_secs REAL,
+            digest_secs REAL,
+            vision_secs REAL,
+            digest_input_tokens INTEGER,
+            digest_output_tokens INTEGER,
+            digest_cache_read_tokens INTEGER,
+            digest_cache_creation_tokens INTEGER,
+            digest_path TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at DESC);
     """)
     return conn
 
@@ -1386,24 +2018,9 @@ def _mark_digest_read(digest_id: str) -> None:
         )
 
 
-def _mark_meta_read(week: str) -> None:
-    import time
-    with _library_connect() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO meta_reads(week, opened_at) VALUES (?, ?)",
-            (week, int(time.time())),
-        )
-
-
 def _read_digest_ids() -> set:
     with _library_connect() as conn:
         rows = conn.execute("SELECT digest_id FROM digest_reads").fetchall()
-        return {r[0] for r in rows}
-
-
-def _read_meta_weeks() -> set:
-    with _library_connect() as conn:
-        rows = conn.execute("SELECT week FROM meta_reads").fetchall()
         return {r[0] for r in rows}
 
 
@@ -1484,10 +2101,10 @@ aside h2 {
   font-weight: 600;
 }
 aside ul { list-style: none; padding: 0; margin: 0; }
-aside li { margin: 0; }
+aside li { margin: 0 0 3px; }
 aside li a {
   display: -webkit-box;
-  -webkit-line-clamp: 2;
+  -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
   padding: 6px 8px;
@@ -1631,6 +2248,51 @@ main sub { color: var(--muted); font-size: 0.85em; }
 .status-table td { padding: 6px 12px; border-bottom: 1px solid var(--border); }
 .status-table td:first-child { color: var(--muted); width: 140px; }
 .status-table td:last-child { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.activity-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
+.activity-table th, .activity-table td {
+  text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.activity-table th { color: var(--muted); font-weight: 600; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.04em; }
+.activity-table td a { color: var(--accent); text-decoration: none; }
+.activity-table td a:hover { text-decoration: underline; }
+.activity-table .ok { color: #4a9f56; font-weight: 600; }
+.activity-table .fail { color: #d04545; font-weight: 600; }
+.activity-meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
+.activity-error { font-family: ui-monospace, "SF Mono", Menlo, monospace; word-break: break-word; }
+.activity-stages, .activity-tokens { font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px; white-space: nowrap; }
+.filter-row { display: flex; gap: 8px; margin: 12px 0 4px; flex-wrap: wrap; }
+.filter-chip {
+  padding: 5px 12px; border: 1px solid var(--border); border-radius: 999px;
+  font-size: 12px; color: var(--fg); text-decoration: none; background: var(--bg);
+}
+.filter-chip:hover { border-color: var(--accent); }
+.filter-chip.active { background: var(--accent); color: white; border-color: var(--accent); }
+.filter-chip-count { opacity: 0.7; }
+.delete-btn {
+  padding: 6px 14px; font-size: 13px; cursor: pointer;
+  background: transparent; color: #b13030;
+  border: 1px solid #b13030; border-radius: 4px;
+}
+.delete-btn:hover { background: #b13030; color: white; }
+.digest-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.digest-toolbar { margin-top: -8px; margin-bottom: 8px; }
+.digest-toolbar .delete-btn { margin-left: auto; }  /* push delete to the far right */
+.discuss-btn {
+  padding: 8px 16px; font-size: 13px; cursor: pointer;
+  background: var(--accent); color: white;
+  border: 1px solid var(--accent); border-radius: 4px;
+  text-decoration: none; display: inline-block;
+}
+.discuss-btn:hover { opacity: 0.9; }
+.discuss-btn-secondary {
+  padding: 6px 12px; font-size: 12px; cursor: pointer;
+  background: transparent; color: var(--fg);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.discuss-btn-secondary:hover { border-color: var(--accent); }
 .job-block { border: 1px solid var(--border); border-radius: 4px; padding: 16px 20px;
   margin: 16px 0; background: var(--sidebar-bg); }
 .job-block h3 { margin: 0 0 8px; font-size: 15px; }
@@ -1706,27 +2368,6 @@ details[open] summary { margin-bottom: 8px; }
     <button class="theme-toggle" type="button" onclick="cycleTheme()" aria-label="Cycle theme: auto / light / dark">🌓</button>
   </div>
 
-  <nav aria-label="Manage">
-  <h2>Manage</h2>
-  <ul>
-    <li{% if current == 'channels' %} class="active"{% endif %}><a href="/channels">Subscriptions ({{ channel_count }})</a></li>
-    <li{% if current == 'one-off' %} class="active"{% endif %}><a href="/one-off">One-off digest</a></li>
-    <li{% if current == 'schedule' %} class="active"{% endif %}><a href="/schedule">Schedule</a></li>
-  </ul>
-  </nav>
-
-  <nav aria-label="Weekly meta-digests">
-  <h2>Meta-digests {% if unread_meta_count %}<span class="unread-count">{{ unread_meta_count }} new</span>{% else %}({{ metas|length }}){% endif %}</h2>
-  {% for m in metas %}
-  <a class="meta-card{% if current == 'meta:' + m.week %} active{% endif %}{% if m.unread %} unread{% endif %}" href="/meta/{{ m.week }}/">
-    <div class="week">{% if m.unread %}<span class="unread-dot" aria-label="unread"></span>{% endif %}{{ m.date_range }}</div>
-    <div class="count">{% if m.count %}covers {{ m.count }} video{{ 's' if m.count != 1 else '' }}{% else %}meta-digest{% endif %}</div>
-  </a>
-  {% else %}
-  <p class="empty">none yet</p>
-  {% endfor %}
-  </nav>
-
   <nav aria-label="Per-video digests">
   <h2>Digests {% if unread_digest_count %}<span class="unread-count">{{ unread_digest_count }} new</span>{% else %}({{ digests|length }}){% endif %}</h2>
   <ul>
@@ -1737,6 +2378,17 @@ details[open] summary { margin-bottom: 8px; }
     {% else %}
     <li class="empty">none yet</li>
     {% endfor %}
+  </ul>
+  </nav>
+
+  <nav aria-label="Manage">
+  <h2>Manage</h2>
+  <ul>
+    <li{% if current == 'channels' %} class="active"{% endif %}><a href="/channels">Subscriptions ({{ channel_count }})</a></li>
+    <li{% if current == 'one-off' %} class="active"{% endif %}><a href="/one-off">One-off digest</a></li>
+    <li{% if current == 'schedule' %} class="active"{% endif %}><a href="/schedule">Schedule</a></li>
+    <li{% if current == 'activity' %} class="active"{% endif %}><a href="/activity">Activity</a></li>
+    <li{% if current == 'settings' %} class="active"{% endif %}><a href="/settings">Settings</a></li>
   </ul>
   </nav>
 </aside>
@@ -1791,47 +2443,6 @@ def _list_digests(digests_dir: Path) -> List[dict]:
     return results
 
 
-def _iso_week_display(stem: str) -> str:
-    """Convert '2026-W18' into a friendly date range like 'Apr 27 – May 3'."""
-    import datetime as _dt
-    try:
-        year_str, week_str = stem.split("-W")
-        year, week = int(year_str), int(week_str)
-        jan4 = _dt.date(year, 1, 4)
-        week1_monday = jan4 - _dt.timedelta(days=jan4.isoweekday() - 1)
-        monday = week1_monday + _dt.timedelta(weeks=week - 1)
-        sunday = monday + _dt.timedelta(days=6)
-    except Exception:
-        return stem
-    # %-d not portable; use .day directly.
-    if monday.year == sunday.year:
-        return f"{monday.strftime('%b')} {monday.day} – {sunday.strftime('%b')} {sunday.day}"
-    return (
-        f"{monday.strftime('%b')} {monday.day}, {monday.year} – "
-        f"{sunday.strftime('%b')} {sunday.day}, {sunday.year}"
-    )
-
-
-def _list_metas(meta_dir: Path) -> List[dict]:
-    if not meta_dir.exists():
-        return []
-    results = []
-    for f in sorted(meta_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
-        # Count unique digest backlinks to show "covers N videos" in the card.
-        try:
-            text = f.read_text()
-            count = len(set(re.findall(r"digests/([^/)\"\s]+)/digest\.md", text)))
-        except Exception:
-            count = 0
-        results.append({
-            "week": f.stem,
-            "date_range": _iso_week_display(f.stem),
-            "mtime": f.stat().st_mtime,
-            "count": count,
-        })
-    return results
-
-
 def _render_markdown(text: str) -> str:
     import markdown as md_lib
     html = md_lib.markdown(text, extensions=["fenced_code", "tables", "sane_lists"])
@@ -1851,7 +2462,6 @@ def cmd_serve(args) -> int:
 
     data_dir = get_data_dir()
     digests_dir = data_dir / "digests"
-    meta_dir = data_dir / "meta"
 
     app = Flask(__name__)
     # Disable Flask's default request logging — keep stdout clean.
@@ -1861,18 +2471,13 @@ def cmd_serve(args) -> int:
     def page(body: str, *, title: str, current: str, base_href: str = None):
         # Annotate listing items with read state so the sidebar can show "new" markers.
         digests = _list_digests(digests_dir)
-        metas = _list_metas(meta_dir)
         try:
             read_digests = _read_digest_ids()
-            read_metas = _read_meta_weeks()
         except Exception:
-            read_digests, read_metas = set(), set()
+            read_digests = set()
         for d in digests:
             d["unread"] = d["id"] not in read_digests
-        for m in metas:
-            m["unread"] = m["week"] not in read_metas
         unread_digest_count = sum(1 for d in digests if d["unread"])
-        unread_meta_count = sum(1 for m in metas if m["unread"])
         return render_template_string(
             SERVE_PAGE_TEMPLATE,
             body=body,
@@ -1880,20 +2485,17 @@ def cmd_serve(args) -> int:
             current=current,
             base_href=base_href,
             digests=digests,
-            metas=metas,
             channel_count=len(read_channels()),
             unread_digest_count=unread_digest_count,
-            unread_meta_count=unread_meta_count,
         )
 
     @app.route("/")
     def home():
         digests = _list_digests(digests_dir)
-        metas = _list_metas(meta_dir)
         channels = read_channels()
 
         # Empty states first — show a real CTA, not a list of zero items.
-        if not digests and not metas:
+        if not digests:
             if not channels:
                 body = (
                     "<h1>Welcome to yt2md</h1>"
@@ -1904,35 +2506,20 @@ def cmd_serve(args) -> int:
                 body = (
                     "<h1>Polling is set up</h1>"
                     f"<p>You're watching {len(channels)} channel(s). Your first digest "
-                    "will appear after the next polling run (every 6 hours, or "
+                    "will appear after the next polling run (every few hours, or "
                     'fire one now from the <a href="/schedule">Schedule</a> page).</p>'
                 )
             return page(body, title="yt2md", current="home")
 
-        # Featured content: prefer the latest meta-digest, fall back to the latest digest.
-        if metas:
-            featured = metas[0]
-            featured_md = (meta_dir / f"{featured['week']}.md").read_text()
-            try:
-                _mark_meta_read(featured["week"])
-            except Exception:
-                pass
-            body = (
-                f'<p class="featured-eyebrow">Weekly meta-digest · '
-                f'<a href="/meta/{featured["week"]}/">{featured["date_range"]}</a> · '
-                f'covers {featured["count"]} video{"s" if featured["count"] != 1 else ""}</p>'
-            )
-            body += _render_markdown(featured_md)
-            base_href = f"/meta/{featured['week']}/"
-        else:
-            featured = digests[0]
-            featured_md = (digests_dir / featured["id"] / "digest.md").read_text()
-            body = (
-                f'<p class="featured-eyebrow">Latest digest · '
-                f'<a href="/digests/{featured["id"]}/">{featured["title"]}</a></p>'
-            )
-            body += _render_markdown(featured_md)
-            base_href = f"/digests/{featured['id']}/"
+        # Featured content: the latest digest's body, with an eyebrow link.
+        featured = digests[0]
+        featured_md = (digests_dir / featured["id"] / "digest.md").read_text()
+        body = (
+            f'<p class="featured-eyebrow">Latest digest · '
+            f'<a href="/digests/{featured["id"]}/">{featured["title"]}</a></p>'
+        )
+        body += _render_markdown(featured_md)
+        base_href = f"/digests/{featured['id']}/"
 
         # No "More digests" footer here — sidebar is the navigation surface;
         # showing the same list twice is just noise.
@@ -1944,7 +2531,8 @@ def cmd_serve(args) -> int:
         from flask import request
         channels = read_channels()
         digests = _list_digests(digests_dir)
-        poll_status = _job_status(SCHEDULE_LABEL_POLL)
+        sched_state = _load_schedule_state()
+        poll_has_run = bool((sched_state.get("poll") or {}).get("last_started_at"))
         flash = request.args.get("msg", "")
 
         body = "<h1>Subscriptions</h1>"
@@ -1959,10 +2547,11 @@ def cmd_serve(args) -> int:
                 "Paste a YouTube channel URL below to get started. "
                 "Each new video on this channel will be auto-digested."
             )
-        elif not poll_status["loaded"]:
+        elif not poll_has_run:
             next_step = (
-                'You\'re subscribed but the polling schedule isn\'t set up yet. '
-                '<a href="/schedule">Install the schedule</a> to start auto-digesting new videos every 6 hours.'
+                "You\'re subscribed but the scheduler hasn\'t fired its first poll yet. "
+                'It runs every few hours — or trigger one now from the '
+                '<a href="/schedule">Schedule page</a>.'
             )
         elif not digests:
             next_step = (
@@ -2028,91 +2617,66 @@ def cmd_serve(args) -> int:
     def schedule_page():
         from flask import request
         from html import escape as h
+        import time as _t
         flash = request.args.get("msg", "")
         cfg = load_schedule_config()
-        poll_status = _job_status(SCHEDULE_LABEL_POLL)
-        meta_status = _job_status(SCHEDULE_LABEL_META)
-        any_loaded = poll_status["loaded"] or meta_status["loaded"]
+        sched_state = _load_schedule_state()
 
         body = "<h1>Schedule</h1>"
         if flash:
             body += f'<div class="flash">{h(flash)}</div>'
 
-        # Configurable schedule form — same form for install and reconfigure.
-        weekday_opts = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
-        body += '<form method="post" action="/schedule/install" class="schedule-form">'
+        body += '<form method="post" action="/schedule/save" class="schedule-form">'
         body += '<div class="schedule-fields">'
         body += '<label>Polling interval'
         body += f'  <input type="number" name="poll_hours" value="{cfg["poll_interval_hours"]}" min="0.1" step="0.1" required>'
         body += '  <span class="suffix">hours</span>'
         body += '</label>'
-
-        body += '<label>Meta-digest frequency'
-        body += '  <select name="meta_frequency">'
-        for opt in ("daily", "weekly"):
-            sel = ' selected' if cfg["meta_frequency"] == opt else ''
-            body += f'    <option value="{opt}"{sel}>{opt}</option>'
-        body += '  </select>'
-        body += '</label>'
-
-        body += '<label class="weekday-label">Day of week'
-        body += '  <select name="meta_weekday">'
-        for i, name in enumerate(weekday_opts):
-            sel = ' selected' if cfg["meta_weekday"] == i else ''
-            body += f'    <option value="{i}"{sel}>{name}</option>'
-        body += '  </select>'
-        body += '</label>'
-
-        body += '<label>Time'
-        body += f'  <input type="time" name="meta_time" value="{cfg["meta_hour"]:02d}:{cfg["meta_minute"]:02d}" required>'
-        body += '</label>'
         body += '</div>'  # schedule-fields
 
-        action = "Save & reinstall" if any_loaded else "Install both jobs"
-        body += f'<button type="submit" class="primary">{action}</button>'
-        if any_loaded:
-            body += (
-                '<form method="post" action="/schedule/uninstall" style="display:inline; margin-left: 8px;">'
-                '<button type="submit">Uninstall</button></form>'
-            )
+        body += '<button type="submit" class="primary">Save</button>'
         body += '</form>'
 
         body += (
-            f'<p class="meta-info">Current schedule: {h(_format_schedule_summary(cfg))}.</p>'
+            f'<p class="meta-info">Current schedule: {h(_format_schedule_summary(cfg))}. '
+            'Scheduling runs inside this server — pauses while it\'s down, '
+            'catches up on missed slots when you start it again.</p>'
         )
 
-        for label, status, run_key, friendly, desc in [
-            (SCHEDULE_LABEL_POLL, poll_status, "poll", "Polling",
-             "every 6 hours · fires <code>yt2md watch run</code>"),
-            (SCHEDULE_LABEL_META, meta_status, "meta", "Meta-digest",
-             "Sundays at 9am local · fires <code>yt2md meta run</code>"),
+        for kind, friendly, desc in [
+            ("poll", "Polling", "fires <code>yt2md watch run</code>"),
         ]:
-            # English-language status sentence + dot color signaling actual health.
-            sentence, dot_class = _job_summary(status)
+            sentence, dot_class = _scheduler_status_summary(kind, sched_state)
+            s = sched_state.get(kind) or {}
+            next_at = _compute_next_poll(cfg, s.get("last_started_at"))
+
             body += f'<div class="job-block"><h3><span class="dot {dot_class}"></span>{friendly}</h3>'
             body += f'<p class="meta-info" style="margin: 0 0 12px;">{desc}</p>'
             body += f'<p class="job-summary">{sentence}</p>'
+            body += (f'<p class="meta-info">Next run: {h(_format_next_run(next_at))} '
+                     f'({h(_t.strftime("%Y-%m-%d %H:%M", _t.localtime(next_at)))}).</p>')
+            running = kind in _scheduler_jobs
+            disabled = " disabled" if running else ""
+            running_label = " (already running)" if running else ""
+            body += (
+                f'<div class="job-actions">'
+                f'<form method="post" action="/schedule/run/{kind}" style="margin:0;">'
+                f'<button type="submit"{disabled}>Run now{running_label}</button>'
+                f'</form></div>'
+            )
 
-            if status["loaded"]:
-                body += (
-                    f'<div class="job-actions">'
-                    f'<form method="post" action="/schedule/run/{run_key}" style="margin:0;">'
-                    f'<button type="submit">Run now</button>'
-                    f'</form></div>'
-                )
-
-            # Disclosure for the diagnostic dump.
             body += '<details><summary>Diagnostics</summary>'
             body += '<table class="status-table">'
-            body += f'<tr><td>plist exists</td><td>{status["plist_exists"]}</td></tr>'
-            body += f'<tr><td>loaded</td><td>{status["loaded"]}</td></tr>'
-            for k in ("state", "runs", "last_exit", "pid"):
-                v = status.get(k)
-                if v is not None:
-                    body += f'<tr><td>{k.replace("_", " ")}</td><td>{h(str(v))}</td></tr>'
+            for k in ("last_started_at", "last_finished_at", "last_exit_code", "last_pid"):
+                v = s.get(k)
+                if v is None:
+                    continue
+                if k.endswith("_at"):
+                    v = _t.strftime("%Y-%m-%d %H:%M:%S", _t.localtime(v))
+                body += f'<tr><td>{k.replace("_", " ")}</td><td>{h(str(v))}</td></tr>'
             body += '</table></details>'
 
-            log_path = data_dir / "logs" / f"{run_key}.log"
+            log_path = data_dir / "logs" / f"{kind}.log"
             body += '<details style="margin-top: 8px;"><summary>Recent log (last 20 lines)</summary>'
             body += f'<div class="log-block">{h(_tail_log(log_path, 20))}</div>'
             body += '</details>'
@@ -2121,61 +2685,161 @@ def cmd_serve(args) -> int:
         body += '<p class="meta-info">Refresh the page to see updated status after a run.</p>'
         return page(body, title="Schedule", current="schedule")
 
-    @app.route("/schedule/install", methods=["POST"])
-    def schedule_install():
+    @app.route("/schedule/save", methods=["POST"])
+    def schedule_save():
         from flask import redirect, request
         cfg = load_schedule_config()
-        # Form fields override the saved config (when present).
         try:
             if request.form.get("poll_hours"):
                 cfg["poll_interval_hours"] = float(request.form["poll_hours"])
-            if request.form.get("meta_frequency") in ("daily", "weekly"):
-                cfg["meta_frequency"] = request.form["meta_frequency"]
-            if request.form.get("meta_weekday"):
-                cfg["meta_weekday"] = int(request.form["meta_weekday"])
-            if request.form.get("meta_time"):
-                h_, m_ = request.form["meta_time"].split(":")
-                cfg["meta_hour"] = int(h_)
-                cfg["meta_minute"] = int(m_)
         except Exception as e:
             return redirect(f"/schedule?msg=Invalid+input:+{e}")
-        success, messages = _do_schedule_install(cfg)
-        _invalidate_status_cache()
-        msg = ("Installed: " + "; ".join(messages)) if success else f"Install failed: {messages[0]}"
-        return redirect(f"/schedule?msg={msg}")
-
-    @app.route("/schedule/uninstall", methods=["POST"])
-    def schedule_uninstall():
-        from flask import redirect
-        results = _do_schedule_uninstall()
-        _invalidate_status_cache()
-        msg = "Uninstalled: " + "; ".join(f"{lbl} ({act})" for lbl, act in results)
-        return redirect(f"/schedule?msg={msg}")
+        save_schedule_config(cfg)
+        return redirect("/schedule?msg=Saved+(scheduler+picks+up+within+30s)")
 
     @app.route("/schedule/run/<job>", methods=["POST"])
     def schedule_run(job):
         from flask import redirect
-        label_map = {"poll": SCHEDULE_LABEL_POLL, "meta": SCHEDULE_LABEL_META}
-        if job not in label_map:
+        if job != "poll":
             abort(404)
-        label = label_map[job]
-        result = subprocess.run(
-            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
-            capture_output=True, text=True,
-        )
-        _invalidate_status_cache()
-        if result.returncode != 0:
-            return redirect(f"/schedule?msg=Failed+to+trigger+{job}:+{result.stderr.strip()}")
+        with _schedule_lock():
+            existing = _scheduler_jobs.get(job)
+            if existing is not None and existing.poll() is None:
+                return redirect(f"/schedule?msg={job}+is+already+running")
+            proc = _fire_scheduled_job(job)
+        if proc is None:
+            return redirect(f"/schedule?msg=Failed+to+fire+{job}+(yt2md+not+on+PATH)")
         return redirect(
-            f"/schedule?msg=Triggered+{job}+(refresh+in+a+few+seconds+to+see+log+update)"
+            f"/schedule?msg=Started+{job}+(pid+{proc.pid}).+Refresh+for+status."
         )
+
+    @app.route("/settings", methods=["GET"])
+    def settings_page():
+        from flask import request
+        from html import escape as h
+        flash = request.args.get("msg", "")
+        s = load_settings()
+        # Show the EFFECTIVE value (settings.json with .env fallback) so the
+        # form matches what the system is actually using. On Save we persist
+        # whatever the user submits, which becomes the new canonical value.
+        for key, env_name in (
+            ("digest_model", "YT2MD_DIGEST_MODEL"),
+            ("panel_model", "YT2MD_PANEL_MODEL"),
+            ("whisper_model", "YT2MD_WHISPER_MODEL"),
+            ("cookies_from_browser", "YT2MD_COOKIES_FROM_BROWSER"),
+            ("digest_language", "YT2MD_DIGEST_LANGUAGE"),
+        ):
+            if not s.get(key) and os.environ.get(env_name):
+                s[key] = os.environ[env_name]
+
+        whisper_choices = ("tiny", "base", "small", "medium", "large-v2", "large-v3")
+        cookie_choices = ("", "chrome", "firefox", "safari", "brave", "edge",
+                          "chromium", "opera", "vivaldi")
+
+        body = "<h1>Settings</h1>"
+        if flash:
+            body += f'<div class="flash">{h(flash)}</div>'
+        body += (
+            '<p class="meta-info">Stored in <code>~/yt2md/settings.json</code>. '
+            'New values take effect on the next one-off submit / scheduled poll / '
+            '"Discuss with experts" click — no restart required.</p>'
+        )
+
+        body += '<form method="post" action="/settings/save" class="schedule-form">'
+        body += '<div class="schedule-fields" style="grid-template-columns: 1fr;">'
+
+        body += (
+            '<label>Digest model'
+            f'  <input type="text" name="digest_model" value="{h(s["digest_model"])}" required>'
+            '  <span class="suffix" style="display:block;">'
+            'Anthropic model ID for the per-video digest. e.g. <code>claude-sonnet-4-6</code>, '
+            '<code>claude-opus-4-7</code>, <code>claude-haiku-4-5-20251001</code>.'
+            '</span>'
+            '</label>'
+        )
+
+        body += (
+            '<label>Panel-discussion model'
+            f'  <input type="text" name="panel_model" value="{h(s["panel_model"])}" required>'
+            '  <span class="suffix" style="display:block;">'
+            'Used when you click "Discuss with experts" on a digest. Multi-perspective '
+            'synthesis benefits from a stronger reasoning model — Opus is the default.'
+            '</span>'
+            '</label>'
+        )
+
+        body += '<label>Whisper model'
+        body += '  <select name="whisper_model">'
+        for w in whisper_choices:
+            sel = ' selected' if s["whisper_model"] == w else ''
+            body += f'    <option value="{w}"{sel}>{w}</option>'
+        body += '  </select>'
+        body += (
+            '  <span class="suffix" style="display:block;">'
+            'Local STT fallback when YouTube has no captions. Larger = better quality, '
+            'slower, bigger first-run download. <code>medium</code> is a good default.'
+            '</span>'
+            '</label>'
+        )
+
+        body += '<label>Digest language'
+        body += '  <select name="digest_language">'
+        for code, label in (
+            ("auto", "auto — match the transcript's language"),
+            ("en", "en — always English"),
+        ):
+            sel = ' selected' if s.get("digest_language", "auto") == code else ''
+            body += f'    <option value="{code}"{sel}>{label}</option>'
+        body += '  </select>'
+        body += (
+            '  <span class="suffix" style="display:block;">'
+            'Applies to both the per-video digest and the panel discussion. '
+            '<code>auto</code> writes in the source language (e.g. Chinese for a Chinese-language video). '
+            '<code>en</code> forces English regardless.'
+            '</span>'
+            '</label>'
+        )
+
+        body += '<label>Cookies from browser'
+        body += '  <select name="cookies_from_browser">'
+        for c in cookie_choices:
+            sel = ' selected' if s.get("cookies_from_browser", "") == c else ''
+            label = "(none)" if c == "" else c
+            body += f'    <option value="{c}"{sel}>{label}</option>'
+        body += '  </select>'
+        body += (
+            '  <span class="suffix" style="display:block;">'
+            'YouTube increasingly requires logged-in cookies. Pick the browser you\'re '
+            'signed into YouTube on; yt-dlp extracts cookies on each run. Leave as '
+            '"(none)" if you only digest publicly-accessible videos.'
+            '</span>'
+            '</label>'
+        )
+
+        body += '</div>'  # schedule-fields
+        body += '<button type="submit" class="primary">Save</button>'
+        body += '</form>'
+        return page(body, title="Settings", current="settings")
+
+    @app.route("/settings/save", methods=["POST"])
+    def settings_save():
+        from flask import redirect, request
+        s = load_settings()
+        for key in ("digest_model", "panel_model", "whisper_model",
+                    "cookies_from_browser", "digest_language"):
+            v = request.form.get(key)
+            if v is not None:
+                s[key] = v.strip()
+        save_settings(s)
+        return redirect("/settings?msg=Saved.")
 
     @app.route("/one-off", methods=["GET"])
     def one_off_page():
         from flask import request
         from html import escape as h
         flash = request.args.get("msg", "")
-        active = _list_active_oneoff_jobs()
+        active = _list_active_oneoff_jobs()  # also reaps exited subprocesses
+        failures = _list_recent_oneoff_failures()
 
         body = "<h1>One-off digest</h1>"
         if flash:
@@ -2195,19 +2859,61 @@ def cmd_serve(args) -> int:
             '</form>'
         )
 
-        if active:
-            body += "<h2>In progress</h2><ul class='channel-list'>"
-            import time as _t
-            for j in active:
-                elapsed = int(_t.time() - j["started"])
-                body += (
-                    '<li>'
-                    f'<span class="url"><strong>{h(j["video_id"])}</strong> · '
-                    f'{h(j["url"])}</span>'
-                    f'<span style="color: var(--muted); font-size: 12px;">{elapsed//60}m {elapsed%60}s</span>'
-                    '</li>'
-                )
-            body += "</ul>"
+        import time as _t
+        # Read the log once so per-job stage lookups don't hit disk repeatedly.
+        log_path = data_dir / "logs" / "oneoff.log"
+        try:
+            log_text = log_path.read_text(errors="replace")
+        except OSError:
+            log_text = ""
+
+        # Always render the section containers so the polling JS can target them
+        # (display:none hides them when empty).
+        active_hidden = "" if active else " style='display:none'"
+        body += f"<section id='oneoff-active-section'{active_hidden}>"
+        body += "<h2>In progress</h2>"
+        body += "<ul id='oneoff-active-list' class='channel-list'>"
+        for j in active:
+            elapsed = int(_t.time() - j["started"])
+            stage = _describe_job_stage(log_text, j["video_id"])
+            body += (
+                '<li>'
+                f'<span class="url"><strong>{h(j["video_id"])}</strong> · '
+                f'{h(j["url"])}</span>'
+                f'<span style="color: var(--muted); font-size: 12px;">'
+                f'{elapsed//60}m {elapsed%60}s · {h(stage)}</span>'
+                '</li>'
+            )
+        body += "</ul></section>"
+
+        failures_hidden = "" if failures else " style='display:none'"
+        body += f"<section id='oneoff-failures-section'{failures_hidden}>"
+        body += "<h2>Recent failures</h2>"
+        body += "<ul id='oneoff-failures-list' class='channel-list'>"
+        for f in failures:
+            ago = int(_t.time() - f["ended"])
+            if ago < 60:
+                when = f"{ago}s ago"
+            elif ago < 3600:
+                when = f"{ago // 60}m ago"
+            else:
+                when = f"{ago // 3600}h ago"
+            err = f["error"] or f"exit code {f['exit_code']}"
+            body += (
+                '<li>'
+                f'<span class="url"><strong>{h(f["video_id"])}</strong> · '
+                f'{h(f["url"])}</span>'
+                f'<span style="color: var(--muted); font-size: 12px;">{when}</span>'
+                f'<div style="color: var(--muted); font-size: 13px; margin-top: 4px;">{h(err)}</div>'
+                '</li>'
+            )
+        body += "</ul>"
+        body += (
+            "<p class='meta-info'>"
+            f"Full output: <code>{h(str(log_path))}</code>"
+            "</p>"
+        )
+        body += "</section>"
 
         body += (
             "<p class='meta-info' style='margin-top: 32px;'>"
@@ -2215,7 +2921,92 @@ def cmd_serve(args) -> int:
             "They appear in the sidebar's <strong>Digests</strong> section once ready."
             "</p>"
         )
+
+        # Polling: refresh in-progress + failures every 2s without reloading the page.
+        body += """
+<script>
+(function () {
+  const activeSection  = document.getElementById('oneoff-active-section');
+  const activeList     = document.getElementById('oneoff-active-list');
+  const failSection    = document.getElementById('oneoff-failures-section');
+  const failList       = document.getElementById('oneoff-failures-list');
+  if (!activeSection || !failSection) return;
+
+  const fmtElapsed = s => `${Math.floor(s/60)}m ${s%60}s`;
+  const fmtAgo = s => s < 60 ? `${s}s ago` : (s < 3600 ? `${Math.floor(s/60)}m ago` : `${Math.floor(s/3600)}h ago`);
+  const esc = s => { const d = document.createElement('div'); d.textContent = String(s ?? ''); return d.innerHTML; };
+
+  function render(data) {
+    const active = data.active || [];
+    activeSection.style.display = active.length ? '' : 'none';
+    activeList.innerHTML = active.map(j => `
+      <li>
+        <span class="url"><strong>${esc(j.video_id)}</strong> &middot; ${esc(j.url)}</span>
+        <span style="color: var(--muted); font-size: 12px;">${esc(fmtElapsed(j.elapsed_secs))} &middot; ${esc(j.stage)}</span>
+      </li>
+    `).join('');
+
+    const failures = data.failures || [];
+    failSection.style.display = failures.length ? '' : 'none';
+    failList.innerHTML = failures.map(f => `
+      <li>
+        <span class="url"><strong>${esc(f.video_id)}</strong> &middot; ${esc(f.url)}</span>
+        <span style="color: var(--muted); font-size: 12px;">${esc(fmtAgo(f.ago_secs))}</span>
+        <div style="color: var(--muted); font-size: 13px; margin-top: 4px;">${esc(f.error || ('exit code ' + f.exit_code))}</div>
+      </li>
+    `).join('');
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch('/one-off/status', { cache: 'no-store' });
+      if (res.ok) render(await res.json());
+    } catch (_) { /* transient — try again next tick */ }
+  }
+
+  poll();
+  setInterval(poll, 2000);
+})();
+</script>
+"""
         return page(body, title="One-off digest", current="one-off")
+
+    @app.route("/one-off/status")
+    def one_off_status():
+        from flask import jsonify
+        import time as _t
+        active = _list_active_oneoff_jobs()  # also reaps any just-exited subprocesses
+        failures = _list_recent_oneoff_failures()
+        log_path = data_dir / "logs" / "oneoff.log"
+        try:
+            log_text = log_path.read_text(errors="replace")
+        except OSError:
+            log_text = ""
+        now = _t.time()
+        return jsonify({
+            "active": [
+                {
+                    "video_id": j["video_id"],
+                    "url": j["url"],
+                    "started": j["started"],
+                    "elapsed_secs": int(now - j["started"]),
+                    "stage": _describe_job_stage(log_text, j["video_id"]),
+                }
+                for j in active
+            ],
+            "failures": [
+                {
+                    "video_id": f["video_id"],
+                    "url": f["url"],
+                    "started": f["started"],
+                    "ended": f["ended"],
+                    "ago_secs": int(now - f["ended"]),
+                    "exit_code": f["exit_code"],
+                    "error": f["error"],
+                }
+                for f in failures
+            ],
+        })
 
     @app.route("/one-off", methods=["POST"])
     def one_off_submit():
@@ -2262,6 +3053,7 @@ def cmd_serve(args) -> int:
                 cwd=digest_path.parent,
                 stdout=log_fd,
                 stderr=subprocess.STDOUT,
+                env={**os.environ, **_settings_to_env(load_settings())},
                 start_new_session=True,
             )
         finally:
@@ -2272,13 +3064,210 @@ def cmd_serve(args) -> int:
             "video_id": video_id,
             "started": _t.time(),
             "url": url,
+            "proc": proc,
         }
         return redirect(
             f"/one-off?msg=Started+digesting+{video_id}+(check+sidebar+in+a+few+minutes)"
         )
 
+    @app.route("/activity")
+    def activity_page():
+        from flask import request
+        from html import escape as h
+        import time as _t
+        flt = request.args.get("status", "all")  # all | success | failed
+        rows = _recent_runs(limit=200)
+        if flt == "success":
+            rows = [r for r in rows if r.get("success")]
+        elif flt == "failed":
+            rows = [r for r in rows if not r.get("success")]
+
+        body = "<h1>Activity</h1>"
+        body += '<p class="meta-info">Every completed one-off digest, success or failure. Persists across server restarts.</p>'
+
+        # In-progress section — live one-off jobs the reaper hasn't logged yet.
+        # Hidden by default; populated by the polling JS at the bottom of the page.
+        active_now = _list_active_oneoff_jobs()
+        log_path = data_dir / "logs" / "oneoff.log"
+        try:
+            log_text = log_path.read_text(errors="replace")
+        except OSError:
+            log_text = ""
+        active_hidden = "" if active_now else " style='display:none'"
+        body += f"<section id='activity-active-section'{active_hidden}>"
+        body += "<h2>In progress</h2>"
+        body += "<ul id='activity-active-list' class='channel-list'>"
+        for j in active_now:
+            elapsed = int(_t.time() - j["started"])
+            stage = _describe_job_stage(log_text, j["video_id"])
+            body += (
+                '<li>'
+                f'<span class="url"><strong>{h(j["video_id"])}</strong> · '
+                f'{h(j["url"])}</span>'
+                f'<span style="color: var(--muted); font-size: 12px;">'
+                f'{elapsed//60}m {elapsed%60}s · {h(stage)}</span>'
+                '</li>'
+            )
+        body += "</ul></section>"
+
+        # Polling JS for the in-progress section — emitted here so both the
+        # "no runs yet" early return and the full table path include it.
+        active_poll_js = """
+<script>
+(function () {
+  const section = document.getElementById('activity-active-section');
+  const list = document.getElementById('activity-active-list');
+  if (!section || !list) return;
+  let prevCount = list.children.length;
+  const fmtElapsed = s => `${Math.floor(s/60)}m ${s%60}s`;
+  const esc = s => { const d = document.createElement('div'); d.textContent = String(s ?? ''); return d.innerHTML; };
+  async function poll() {
+    try {
+      const res = await fetch('/one-off/status', { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+      const active = data.active || [];
+      section.style.display = active.length ? '' : 'none';
+      list.innerHTML = active.map(j => `
+        <li>
+          <span class="url"><strong>${esc(j.video_id)}</strong> &middot; ${esc(j.url)}</span>
+          <span style="color: var(--muted); font-size: 12px;">${esc(fmtElapsed(j.elapsed_secs))} &middot; ${esc(j.stage)}</span>
+        </li>
+      `).join('');
+      if (active.length < prevCount) {
+        window.location.reload();
+        return;
+      }
+      prevCount = active.length;
+    } catch (_) { /* try again */ }
+  }
+  poll();
+  setInterval(poll, 2000);
+})();
+</script>
+"""
+
+        # Filter chips
+        chip = lambda v, label, count: (
+            f'<a href="/activity?status={v}" class="filter-chip'
+            + (' active' if flt == v else '')
+            + f'">{h(label)} <span class="filter-chip-count">({count})</span></a>'
+        )
+        all_runs = _recent_runs(limit=200)
+        n_all = len(all_runs)
+        n_ok = sum(1 for r in all_runs if r.get("success"))
+        n_fail = n_all - n_ok
+        body += "<div class='filter-row'>"
+        body += chip("all", "All", n_all)
+        body += chip("success", "Success", n_ok)
+        body += chip("failed", "Failed", n_fail)
+        body += "</div>"
+
+        if not rows:
+            body += "<p class='meta-info'>No runs recorded yet. Submit a one-off digest from the <a href='/one-off'>One-off digest</a> page.</p>"
+            body += active_poll_js
+            return page(body, title="Activity", current="activity")
+
+        def _fmt_ago(secs: float) -> str:
+            secs = int(secs)
+            if secs < 60: return f"{secs}s ago"
+            if secs < 3600: return f"{secs//60}m ago"
+            if secs < 86400: return f"{secs//3600}h ago"
+            return f"{secs//86400}d ago"
+
+        def _fmt_dur(secs) -> str:
+            if secs is None: return "—"
+            secs = float(secs)
+            if secs < 60: return f"{secs:.1f}s"
+            return f"{int(secs)//60}m {int(secs)%60}s"
+
+        def _fmt_int(n) -> str:
+            if n is None: return "—"
+            n = int(n)
+            return f"{n:,}"
+
+        now = _t.time()
+        body += "<table class='activity-table'>"
+        body += (
+            "<thead><tr>"
+            "<th>When</th><th>Video</th><th>Outcome</th>"
+            "<th>Duration</th><th>Stages</th><th>Tokens</th>"
+            "</tr></thead><tbody>"
+        )
+        for r in rows:
+            video_id = r.get("video_id") or ""
+            url = r.get("url") or ""
+            ago = _fmt_ago(now - (r.get("started_at") or now))
+            dur = _fmt_dur(r.get("duration_secs"))
+            success = r.get("success")
+            if success:
+                outcome = "<span class='ok'>✓ done</span>"
+                if r.get("digest_path"):
+                    title = f'<a href="/digests/{h(video_id)}/">{h(video_id)}</a>'
+                else:
+                    title = h(video_id)
+            else:
+                stage = r.get("stage_reached") or "?"
+                outcome = f"<span class='fail'>✗ failed at {h(stage)}</span>"
+                title = h(video_id)
+            # Stage breakdown
+            parts = []
+            for label, key in [
+                ("dl", "download_secs"),
+                ("whisper", "whisper_secs"),
+                ("frames", "frames_secs"),
+                ("digest", "digest_secs"),
+                ("vision", "vision_secs"),
+            ]:
+                v = r.get(key)
+                if v is not None and v > 0.05:
+                    parts.append(f"{label} {v:.1f}s")
+            stages_cell = h(", ".join(parts)) if parts else "—"
+            # Tokens (digest only)
+            tin = r.get("digest_input_tokens")
+            tout = r.get("digest_output_tokens")
+            cache = r.get("digest_cache_read_tokens") or 0
+            if tin or tout:
+                tokens_cell = f"in {_fmt_int(tin)} · out {_fmt_int(tout)}"
+                if cache:
+                    tokens_cell += f" · cache {_fmt_int(cache)}"
+                tokens_cell = h(tokens_cell)
+            else:
+                tokens_cell = "—"
+
+            body += "<tr>"
+            body += f"<td title='{h(url)}'>{h(ago)}</td>"
+            body += f"<td>{title}"
+            extras = []
+            if r.get("source_lang"): extras.append(f"lang: {h(r['source_lang'])}")
+            if r.get("used_whisper"):
+                wm = r.get("whisper_model") or "?"
+                extras.append(f"whisper: {h(wm)}")
+            if extras:
+                body += f"<div class='activity-meta'>{' · '.join(extras)}</div>"
+            body += "</td>"
+            body += f"<td>{outcome}"
+            err = r.get("error")
+            if err and not success:
+                body += f"<div class='activity-meta activity-error'>{h(err)}</div>"
+            body += "</td>"
+            body += f"<td>{h(dur)}</td>"
+            body += f"<td class='activity-stages'>{stages_cell}</td>"
+            body += f"<td class='activity-tokens'>{tokens_cell}</td>"
+            body += "</tr>"
+        body += "</tbody></table>"
+        body += (
+            "<p class='meta-info' style='margin-top: 24px;'>"
+            f"Raw log: <code>{h(str(_oneoff_log_path()))}</code><br>"
+            f"JSONL: <code>{h(str(_runs_jsonl_path()))}</code>"
+            "</p>"
+        )
+        body += active_poll_js
+        return page(body, title="Activity", current="activity")
+
     @app.route("/digests/<video_id>/")
     def view_digest(video_id):
+        from html import escape as h
         digest_md = digests_dir / video_id / "digest.md"
         if not digest_md.exists():
             abort(404)
@@ -2286,37 +3275,144 @@ def cmd_serve(args) -> int:
             _mark_digest_read(video_id)
         except Exception:
             pass  # never block reading on a DB error
-        html = _render_markdown(digest_md.read_text())
-        return page(html, title=video_id, current=f"digest:{video_id}",
+        rendered = _render_markdown(digest_md.read_text())
+
+        # Build the action toolbar. Lives at the TOP of the page so the user
+        # doesn't have to scroll past the whole digest to find these. Discuss
+        # POST is synchronous (~60–120s for the Opus call); the JS handler
+        # disables the button on submit and swaps its label so the wait is
+        # visible. The form still posts normally; the browser navigates to the
+        # panel page on redirect.
+        panel_md = digests_dir / video_id / "panel.md"
+        panel_exists = panel_md.exists()
+        discuss_submit_js = (
+            "this.querySelector('button').disabled=true;"
+            "this.querySelector('button').textContent='Generating panel… (~60–120s)';"
+        )
+        toolbar = "<div class='digest-actions digest-toolbar'>"
+        if panel_exists:
+            toolbar += (
+                f"<a class='discuss-btn' href='/digests/{h(video_id)}/panel/'>"
+                "View panel discussion</a>"
+                f"<form method='post' action='/digests/{h(video_id)}/discuss' "
+                f"style='display:inline;' onsubmit=\"{discuss_submit_js}\">"
+                "<button type='submit' class='discuss-btn-secondary' "
+                "title='Re-runs the panel; replaces existing panel.md'>Regenerate</button>"
+                "</form>"
+            )
+        else:
+            toolbar += (
+                f"<form method='post' action='/digests/{h(video_id)}/discuss' "
+                f"style='display:inline;' onsubmit=\"{discuss_submit_js}\">"
+                "<button type='submit' class='discuss-btn' "
+                "title='Generates a panel-of-experts discussion (~60–120s, one Opus 4.7 call)'>"
+                "Discuss with experts</button>"
+                "</form>"
+            )
+        toolbar += (
+            f"<form method='post' action='/digests/{h(video_id)}/delete' style='display:inline;' "
+            "onsubmit=\"return confirm('Delete this digest? "
+            "The rendered output, frames, and cached video will be wiped.');\">"
+            "<button type='submit' class='delete-btn' "
+            "title='Wipes digest.md, frames, and cached video. Re-submit via One-off digest to regenerate.'>"
+            "Delete digest</button>"
+            "</form>"
+        )
+        toolbar += "</div>"
+
+        body = (
+            toolbar
+            + "<hr style='margin: 16px 0 32px; border: none; border-top: 1px solid var(--border);'>"
+            + rendered
+        )
+        return page(body, title=video_id, current=f"digest:{video_id}",
                     base_href=f"/digests/{video_id}/")
+
+    @app.route("/digests/<video_id>/discuss", methods=["POST"])
+    def generate_panel(video_id):
+        from flask import redirect
+        digest_md = digests_dir / video_id / "digest.md"
+        if not digest_md.exists():
+            abort(404)
+        # Find the cached SRT to feed into the panel prompt. The download dir
+        # holds whichever language track was picked (en / zh-Hans / etc.).
+        srt_dir = digests_dir / video_id / "downloads" / video_id
+        srt_files = list(srt_dir.glob("*.srt")) if srt_dir.exists() else []
+        if not srt_files:
+            return redirect(
+                f"/digests/{video_id}/?msg=No+cached+transcript.+Re-digest+the+video+first."
+            )
+        # Filename pattern: <video_id>.<lang>.srt — pull the lang back out so
+        # the panel can be written in the same language as the digest.
+        srt_path = srt_files[0]
+        lang = srt_path.stem[len(video_id) + 1:] if srt_path.stem.startswith(video_id + ".") else "en"
+        s = load_settings()
+        try:
+            segments = parse_srt(srt_path)
+            text, _usage = generate_panel_discussion(
+                digest_md.read_text(),
+                segments,
+                model=s.get("panel_model") or DEFAULT_PANEL_MODEL,
+                source_lang=lang,
+                output_language=s.get("digest_language") or "auto",
+            )
+        except Exception as e:
+            return redirect(f"/digests/{video_id}/?msg=Panel+generation+failed:+{e}")
+        (digests_dir / video_id / "panel.md").write_text(text)
+        return redirect(f"/digests/{video_id}/panel/")
+
+    @app.route("/digests/<video_id>/panel/")
+    def view_panel(video_id):
+        panel_md = digests_dir / video_id / "panel.md"
+        if not panel_md.exists():
+            abort(404)
+        rendered = _render_markdown(panel_md.read_text())
+        nav = (
+            f'<p class="meta-info" style="margin-top:0;">'
+            f'<a href="/digests/{video_id}/">← Back to digest</a></p>'
+        )
+        return page(nav + rendered, title=f"Panel · {video_id}",
+                    current=f"digest:{video_id}",
+                    base_href=f"/digests/{video_id}/panel/")
+
+    @app.route("/digests/<video_id>/delete", methods=["POST"])
+    def delete_digest(video_id):
+        from flask import redirect
+        target = digests_dir / video_id
+        if not target.exists():
+            abort(404)
+        # Wipe artifacts + cached source media. shutil handles missing children.
+        shutil.rmtree(target, ignore_errors=True)
+        # Clear read-state row.
+        try:
+            with _library_connect() as conn:
+                conn.execute("DELETE FROM digest_reads WHERE digest_id = ?", (video_id,))
+        except Exception:
+            pass
+        return redirect("/?msg=Deleted+" + video_id)
 
     @app.route("/digests/<video_id>/digest_images/<path:filename>")
     def digest_image(video_id, filename):
         return send_from_directory(digests_dir / video_id / "digest_images", filename)
 
-    @app.route("/meta/<week>/")
-    def view_meta(week):
-        meta_md = meta_dir / f"{week}.md"
-        if not meta_md.exists():
-            abort(404)
-        try:
-            _mark_meta_read(week)
-        except Exception:
-            pass
-        html = _render_markdown(meta_md.read_text())
-        return page(html, title=f"Meta-digest · {_iso_week_display(week)}",
-                    current=f"meta:{week}", base_href="/meta/")
-
     @app.errorhandler(404)
     def not_found(e):
         return page(
-            "<h1>Not found</h1><p>That digest or meta-digest doesn't exist yet.</p>",
+            "<h1>Not found</h1><p>That digest doesn't exist yet.</p>",
             title="404", current="home",
         ), 404
 
     url = f"http://127.0.0.1:{args.port}/"
     print(f"yt2md reader: {url}")
     print(f"Data dir: {data_dir}")
+    # Surface the YouTube prerequisites at startup so the user notices missing
+    # cookies / JS runtime before a one-off digest fails 30s later.
+    cookies_browser = os.environ.get("YT2MD_COOKIES_FROM_BROWSER")
+    print(f"Cookies: {cookies_browser or '(none — set YT2MD_COOKIES_FROM_BROWSER for paywalled YouTube)'}")
+    js_rt = _ensure_js_runtime_available()
+    print(f"JS runtime: {js_rt or '(not found — yt-dlp n-challenge will fail; install deno or node)'}")
+    _cleanup_legacy_launchd()
+    start_scheduler()
     print("Press Ctrl-C to stop.\n")
 
     if not args.no_browser:
@@ -2331,7 +3427,7 @@ def cmd_serve(args) -> int:
 # ---- subcommand dispatcher ----
 
 def _subcommand_main(argv: List[str]) -> int:
-    """Handle yt2md {watch,meta,schedule} ..."""
+    """Handle yt2md {watch,serve} ..."""
     ap = argparse.ArgumentParser(prog="yt2md", description="yt2md subcommands")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -2345,39 +3441,11 @@ def _subcommand_main(argv: List[str]) -> int:
     p = watch_sub.add_parser("run", help="Poll all channels and digest new videos")
     p.set_defaults(func=cmd_watch_run)
 
-    meta = sub.add_parser("meta", help="Generate cross-cutting meta-digests")
-    meta_sub = meta.add_subparsers(dest="meta_cmd", required=True)
-    p = meta_sub.add_parser("run", help="Synthesize a meta-digest of recent digests")
-    p.add_argument("--lookback-days", type=int, default=META_LOOKBACK_DAYS,
-                   help=f"Window in days (default: {META_LOOKBACK_DAYS})")
-    p.add_argument("--min-digests", type=int, default=META_MIN_DIGESTS,
-                   help=f"Skip if fewer than this many recent digests (default: {META_MIN_DIGESTS})")
-    p.add_argument("--model", default=META_MODEL_DEFAULT,
-                   help=f"Claude model (default: {META_MODEL_DEFAULT})")
-    p.set_defaults(func=cmd_meta_run)
-
-    serve = sub.add_parser("serve", help="Start a local web reader for digests")
+    serve = sub.add_parser("serve", help="Start a local web reader (also runs the in-process scheduler)")
     serve.add_argument("--port", type=int, default=7682, help="Port (default: 7682)")
     serve.add_argument("--no-browser", action="store_true",
                        help="Don't auto-open a browser tab on start")
     serve.set_defaults(func=cmd_serve)
-
-    schedule = sub.add_parser("schedule", help="Install/uninstall launchd jobs")
-    sched_sub = schedule.add_subparsers(dest="schedule_cmd", required=True)
-    p = sched_sub.add_parser("install", help="Install both launchd jobs (saves config to ~/yt2md/schedule.json)")
-    p.add_argument("--poll-hours", type=float, default=None, metavar="N",
-                   help="Polling interval in hours (default: 6, or last saved value)")
-    p.add_argument("--meta-frequency", choices=["daily", "weekly"], default=None,
-                   help="Meta-digest cadence (default: weekly)")
-    p.add_argument("--meta-weekday", type=int, choices=range(7), default=None, metavar="N",
-                   help="Day of week for weekly meta-digest: 0=Sun ... 6=Sat (default: 0)")
-    p.add_argument("--meta-time", type=str, default=None, metavar="HH:MM",
-                   help="Time of day for meta-digest (default: 09:00)")
-    p.set_defaults(func=cmd_schedule_install)
-    p = sched_sub.add_parser("uninstall", help="Remove both launchd jobs")
-    p.set_defaults(func=cmd_schedule_uninstall)
-    p = sched_sub.add_parser("status", help="Show launchd job status")
-    p.set_defaults(func=cmd_schedule_status)
 
     args = ap.parse_args(argv)
     return args.func(args)
@@ -2387,8 +3455,8 @@ def _subcommand_main(argv: List[str]) -> int:
 
 def main():
     # Subcommand dispatch — short-circuit the single-video flow when the user
-    # invokes yt2md watch / meta / schedule.
-    if len(sys.argv) > 1 and sys.argv[1] in ("watch", "meta", "schedule", "serve"):
+    # invokes yt2md watch / serve.
+    if len(sys.argv) > 1 and sys.argv[1] in ("watch", "serve"):
         load_env_files()
         sys.exit(_subcommand_main(sys.argv[1:]))
 
@@ -2407,7 +3475,8 @@ def main():
     ap.add_argument("--no-vision", action="store_true",
                     help="Disable vision-based frame picking for the digest. Cheaper but the "
                          "frames may be less illustrative.")
-    ap.add_argument("--digest-model", default="claude-sonnet-4-6",
+    ap.add_argument("--digest-model",
+                    default=os.environ.get("YT2MD_DIGEST_MODEL") or "claude-sonnet-4-6",
                     help="Claude model for the digest (default: claude-sonnet-4-6). "
                          "Use claude-opus-4-7 for the highest-quality summarization.")
     ap.add_argument("--scene-threshold", type=float, default=0.2,
@@ -2422,6 +3491,31 @@ def main():
                     help="Keep extracted frames in ./frames_<videoname>/ instead of cleaning up")
     ap.add_argument("--downloads-dir", type=Path, default=Path("downloads"),
                     help="Where to cache YouTube downloads (default: ./downloads)")
+    ap.add_argument("--source-lang", default=None, metavar="CODE",
+                    help="BCP-47 language code of a local SRT (e.g. 'zh-Hans'). "
+                         "Drives the digest's output language when --digest-language=auto. "
+                         "Ignored for URLs — yt-dlp / Whisper picks the track and the "
+                         "lang is read from the file.")
+    ap.add_argument("--digest-language",
+                    default=os.environ.get("YT2MD_DIGEST_LANGUAGE") or "auto",
+                    choices=["auto", "en"],
+                    help="Output language for the digest + panel discussion. "
+                         "'auto' (default) writes in the transcript's language. "
+                         "'en' forces English regardless of source.")
+    ap.add_argument("--whisper-model",
+                    default=os.environ.get("YT2MD_WHISPER_MODEL") or DEFAULT_WHISPER_MODEL,
+                    choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+                    help=f"faster-whisper model used as fallback when a YouTube "
+                         f"video has no captions (default: {DEFAULT_WHISPER_MODEL}).")
+    ap.add_argument("--no-whisper", action="store_true",
+                    help="Disable Whisper fallback; fail when a video has no captions.")
+    ap.add_argument("--cookies-from-browser", default=os.environ.get("YT2MD_COOKIES_FROM_BROWSER"),
+                    choices=["chrome", "firefox", "safari", "brave", "edge",
+                             "chromium", "opera", "vivaldi"],
+                    metavar="BROWSER",
+                    help="Pass cookies from this browser to yt-dlp. Required when "
+                         "YouTube returns 'Sign in to confirm you're not a bot'. "
+                         "Defaults to $YT2MD_COOKIES_FROM_BROWSER if set.")
     args = ap.parse_args()
 
     load_env_files()
@@ -2434,11 +3528,30 @@ def main():
     if do_digest:
         ensure_api_key()
 
+    import time as _time
+    timings: dict = {}
+    fetch_meta: dict = {
+        "used_whisper": False, "whisper_model": None,
+    }
+
     if is_url(args.video):
         print(f"[0/5] Fetching YouTube video: {args.video}")
-        video_path, srt_path = fetch_youtube(args.video, args.downloads_dir)
+        result = fetch_youtube(
+            args.video,
+            args.downloads_dir,
+            whisper_model=args.whisper_model,
+            allow_whisper=not args.no_whisper,
+            cookies_from_browser=args.cookies_from_browser,
+        )
+        video_path = result["mp4"]
+        srt_path = result["srt"]
+        source_lang = result["lang"]
+        timings["download"] = round(result["download_secs"], 3)
+        timings["whisper"] = round(result["whisper_secs"], 3)
+        fetch_meta["used_whisper"] = result["used_whisper"]
+        fetch_meta["whisper_model"] = result["whisper_model"]
         print(f"      mp4: {video_path}")
-        print(f"      srt: {srt_path}")
+        print(f"      srt: {srt_path} (lang: {source_lang})")
     else:
         video_path = Path(args.video)
         if not video_path.exists():
@@ -2448,6 +3561,9 @@ def main():
         srt_path = Path(args.srt)
         if not srt_path.exists():
             sys.exit(f"SRT not found: {srt_path}")
+        # Local-file path: caller didn't tell us the language; assume English.
+        # Override with --source-lang if you're digesting a non-English local SRT.
+        source_lang = args.source_lang or "en"
 
     base = video_path.stem
     digest_path = args.output if args.output is not None else Path(f"{base}_digest.md")
@@ -2469,6 +3585,7 @@ def main():
 
         print(f"[1/5] Extracting frames "
               f"(scene threshold={args.scene_threshold}, interval={args.interval}s)...")
+        _frames_t0 = _time.monotonic()
         scene_frames = extract_scene_frames(video_path, scene_dir, args.scene_threshold)
         interval_frames = extract_interval_frames(video_path, interval_dir, args.interval, duration)
         frames = merge_frames(scene_frames, interval_frames)
@@ -2478,6 +3595,7 @@ def main():
         print(f"[2/5] Deduping consecutive near-identical frames (hash distance <= {args.hash_distance})...")
         frames = dedupe_frames(frames, args.hash_distance)
         print(f"      {len(frames)} unique frames")
+        timings["frames"] = round(_time.monotonic() - _frames_t0, 3)
 
         print(f"[3/5] Parsing SRT: {srt_path.name}")
         segments = parse_srt(srt_path)
@@ -2492,11 +3610,18 @@ def main():
         else:
             print("[5/5] Skipping deck (use --deck to also write one)")
 
+        usage = None
         if do_digest:
             digest_path.parent.mkdir(parents=True, exist_ok=True)
             images_dir = digest_path.parent / f"{digest_path.stem}_images"
             print(f"[+] Generating digest with {args.digest_model} -> {digest_path}")
-            digest, usage = generate_digest(segments, video_path.stem, args.digest_model)
+            _digest_t0 = _time.monotonic()
+            digest, usage = generate_digest(
+                segments, video_path.stem, args.digest_model,
+                source_lang=source_lang,
+                output_language=args.digest_language,
+            )
+            timings["digest"] = round(_time.monotonic() - _digest_t0, 3)
             print(f"      {len(digest.topics)} topics  |  "
                   f"input: {usage.input_tokens} tokens "
                   f"(cache read: {getattr(usage, 'cache_read_input_tokens', 0)}, "
@@ -2506,9 +3631,11 @@ def main():
             vision_picks = None
             if not args.no_vision:
                 print(f"[+] Vision-picking frames with {args.digest_model}...")
+                _vision_t0 = _time.monotonic()
                 vision_picks, v_usage = vision_pick_frames(
-                    digest, frames, duration, args.digest_model
+                    digest, frames, duration, args.digest_model, segments=segments
                 )
+                timings["vision"] = round(_time.monotonic() - _vision_t0, 3)
                 print(f"      vision-selected {len(vision_picks)}/{len(digest.topics)} topics  |  "
                       f"input: {v_usage.input_tokens} tokens  |  "
                       f"output: {v_usage.output_tokens} tokens")
@@ -2530,6 +3657,23 @@ def main():
         if deck_path is not None:
             outputs.append(str(deck_path))
         print(f"\nDone. Wrote: {', '.join(outputs)}")
+
+        # Structured one-line summary parsed by the web reaper. Keep this on
+        # one line and as the LAST thing printed on success.
+        summary = {
+            "source_lang": source_lang,
+            "used_whisper": fetch_meta["used_whisper"],
+            "whisper_model": fetch_meta["whisper_model"],
+            "timings": timings,
+            "tokens": {
+                "input": getattr(usage, "input_tokens", None) if usage else None,
+                "output": getattr(usage, "output_tokens", None) if usage else None,
+                "cache_read": getattr(usage, "cache_read_input_tokens", None) if usage else None,
+                "cache_creation": getattr(usage, "cache_creation_input_tokens", None) if usage else None,
+            } if usage else None,
+            "digest_path": str(digest_path) if do_digest else None,
+        }
+        print("[summary] " + json.dumps(summary))
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
