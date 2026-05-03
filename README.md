@@ -1,215 +1,169 @@
 # youtube-to-markdown
 
-Read YouTube without watching. Subscribe to channels and get Markdown digests
-of new videos automatically — topic-segmented summaries, frames embedded as
-`<img>` tags, plus a weekly cross-cutting meta-digest. Or digest one video on
-demand. Runs entirely on your Mac.
+Read YouTube without watching. A local web app that turns videos into
+Markdown digests — topic-segmented summaries with embedded frames — so you
+can skim what was said in 30 seconds instead of sitting through 30 minutes.
 
-## Two modes
+Subscribe to channels and new videos get auto-digested in the background.
+Drop in a one-off URL when you want a single digest. Click "Discuss with
+experts" on any digest for a panel-of-experts deep-dive. Runs entirely on
+your Mac.
 
-### Subscription mode (the recommended daily-use path)
-
-Set up once, runs forever. New videos get digested in the background; a
-weekly meta-digest weaves the week's videos into one cross-cutting summary.
+## Quickstart
 
 ```bash
-# Install (requires `uv` and `ffmpeg`)
+# 1. System prerequisites (one-time)
 brew install ffmpeg uv
-uv tool install git+https://github.com/jyouturner/youtube-to-markdown
-uv tool install yt-dlp
 
-# Subscribe to a channel
-yt2md watch add https://www.youtube.com/@LennysPodcast/videos
+# 2. Get the code and install Python deps
+git clone https://github.com/jyouturner/youtube-to-markdown
+cd youtube-to-markdown
+uv sync
 
-# Schedule both jobs on your Mac (polling every 6h, meta-digest weekly)
-yt2md schedule install
+# 3. Verify everything's in place
+uv run yt2md doctor
+
+# 4. Start the reader (also runs the in-process scheduler)
+uv run yt2md serve
 ```
 
-That's it. Outputs land in `~/yt2md/digests/<video-id>/digest.md` (one per
-video) and `~/yt2md/meta/YYYY-WW.md` (one per week). Read them in Finder,
-Obsidian, or whatever you like.
+`yt2md serve` opens `http://localhost:7682/` in your browser. Everything —
+adding subscriptions, submitting one-off digests, generating panel
+discussions, configuring models — happens through that UI. First run prompts
+for an Anthropic API key
+([get one here](https://console.anthropic.com/settings/keys)).
 
-### One-off mode (digest a single video)
+## Prerequisites
 
-Saw a video and want a digest of just that one? Skip the subscription:
+| | What | Why |
+| --- | --- | --- |
+| **System** | `ffmpeg` + `ffprobe` | frame extraction |
+| **System** | `uv` (or `pip`) | Python toolchain |
+| **System** | Node 20+ (or Deno) | yt-dlp's n-challenge JavaScript solver |
+| **Config** | Anthropic API key | digest + panel-discussion LLM calls |
+| **Config (recommended)** | YouTube login in a local browser | yt-dlp passes its cookies through; many videos now require a logged-in session |
 
-```bash
-yt2md "https://youtu.be/nWzXyjXCoCE"
-```
+`yt2md doctor` checks all of these and prints a punch list with fix hints.
 
-Output lands in the current directory: `<video-id>_digest.md` + a sibling
-`_images/` folder.
-
----
-
-First run prompts for an Anthropic API key
-([get one here](https://console.anthropic.com/settings/keys)) and offers to
-save it to `~/yt2md/.env` so future runs find it
-automatically.
+If you only have Node 18 (old `/usr/local/bin/node`), the doctor and `serve`
+auto-detect newer versions installed via nvm / fnm / asdf / volta and prepend
+them to PATH. yt-dlp marks Node <20 as "unsupported" for the n-challenge.
 
 ## How it works
 
-1. **Fetch** — given a YouTube URL, download mp4 + auto-captions via `yt-dlp`,
-   cached under `./downloads/<video-id>/`.
+1. **Fetch** — `yt-dlp` downloads mp4 + auto-captions, with cookies passed
+   through from your browser. If captions don't exist (e.g. some non-English
+   videos), [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper)
+   transcribes locally.
 2. **Frame extraction** — `ffmpeg` scene detection + periodic interval sampling
-   (every 20s by default). The interval pass is what makes screen recordings work;
-   gradual scrolling rarely trips a scene cut on its own.
-3. **Dedup** — perceptual-hash (`imagehash.phash`) compared only against the *previous
-   kept frame*. Drops identical-looking neighbors, preserves recurring views (e.g.
-   returning to the same editor 5 minutes later).
-4. **Topic segmentation** — Claude reads the timestamped transcript and returns 5–12
-   topic sections (title, summary, key points), each anchored to a real timestamp.
-5. **Vision-aware frame picking** — for each topic, Claude looks at the candidate
-   frames in that topic's time window and picks the most illustrative one.
-6. **Render** — Markdown digest with `<img>` tags inline, plus the chosen frames in
-   a sibling `_images/` folder. Optionally also a PowerPoint deck (one slide per
-   kept frame, full transcript in speaker notes).
+   (every 20s by default).
+3. **Dedup** — perceptual-hash clustering keeps the *last* frame of each
+   near-identical run, so animated reveals settle on the fully-built diagram
+   instead of a blank slide.
+4. **Topic segmentation** — Claude reads the timestamped transcript and
+   returns 5–12 topic sections (title, summary, key points), anchored to real
+   timestamps.
+5. **Vision-aware frame picking** — for each topic, Claude looks at the
+   candidate frames *and the per-topic transcript slice* and picks the most
+   illustrative one. The transcript context lets it ground picks on phrases
+   like "as you can see here."
+6. **Render** — Markdown digest with `<img>` tags, in either the source
+   language (default — match the transcript) or English.
+7. **(Optional) Discuss with experts** — click the button on any digest and
+   Claude infers 3–5 domain-relevant experts (a neuroscientist for a brain
+   talk, a hardware engineer for a chip-design talk, etc.) and runs a
+   1500–2500-word panel discussion that surfaces what the speaker glossed
+   over, brings contrary readings, and connects to adjacent domains.
 
-## Subscription mode — reference
+## The web UI
 
-```bash
-yt2md watch add <CHANNEL_URL>      # subscribe to a channel
-yt2md watch list                    # see what you're watching
-yt2md watch remove <CHANNEL_URL>    # unsubscribe
-yt2md watch run                     # poll once now (no scheduler needed)
+Once `yt2md serve` is running, the sidebar gives you:
 
-yt2md meta run                      # generate a meta-digest now
+- **Digests** — every per-video digest, with unread markers
+- **Subscriptions** — manage watched channels
+- **One-off digest** — paste a URL; the digest runs in the background and
+  lands in the sidebar when ready (with live progress on `/one-off` and
+  `/activity`)
+- **Schedule** — polling cadence + "Run now" buttons
+- **Activity** — every completed run with timings, token usage, outcome.
+  Survives server restarts.
+- **Settings** — model choice (digest, panel, Whisper), output language
+  (auto / English), browser to extract YouTube cookies from
 
-yt2md schedule install              # poll every 6h + meta weekly via launchd
-yt2md schedule status               # check job status
-yt2md schedule uninstall            # remove both jobs
+Each digest page has a top toolbar:
 
-yt2md serve                         # local web reader at http://localhost:7682
-```
+- **Discuss with experts** — generates `panel.md` next to the digest
+- **Delete digest** — wipes the rendered output, frames, and cached video
 
-### Reading the digests
+## Where things live
 
-The simplest reader is `yt2md serve` — a small local web app at
-`http://localhost:7682/` that lists every digest and meta-digest, renders
-them with embedded images, and rewrites cross-references so meta-digests
-link to their source digests. Auto-opens a browser tab. Ctrl-C to stop.
+Everything is under `~/yt2md/` (override with `YT2MD_DATA=/path/to/dir`):
 
-You can also browse `~/yt2md/digests/` and `~/yt2md/meta/` directly in
-Finder, Obsidian, VS Code, or any other Markdown reader — the files are
-plain `.md`.
-
-**Everything lives in one visible directory: `~/yt2md/`** (override with
-`YT2MD_DATA=/path/to/dir`). To inspect or remove all of the tool's data,
-look in or delete that one folder. Layout:
-
-- `~/yt2md/channels.txt` — your subscriptions
+- `~/yt2md/.env` — API key + env-style overrides (auto-saved on first run)
+- `~/yt2md/settings.json` — model + language + cookies preferences
+- `~/yt2md/channels.txt` — subscriptions
 - `~/yt2md/state.json` — last-seen video IDs per channel
-- `~/yt2md/.env` — API key (auto-saved on first run)
-- `~/yt2md/digests/<video-id>/digest.md` — one per video
-- `~/yt2md/meta/YYYY-WW.md` — weekly cross-cutting synthesis
-- `~/yt2md/logs/{poll,meta}.log` — job logs
-- `~/yt2md/downloads/<video-id>/` — yt-dlp cache (re-runs skip downloaded videos)
+- `~/yt2md/schedule.json` — polling interval
+- `~/yt2md/schedule_state.json` — last-run timestamps
+- `~/yt2md/library.db` — read state, run history (SQLite)
+- `~/yt2md/digests/<video-id>/digest.md` — one digest per video
+- `~/yt2md/digests/<video-id>/panel.md` — panel discussion (when generated)
+- `~/yt2md/digests/<video-id>/digest_images/` — frames embedded in the digest
+- `~/yt2md/digests/<video-id>/downloads/` — yt-dlp / Whisper cache
+- `~/yt2md/logs/{poll,oneoff}.log` — job logs
+- `~/yt2md/logs/runs.jsonl` — append-only structured run history
 
-(The launchd plists are the one exception — macOS requires those at
-`~/Library/LaunchAgents/com.youtube-to-markdown.{poll,meta}.plist`. They're
-tiny pointer files; `yt2md schedule uninstall` removes them.)
+## Behavior notes
 
-**Behavior notes:**
-- First run on a new channel just *seeds* state without backfilling — only videos posted *after* you add the channel get digested.
-- Meta-digest synthesizes the past 7 days when at least 2 digests are present; otherwise skips.
-- Schedule defaults: poll every 6 hours; meta-digest Sundays at 9am local time.
+- **First run on a new channel** seeds state without backfilling — only
+  videos posted *after* you subscribe get digested.
+- **Permanent failures** (members-only / private / deleted videos) are
+  marked seen on first failure so polling stops cycling on them.
+  Transient failures (network, 5xx) keep retrying.
+- **Schedule pauses while serve is down**, then catches up on missed slots
+  the next time you start `yt2md serve`. Trade-off versus launchctl: one
+  fewer execution context to debug, env/PATH match what just worked in your
+  shell.
+- **Why local instead of a cloud runner?** YouTube's "sign in to confirm
+  you're not a bot" wall fires on datacenter IPs, so video downloads need a
+  residential IP. Running on your Mac sidesteps the wall entirely.
 
-**Why local instead of a cloud runner?** YouTube's "sign in to confirm you're
-not a bot" wall fires on datacenter IPs (GitHub Actions, Claude Code remote
-routines), so video downloads need a residential IP. Running on your Mac
-sidesteps the wall entirely. Tradeoff: the Mac has to be powered on for jobs
-to fire — easy to satisfy with a normally-used laptop.
+## CLI reference
 
-## One-off mode — reference
-
-```bash
-yt2md "https://youtu.be/..."                 # YouTube URL
-yt2md input.mp4 input.srt                    # local files
-yt2md "https://youtu.be/..." --deck          # also write a PowerPoint deck
-yt2md "https://youtu.be/..." --deck-only     # only the deck (no API call needed)
-yt2md "https://youtu.be/..." --no-vision     # cheaper, skip vision frame picking
-```
-
-Output (defaults) lands in the current directory:
-- `<video-name>_digest.md` — overview + 5–12 topic sections
-- `<video-name>_digest_images/topic_NN.jpg` — one frame per topic, embedded as `<img>` tags
-- `<video-name>_deck.pptx` — only when `--deck` is set
-
-YouTube downloads cache to `./downloads/<video-id>/` and re-runs on the same URL skip the download.
-
-## API key
-
-The digest needs `ANTHROPIC_API_KEY`. The tool looks in this order:
-1. The shell environment
-2. `./.env` in the current directory (per-project override)
-3. `~/yt2md/.env` (default, used by scheduled jobs)
-
-If none of those have it, the first interactive run prompts for the key and offers
-to save it to `~/yt2md/.env` so you never have to think about
-it again. Get a key at https://console.anthropic.com/settings/keys.
-
-For non-interactive contexts (CI, cron) just export `ANTHROPIC_API_KEY` directly.
-
-## Cost
-
-Default settings on a 20-min video: ~$0.16
-- Digest: ~$0.05 (Sonnet 4.6, ~9k input + ~2k output tokens)
-- Vision pass: ~$0.11 (Sonnet 4.6, ~30 frames as input)
-
-`--no-vision` drops it to ~$0.05. `--digest-model claude-opus-4-7` raises quality
-~3–5× the cost. `--deck-only` skips the API entirely.
-
-### Options
-
-| Flag | Default | Effect |
-| --- | --- | --- |
-| `-o`, `--output` | `<video-name>_digest.md` | Digest output path. |
-| `--deck [PATH]` | off | Also write a PowerPoint deck (default path: `<video-name>_deck.pptx`). |
-| `--deck-only` | off | Skip the digest entirely. No API key required. |
-| `--no-vision` | off | Skip vision-based frame picking; cheaper but less illustrative. |
-| `--digest-model` | `claude-sonnet-4-6` | Claude model for the digest. `claude-opus-4-7` for higher quality. |
-| `--scene-threshold` | `0.2` | ffmpeg scene-cut sensitivity. `0.1` = many cuts, `0.5` = only major cuts. |
-| `--interval` | `20` | Also sample one frame every N seconds. Set to `0` to disable. |
-| `--hash-distance` | `4` | Perceptual-hash dedup threshold (compared to previous kept frame only). Higher = more aggressive dedup. |
-| `--keep-frames` | off | Copy extracted frames to `./frames_<videoname>/` for inspection. |
-| `--downloads-dir` | `./downloads` | Where to cache YouTube downloads. |
-
-### Tuning
-
-- **Deck too sparse?** Lower `--interval` (e.g. `10`) or `--scene-threshold` (e.g. `0.15`).
-- **Deck too dense / lots of similar slides?** Raise `--hash-distance` (e.g. `6`) or
-  raise `--interval` (e.g. `40`).
-- **Pure scene-cut mode** (no periodic sampling): `--interval 0`.
-
-## Example
+The CLI is small now — `serve` is the primary entry point and the web UI
+covers everything else. The remaining commands:
 
 ```bash
-$ yt2md "https://youtu.be/nWzXyjXCoCE"
-[0/5] Fetching YouTube video: https://youtu.be/nWzXyjXCoCE
-      using cached downloads/nWzXyjXCoCE/
-[1/5] Extracting frames (scene threshold=0.2, interval=20.0s)...
-      18 scene + 62 interval = 80 candidate frames
-[2/5] Deduping consecutive near-identical frames (hash distance <= 4)...
-      68 unique frames
-[3/5] Parsing SRT: nWzXyjXCoCE.en.srt
-      506 transcript segments
-[4/5] Aligning transcript to frames...
-[5/5] Skipping deck (use --deck to also write one)
-[+] Generating digest with claude-sonnet-4-6 -> nWzXyjXCoCE_digest.md
-      9 topics  |  input: 7600 tokens (cache write) |  output: 1891 tokens
-[+] Vision-picking frames with claude-sonnet-4-6...
-      vision-selected 9/9 topics  |  input: 30928 tokens  |  output: 512 tokens
-      Digest written. Images in nWzXyjXCoCE_digest_images/
-
-Done. Wrote: nWzXyjXCoCE_digest.md
+yt2md doctor                          # check prerequisites and config
+yt2md serve                           # local web reader at :7682
+yt2md watch add <CHANNEL_URL>         # subscribe to a channel (or use the web UI)
+yt2md watch list                      # see subscriptions
+yt2md watch remove <CHANNEL_URL>      # unsubscribe
+yt2md watch run                       # poll once now
+yt2md "https://youtu.be/..."          # one-off digest from CLI (or use the web UI)
 ```
+
+The single-video flow accepts `--digest-model`, `--whisper-model`,
+`--cookies-from-browser`, `--digest-language`, etc. — most map to settings
+the web UI exposes; check `yt2md --help` for the full list.
+
+## Cost (defaults)
+
+Per 20-min English video, with Sonnet 4.6 + vision: ~$0.16
+- Digest pass: ~$0.05 (~9k input + ~2k output)
+- Vision frame-picking: ~$0.11 (~30 frames as input)
+
+Per panel discussion (Opus 4.7, on demand only): ~$0.30 — one click cost.
+Pick `--digest-language=en` if you want English output for non-English
+videos (slightly cheaper than Whisper-then-translate-yourself).
 
 ## Project layout
 
 ```
-youtube_to_markdown.py    main script
-setup.sh            one-shot onboarding (checks ffmpeg, installs uv, syncs deps)
-pyproject.toml      project metadata + dependencies (used by uv)
-uv.lock             pinned resolution (commit this to share an exact env)
-.python-version     pinned Python version for uv
+youtube_to_markdown.py    main script (CLI + web app + scheduler)
+setup.sh                  one-shot onboarding (checks ffmpeg, installs uv, syncs deps)
+pyproject.toml            project metadata + Python dependencies
+uv.lock                   pinned resolution
+.python-version           pinned Python version for uv
+README.md                 this file
 ```

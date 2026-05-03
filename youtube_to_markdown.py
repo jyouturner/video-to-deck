@@ -3424,6 +3424,142 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def cmd_doctor(args) -> int:
+    """Diagnose prerequisites and config. Prints check/X per item with fix hints.
+
+    Exits 0 if everything looks usable, 1 if any blocking issue was found.
+    Designed to be the first thing a new user runs after install — gives a
+    concrete punch list instead of failing mid-pipeline 30s into the first
+    digest.
+    """
+    OK, WARN, FAIL = "\033[32m✓\033[0m", "\033[33m!\033[0m", "\033[31m✗\033[0m"
+    blocking: list = []
+    advisory: list = []
+
+    def ok(msg: str) -> None:
+        print(f"  {OK} {msg}")
+
+    def warn(msg: str, hint: Optional[str] = None) -> None:
+        print(f"  {WARN} {msg}")
+        if hint:
+            print(f"      → {hint}")
+        advisory.append(msg)
+
+    def fail(msg: str, hint: Optional[str] = None) -> None:
+        print(f"  {FAIL} {msg}")
+        if hint:
+            print(f"      → {hint}")
+        blocking.append(msg)
+
+    print("\nyt2md doctor — checking prerequisites and config\n")
+
+    print("System tools:")
+    for tool in ("ffmpeg", "ffprobe"):
+        if shutil.which(tool):
+            ok(f"{tool} on PATH")
+        else:
+            fail(f"{tool} not found",
+                 "macOS: `brew install ffmpeg` · Linux: `apt install ffmpeg`")
+
+    if shutil.which("uv"):
+        try:
+            v = subprocess.run(["uv", "--version"], capture_output=True, text=True,
+                               timeout=5).stdout.strip()
+            ok(f"uv ({v})")
+        except Exception:
+            ok("uv on PATH")
+    else:
+        warn("uv not on PATH",
+             "Recommended: install via `curl -LsSf https://astral.sh/uv/install.sh | sh`")
+
+    rt = _ensure_js_runtime_available()
+    if rt:
+        rt_path = shutil.which(rt) or "(unknown)"
+        try:
+            ver = subprocess.run([rt, "--version"], capture_output=True, text=True,
+                                 timeout=5).stdout.strip()
+        except Exception:
+            ver = "?"
+        ok(f"JS runtime: {rt} {ver} ({rt_path})")
+    else:
+        fail("No JS runtime found (needed for yt-dlp's n-challenge solver)",
+             "`brew install deno` (simplest) or `nvm install 20`")
+
+    print("\nPython packages:")
+    try:
+        import yt_dlp  # type: ignore
+        ok(f"yt-dlp {yt_dlp.version.__version__}")
+    except ImportError:
+        fail("yt-dlp not installed", "Run `uv sync` from the project directory")
+    try:
+        import faster_whisper  # type: ignore  # noqa: F401
+        ok("faster-whisper installed")
+    except ImportError:
+        warn("faster-whisper not installed",
+             "Whisper fallback won't work for captionless videos. `uv sync` to install.")
+    try:
+        import anthropic  # type: ignore  # noqa: F401
+        ok("anthropic SDK installed")
+    except ImportError:
+        fail("anthropic SDK not installed", "Run `uv sync`")
+
+    print("\nAPI / auth:")
+    load_env_files()
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key:
+        ok(f"ANTHROPIC_API_KEY set ({key[:10]}…{key[-4:]})")
+    else:
+        fail("ANTHROPIC_API_KEY not set",
+             f"Get a key at https://console.anthropic.com/settings/keys; first run "
+             f"of yt2md will prompt and save it to {get_data_dir() / '.env'}")
+
+    settings = load_settings()
+    cookies = settings.get("cookies_from_browser") or os.environ.get("YT2MD_COOKIES_FROM_BROWSER", "")
+    if cookies:
+        ok(f"YouTube cookies: from browser '{cookies}'")
+    else:
+        warn("YouTube cookies not configured",
+             "Many videos now require login. Set in /settings or as "
+             "YT2MD_COOKIES_FROM_BROWSER=firefox in ~/yt2md/.env")
+
+    print("\nConfig:")
+    data_dir = get_data_dir()
+    print(f"  data dir: {data_dir}")
+    if _settings_file().exists():
+        ok(f"settings.json exists")
+    else:
+        warn("settings.json not yet created — defaults in effect",
+             f"Open http://localhost:7682/settings to configure (after `yt2md serve`)")
+    print(f"  digest model: {settings.get('digest_model')}")
+    print(f"  panel model:  {settings.get('panel_model')}")
+    print(f"  whisper model: {settings.get('whisper_model')}")
+    print(f"  digest language: {settings.get('digest_language')}")
+
+    cfg = load_schedule_config()
+    print(f"  schedule: {_format_schedule_summary(cfg)}")
+
+    digests_dir = data_dir / "digests"
+    n_digests = len([d for d in digests_dir.iterdir() if (d / "digest.md").exists()]) if digests_dir.exists() else 0
+    n_channels = len(read_channels())
+    print(f"  library: {n_digests} digest(s), {n_channels} channel(s)")
+
+    print()
+    if blocking:
+        print(f"{FAIL} {len(blocking)} blocking issue{'s' if len(blocking) != 1 else ''}; "
+              "fix the items marked above.")
+        if advisory:
+            print(f"{WARN} {len(advisory)} advisory item{'s' if len(advisory) != 1 else ''} "
+                  "(non-blocking but worth setting up).")
+        return 1
+    if advisory:
+        n = len(advisory)
+        print(f"{OK} Core requirements met. {n} advisory item"
+              f"{'s' if n != 1 else ''} {'are' if n != 1 else 'is'} optional.")
+    else:
+        print(f"{OK} All checks passed. Run `yt2md serve` to start the reader.")
+    return 0
+
+
 # ---- subcommand dispatcher ----
 
 def _subcommand_main(argv: List[str]) -> int:
@@ -3447,6 +3583,9 @@ def _subcommand_main(argv: List[str]) -> int:
                        help="Don't auto-open a browser tab on start")
     serve.set_defaults(func=cmd_serve)
 
+    doctor = sub.add_parser("doctor", help="Check prerequisites and config; print a punch list")
+    doctor.set_defaults(func=cmd_doctor)
+
     args = ap.parse_args(argv)
     return args.func(args)
 
@@ -3455,8 +3594,8 @@ def _subcommand_main(argv: List[str]) -> int:
 
 def main():
     # Subcommand dispatch — short-circuit the single-video flow when the user
-    # invokes yt2md watch / serve.
-    if len(sys.argv) > 1 and sys.argv[1] in ("watch", "serve"):
+    # invokes yt2md watch / serve / doctor.
+    if len(sys.argv) > 1 and sys.argv[1] in ("watch", "serve", "doctor"):
         load_env_files()
         sys.exit(_subcommand_main(sys.argv[1:]))
 
