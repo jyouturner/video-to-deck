@@ -12,22 +12,27 @@ your Mac.
 ## Quickstart
 
 ```bash
-# 1. System prerequisites (one-time)
-brew install ffmpeg uv
-
-# 2. Get the code and install Python deps
+# Get the code
 git clone https://github.com/jyouturner/youtube-to-markdown
 cd youtube-to-markdown
-uv sync
 
-# 3. Verify everything's in place
-uv run yt2md doctor
-
-# 4. Start the reader (also runs the in-process scheduler)
-uv run yt2md serve
+# One-command bootstrap + launch
+./run.sh
 ```
 
-`yt2md serve` opens `http://localhost:7682/` in your browser. Everything —
+`run.sh` is idempotent — it checks ffmpeg, installs uv if missing (with a
+prompt), syncs Python deps, runs `yt2md doctor` to verify the rest, and
+launches the web reader at `http://localhost:7682/`. Re-run it any time to
+restart; passing checks become no-ops.
+
+If you'd rather drive it manually:
+
+```bash
+brew install ffmpeg uv      # one-time system deps
+uv sync                     # install Python deps
+uv run yt2md doctor         # verify everything
+uv run yt2md serve          # launch reader (runs the in-process scheduler too)
+``` Everything —
 adding subscriptions, submitting one-off digests, generating panel
 discussions, configuring models — happens through that UI. First run prompts
 for an Anthropic API key
