@@ -2912,6 +2912,112 @@ _COPY_BUTTON_JS = """
 """
 
 
+# ---- shared async job tracker for in-process work surfaced via the web UI ----
+#
+# In-process daemon threads keyed by "<video_id>:<kind>" — currently used for
+# slides generation; designed to also serve panel + takeaway retrofits later.
+# Threads die with the Flask process; the work is idempotent so a lost job
+# just means the user clicks Generate again. State lives in a module dict
+# (single-process Flask, single-writer assumption holds).
+
+_local_jobs: dict = {}
+
+
+def start_local_job(key: str, fn, *args, **kwargs) -> bool:
+    """Start a daemon-thread job under `key` if one isn't already running.
+    Returns True if a new job was started, False if one was already in flight.
+    Idempotent: a second click while running is a no-op (not an error).
+    """
+    import threading
+    import time as _t
+
+    existing = _local_jobs.get(key)
+    if existing and existing["thread"].is_alive():
+        return False
+
+    job = {
+        "started": _t.time(),
+        "kind": key.split(":", 1)[-1],
+        "error": None,
+        "thread": None,
+    }
+
+    def _wrapper():
+        try:
+            fn(*args, **kwargs)
+        except Exception as e:
+            job["error"] = f"{type(e).__name__}: {e}"
+
+    t = threading.Thread(target=_wrapper, daemon=True)
+    job["thread"] = t
+    _local_jobs[key] = job
+    t.start()
+    return True
+
+
+def local_job_status(key: str) -> dict:
+    """Snapshot of a job's state. Includes a simple 'phase' string the UI can
+    render directly: 'idle' (no job ever ran or completed long ago) /
+    'running' / 'done' / 'error'.
+    """
+    import time as _t
+    job = _local_jobs.get(key)
+    if not job:
+        return {"phase": "idle"}
+    running = job["thread"].is_alive()
+    elapsed = int(_t.time() - job["started"])
+    if running:
+        return {"phase": "running", "elapsed": elapsed,
+                "started": job["started"]}
+    if job.get("error"):
+        return {"phase": "error", "elapsed": elapsed,
+                "error": job["error"]}
+    return {"phase": "done", "elapsed": elapsed}
+
+
+# Job-status polling JS shared by any toolbar element with
+# data-poll-url=<url> — polls every 2s, updates a `.elapsed` child with
+# "{n}s", and reloads the page when the artifact appears (on success) or
+# surfaces the error inline (on failure).
+_JOB_POLL_JS = """
+<script>
+(function () {
+  const el = document.querySelector('[data-poll-url]');
+  if (!el) return;
+  const url = el.getAttribute('data-poll-url');
+  const elapsedSpan = el.querySelector('.elapsed');
+  let timer = null;
+  async function tick() {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return;
+      const s = await res.json();
+      if (s.phase === 'running') {
+        if (elapsedSpan) elapsedSpan.textContent = s.elapsed + 's';
+        return;
+      }
+      if (timer) { clearInterval(timer); timer = null; }
+      if (s.phase === 'done' && s.artifact_exists) {
+        // Reload so the toolbar swaps to "Download slides".
+        window.location.href = window.location.pathname + '?msg=Slides+ready.';
+        return;
+      }
+      if (s.phase === 'error') {
+        el.innerHTML = '<span style="color: #c00;">Generation failed: ' +
+          (s.error || '(unknown error)') + '</span>';
+        return;
+      }
+      // Done but artifact missing — likely a write race. Reload anyway.
+      window.location.reload();
+    } catch (e) { /* network blip — try next tick */ }
+  }
+  tick();
+  timer = setInterval(tick, 2000);
+})();
+</script>
+"""
+
+
 def build_chat_handoff_prompt(video_id: str, digests_dir: Path) -> str:
     """Assemble a prompt the user can paste into claude.ai (or any chat) to
     continue thinking about a video. Includes whichever artifacts exist on
@@ -4710,8 +4816,10 @@ def cmd_serve(args) -> int:
         # Slides — sibling artifact alongside takeaway/panel. The visual
         # layer (intelligently-picked frames + transcript snippets) is the
         # tool's main differentiator vs. a pure-LLM workflow. Generation
-        # uses cached MP4 + SRT, no LLM calls, ~30–90s depending on video.
+        # is async (daemon thread); the toolbar renders three states.
         slides_path = digests_dir / video_id / "slides.pptx"
+        slides_job = local_job_status(f"{video_id}:slides")
+        slides_running = slides_job.get("phase") == "running"
         if slides_path.exists():
             toolbar += (
                 f"<a class='discuss-btn-secondary' style='text-decoration:none;' "
@@ -4720,17 +4828,22 @@ def cmd_serve(args) -> int:
                 "(one slide per topic, with intelligently-picked frames).'>"
                 "Download slides</a>"
             )
-        else:
-            gen_submit_js_slides = (
-                "this.querySelector('button').disabled=true;"
-                "this.querySelector('button').textContent='Generating slides… (~30–90s)';"
+        elif slides_running:
+            elapsed = slides_job.get("elapsed", 0)
+            toolbar += (
+                f"<span class='discuss-btn-secondary' style='cursor: default;' "
+                f"data-poll-url='/digests/{h(video_id)}/job-status?kind=slides'>"
+                f"Generating slides… <span class='elapsed'>{elapsed}s</span>"
+                "</span>"
             )
+        else:
             toolbar += (
                 f"<form method='post' action='/digests/{h(video_id)}/slides' "
-                f"style='display:inline;' onsubmit=\"{gen_submit_js_slides}\">"
+                f"style='display:inline;'>"
                 "<button type='submit' class='discuss-btn-secondary' "
                 "title='Builds slides.pptx from the cached video — local frame "
-                "extraction + alignment + PowerPoint assembly. No LLM call.'>"
+                "extraction + alignment + PowerPoint assembly. No LLM call. "
+                "Runs in the background; this page will refresh when ready.'>"
                 "Generate slides</button>"
                 "</form>"
             )
@@ -4761,10 +4874,15 @@ def cmd_serve(args) -> int:
             f'{h(md_source)}</textarea>'
         )
 
+        # Inject the polling JS only when there's actually a job in flight,
+        # so the steady state has zero JS overhead beyond the existing copy
+        # handler.
+        poll_js = _JOB_POLL_JS if slides_running else ""
         body = (
             toolbar
             + hidden_md
             + _COPY_BUTTON_JS
+            + poll_js
             + "<hr style='margin: 16px 0 32px; border: none; border-top: 1px solid var(--border);'>"
             + rendered
         )
@@ -4953,32 +5071,32 @@ def cmd_serve(args) -> int:
             as_attachment=True, download_name=f"{video_id}.pptx",
         )
 
-    @app.route("/digests/<video_id>/slides", methods=["POST"])
-    def generate_slides_route(video_id):
-        from flask import redirect
+    def _build_slides_for_digest(video_id: str) -> None:
+        """Synchronous slides-only pipeline against cached MP4 + SRT.
+        Raises on any failure; the caller (sync or async) is expected to
+        catch and surface the error. Idempotent: writes slides.pptx atomically
+        via a temp suffix swap so a partial write doesn't leave a corrupt file.
+        """
         from concurrent.futures import ThreadPoolExecutor
         cache_dir = digests_dir / video_id / "downloads" / video_id
         if not cache_dir.exists():
-            return redirect(
-                f"/digests/{video_id}/?msg=No+cached+video.+Re-digest+the+video+first."
-            )
+            raise RuntimeError("No cached video. Re-digest the video first.")
         mp4_path = cache_dir / f"{video_id}.mp4"
         srt_files = list(cache_dir.glob("*.srt"))
         if not mp4_path.exists() or not srt_files:
-            return redirect(
-                f"/digests/{video_id}/?msg=Cached+video+or+SRT+missing.+Re-digest+the+video+first."
+            raise RuntimeError(
+                "Cached video or SRT missing. Re-digest the video first."
             )
         srt_path = srt_files[0]
-
-        # Pure local pipeline — no LLM. Mirrors the slides leg of main()
-        # but reads from the digest's existing cache instead of downloading.
         workdir = Path(tempfile.mkdtemp(prefix="v2d_slides_"))
         scene_dir = workdir / "scene"
         interval_dir = workdir / "interval"
         try:
             duration = get_video_duration(mp4_path)
             with ThreadPoolExecutor(max_workers=2) as pool:
-                scene_fut = pool.submit(extract_scene_frames, mp4_path, scene_dir, 0.2)
+                scene_fut = pool.submit(
+                    extract_scene_frames, mp4_path, scene_dir, 0.2,
+                )
                 interval_fut = pool.submit(
                     extract_interval_frames, mp4_path, interval_dir, 20.0, duration,
                 )
@@ -4997,18 +5115,37 @@ def cmd_serve(args) -> int:
                     if line.startswith("# "):
                         title = line[2:].strip()
                         break
-            build_deck(
-                slides_data,
-                digests_dir / video_id / "slides.pptx",
-                title,
-            )
-        except Exception as e:
-            return redirect(
-                f"/digests/{video_id}/?msg=Slides+generation+failed:+{type(e).__name__}:+{e}"
-            )
+            # Write through a temp path then rename so the polling UI
+            # never sees a half-written .pptx as "ready".
+            tmp_out = digests_dir / video_id / "slides.pptx.tmp"
+            build_deck(slides_data, tmp_out, title)
+            tmp_out.replace(digests_dir / video_id / "slides.pptx")
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
-        return redirect(f"/digests/{video_id}/?msg=Slides+generated.")
+
+    @app.route("/digests/<video_id>/slides", methods=["POST"])
+    def generate_slides_route(video_id):
+        from flask import redirect
+        # Slides already on disk — no-op, just bounce back.
+        if (digests_dir / video_id / "slides.pptx").exists():
+            return redirect(f"/digests/{video_id}/?msg=Slides+already+exist.")
+        # Spawn the job and return immediately. The UI polls
+        # /job-status?kind=slides for progress and reloads when done.
+        start_local_job(f"{video_id}:slides", _build_slides_for_digest, video_id)
+        return redirect(f"/digests/{video_id}/")
+
+    @app.route("/digests/<video_id>/job-status")
+    def job_status_route(video_id):
+        from flask import jsonify, request
+        kind = request.args.get("kind", "slides")
+        snap = local_job_status(f"{video_id}:{kind}")
+        # Surface artifact presence so the polling UI can decide whether to
+        # reload to the success state or show "missing" after a clean exit.
+        if kind == "slides":
+            snap["artifact_exists"] = (
+                (digests_dir / video_id / "slides.pptx").exists()
+            )
+        return jsonify(snap)
 
     @app.errorhandler(404)
     def not_found(e):
