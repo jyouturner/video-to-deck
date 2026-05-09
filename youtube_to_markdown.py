@@ -487,21 +487,6 @@ def format_timestamp(seconds: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
 
 
-def _shorten(text: str, max_chars: int = 280) -> str:
-    """Trim a transcript chunk to a slide-friendly length on a sentence boundary."""
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) <= max_chars:
-        return text
-    cut = text[:max_chars]
-    # Prefer to end on sentence punctuation, then on a word boundary
-    for sep in (". ", "! ", "? "):
-        idx = cut.rfind(sep)
-        if idx >= max_chars * 0.5:
-            return cut[: idx + 1].strip()
-    idx = cut.rfind(" ")
-    return (cut[:idx] if idx > 0 else cut).strip() + "…"
-
-
 def build_deck(slides_data, output: Path, video_name: str) -> None:
     from pptx import Presentation
     from pptx.util import Inches, Pt
@@ -523,12 +508,13 @@ def build_deck(slides_data, output: Path, video_name: str) -> None:
     sub.text_frame.paragraphs[0].text = f"{len(slides_data)} slides extracted from video"
     sub.text_frame.paragraphs[0].font.size = Pt(18)
 
-    # Layout: image on top (~5"), transcript snippet below (~1.6"), footer at bottom.
+    # Layout: image fills most of the slide (image-first, deck-replication
+    # framing). The full transcript chunk lives in PowerPoint's speaker
+    # notes so anyone who wants the narration can open it via View → Notes
+    # Page; the slide itself stays clean.
     img_top_in = 0.3
-    img_max_h_in = 5.0
+    img_max_h_in = 6.8
     img_max_w_in = 12.33
-    text_top_in = 5.5
-    text_h_in = 1.6
     footer_top_in = 7.15
 
     for idx, (frame_path, start, end, transcript) in enumerate(slides_data, 1):
@@ -547,18 +533,8 @@ def build_deck(slides_data, output: Path, video_name: str) -> None:
             width=Inches(disp_w), height=Inches(disp_h),
         )
 
-        # On-slide transcript snippet
-        snippet = _shorten(transcript, 280) if transcript else ""
-        if snippet:
-            tx = slide.shapes.add_textbox(Inches(0.5), Inches(text_top_in),
-                                          Inches(12.33), Inches(text_h_in))
-            tf = tx.text_frame
-            tf.word_wrap = True
-            para = tf.paragraphs[0]
-            para.text = snippet
-            para.font.size = Pt(14)
-
-        # Footer with time range + slide number
+        # Footer with time range + slide number — useful provenance, small
+        # enough not to compete with the image.
         footer = slide.shapes.add_textbox(Inches(0.3), Inches(footer_top_in), Inches(12.7), Inches(0.3))
         fp = footer.text_frame.paragraphs[0]
         fp.text = f"{format_timestamp(start)} – {format_timestamp(end)}   |   Slide {idx}"
