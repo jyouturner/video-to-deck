@@ -329,6 +329,63 @@ def load_env_files() -> None:
         load_dotenv(e)
 
 
+def set_env_var(name: str, value: str) -> Path:
+    """Persist <name>=<value> to ~/yt2md/.env, preserving other entries.
+
+    Uses dotenv.set_key for round-trip safe updates (vs. naive overwrite, which
+    would clobber co-resident keys). Also updates os.environ so the running
+    process sees the new value immediately. Returns the .env path.
+    """
+    from dotenv import set_key
+
+    e = env_file()
+    e.parent.mkdir(parents=True, exist_ok=True)
+    if not e.exists():
+        e.touch()
+    try:
+        os.chmod(e, 0o600)
+    except OSError:
+        pass
+    set_key(str(e), name, value, quote_mode="never")
+    os.environ[name] = value
+    return e
+
+
+API_KEY_COST_NOTE = (
+    "Anthropic bills your API key per request (separate from any Claude.ai "
+    "subscription). Rough costs: a 30-min digest is ~$0.03 with "
+    "<code>claude-sonnet-4-6</code> (default), ~$0.15 with "
+    "<code>claude-opus-4-7</code>. The panel discussion adds one Opus call "
+    "(~$0.10). Add a payment method at "
+    '<a href="https://console.anthropic.com/settings/billing" target="_blank" '
+    'rel="noopener">console.anthropic.com/settings/billing</a>.'
+)
+
+
+def validate_api_key(key: str) -> Optional[str]:
+    """Send a 1-token request to the cheapest model to verify auth. Returns
+    None on success, otherwise a short human-readable error string.
+    """
+    import anthropic
+
+    try:
+        client = anthropic.Anthropic(api_key=key)
+        client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1,
+            messages=[{"role": "user", "content": "ok"}],
+        )
+        return None
+    except anthropic.AuthenticationError:
+        return "key rejected by Anthropic (authentication failed)."
+    except anthropic.PermissionDeniedError as e:
+        return f"key authenticated but lacks permission: {e}"
+    except anthropic.APIConnectionError as e:
+        return f"could not reach Anthropic: {e}"
+    except Exception as e:
+        return f"unexpected error: {type(e).__name__}: {e}"
+
+
 def ensure_api_key() -> None:
     """Make sure ANTHROPIC_API_KEY is set, prompting + saving on first run if interactive."""
     if os.environ.get("ANTHROPIC_API_KEY"):
@@ -343,7 +400,7 @@ def ensure_api_key() -> None:
         sys.exit(
             f"{msg}\n"
             "Then either export it (`export ANTHROPIC_API_KEY=...`) or save it via:\n"
-            f"  mkdir -p {e.parent} && echo 'ANTHROPIC_API_KEY=sk-ant-...' > {e}"
+            f"  mkdir -p {e.parent} && echo 'ANTHROPIC_API_KEY=sk-ant-...' >> {e}"
         )
 
     print(msg)
@@ -355,14 +412,10 @@ def ensure_api_key() -> None:
         f"Save it to {e} so future runs find it automatically? [Y/n] "
     ).strip().lower()
     if save in ("", "y", "yes"):
-        e.parent.mkdir(parents=True, exist_ok=True)
-        e.write_text(f"ANTHROPIC_API_KEY={key}\n")
-        try:
-            os.chmod(e, 0o600)
-        except OSError:
-            pass
+        set_env_var("ANTHROPIC_API_KEY", key)
         print(f"      saved to {e}")
-    os.environ["ANTHROPIC_API_KEY"] = key
+    else:
+        os.environ["ANTHROPIC_API_KEY"] = key
 
 
 # ---------- YouTube fetch ----------
@@ -581,6 +634,7 @@ def fetch_youtube(
 
     Returns a dict with:
       mp4 (Path), srt (Path), lang (str),
+      title (str), webpage_url (str),
       download_secs (float), whisper_secs (float),
       used_whisper (bool), whisper_model (Optional[str]).
 
@@ -623,6 +677,8 @@ def fetch_youtube(
     with yt_dlp.YoutubeDL(probe_opts) as ydl:
         info = ydl.extract_info(url, download=False)
     video_id = info["id"]
+    title = info.get("title") or video_id
+    webpage_url = info.get("webpage_url") or url
     out_dir = cache_root / video_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -635,6 +691,7 @@ def fetch_youtube(
         print(f"      using cached {out_dir}/ (lang: {lang})")
         return {
             "mp4": mp4_path, "srt": existing_srt, "lang": lang,
+            "title": title, "webpage_url": webpage_url,
             "download_secs": 0.0, "whisper_secs": 0.0,
             "used_whisper": False, "whisper_model": None,
         }
@@ -696,6 +753,7 @@ def fetch_youtube(
         lang = srt_found.stem[len(video_id) + 1:]
         return {
             "mp4": mp4_path, "srt": srt_found, "lang": lang,
+            "title": title, "webpage_url": webpage_url,
             "download_secs": download_secs, "whisper_secs": 0.0,
             "used_whisper": False, "whisper_model": None,
         }
@@ -705,6 +763,7 @@ def fetch_youtube(
     whisper_secs = _time.monotonic() - whisper_t0
     return {
         "mp4": mp4_path, "srt": srt_path, "lang": lang,
+        "title": title, "webpage_url": webpage_url,
         "download_secs": download_secs, "whisper_secs": whisper_secs,
         "used_whisper": True, "whisper_model": whisper_model,
     }
@@ -1105,11 +1164,17 @@ def write_markdown_digest(
     output_md: Path,
     images_dir: Path,
     vision_picks: Optional[dict] = None,
+    video_title: Optional[str] = None,
+    video_url: Optional[str] = None,
 ) -> None:
     """Render the digest as Markdown with <img> tags. Copies frames into images_dir.
 
     If vision_picks is provided, prefer those mappings; fall back to timestamp-based picks
     for any topic not covered.
+
+    video_title (when provided) overrides the LLM-generated title so the digest's
+    heading matches the original YouTube title — readers can map it back to the
+    source. video_url renders a "Watch on YouTube" link directly under the title.
     """
     images_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1135,8 +1200,12 @@ def write_markdown_digest(
 
     rel_dir = images_dir.name  # render as "images/topic_NN.jpg"
     lines: List[str] = []
-    lines.append(f"# {digest.title}")
+    heading = video_title if video_title else digest.title
+    lines.append(f"# {heading}")
     lines.append("")
+    if video_url:
+        lines.append(f"**Watch on YouTube:** <{video_url}>")
+        lines.append("")
     lines.append(digest.overview)
     lines.append("")
     for i, topic in enumerate(topics):
@@ -2478,6 +2547,22 @@ def cmd_serve(args) -> int:
         for d in digests:
             d["unread"] = d["id"] not in read_digests
         unread_digest_count = sum(1 for d in digests if d["unread"])
+
+        # Persistent banner above every page when the API key is missing. Reading
+        # cached digests still works without it; only generation does, so we
+        # warn rather than gate. The Setup page is the one place this is hidden
+        # (the page itself IS the configuration UI).
+        if current != "setup" and not os.environ.get("ANTHROPIC_API_KEY"):
+            banner = (
+                '<div class="flash" style="border-left-color: #c00;">'
+                '<strong>API key not configured.</strong> '
+                'Anthropic API access is required to generate digests and panel '
+                'discussions. Reading existing digests still works. '
+                '<a href="/setup">Set it up →</a>'
+                '</div>'
+            )
+            body = banner + body
+
         return render_template_string(
             SERVE_PAGE_TEMPLATE,
             body=body,
@@ -2489,10 +2574,27 @@ def cmd_serve(args) -> int:
             unread_digest_count=unread_digest_count,
         )
 
+    def _require_api_key_or_redirect():
+        """Helper for action endpoints: returns a redirect Response if no key,
+        else None. Use as: r = _require_api_key_or_redirect(); if r: return r."""
+        from flask import redirect
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            return None
+        return redirect("/setup?msg=API+key+required+to+run+this+action.")
+
     @app.route("/")
     def home():
+        from flask import redirect
         digests = _list_digests(digests_dir)
         channels = read_channels()
+
+        # True first-run (no key, no digests, no channels): land directly on
+        # the setup page so the user isn't asked to subscribe before they can
+        # generate anything. Skip when there are existing digests — those
+        # should still be readable even without a key.
+        if (not digests and not channels
+                and not os.environ.get("ANTHROPIC_API_KEY")):
+            return redirect("/setup")
 
         # Empty states first — show a real CTA, not a list of zero items.
         if not digests:
@@ -2700,6 +2802,9 @@ def cmd_serve(args) -> int:
     @app.route("/schedule/run/<job>", methods=["POST"])
     def schedule_run(job):
         from flask import redirect
+        gate = _require_api_key_or_redirect()
+        if gate is not None:
+            return gate
         if job != "poll":
             abort(404)
         with _schedule_lock():
@@ -2740,13 +2845,38 @@ def cmd_serve(args) -> int:
         if flash:
             body += f'<div class="flash">{h(flash)}</div>'
         body += (
-            '<p class="meta-info">Stored in <code>~/yt2md/settings.json</code>. '
+            '<p class="meta-info">Stored in <code>~/yt2md/settings.json</code> '
+            '(API key in <code>~/yt2md/.env</code>). '
             'New values take effect on the next one-off submit / scheduled poll / '
             '"Discuss with experts" click — no restart required.</p>'
         )
 
         body += '<form method="post" action="/settings/save" class="schedule-form">'
         body += '<div class="schedule-fields" style="grid-template-columns: 1fr;">'
+
+        cur_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if cur_key:
+            cur_state = (
+                f'<span style="color: var(--accent);">set</span> '
+                f'(<code>{h(cur_key[:7])}…{h(cur_key[-4:])}</code>)'
+            )
+        else:
+            cur_state = '<span style="color: #c00;">not set</span>'
+        body += (
+            '<label>Anthropic API key'
+            '  <input type="password" name="anthropic_api_key" '
+            '    placeholder="sk-ant-... (leave blank to keep current)" '
+            '    autocomplete="off">'
+            '  <span class="suffix" style="display:block;">'
+            f'    Current: {cur_state}. '
+            f'    {API_KEY_COST_NOTE} '
+            '    Get a key at '
+            '    <a href="https://console.anthropic.com/settings/keys" target="_blank" '
+            '       rel="noopener">console.anthropic.com/settings/keys</a>. '
+            '    The key is validated on save with a 1-token test call.'
+            '  </span>'
+            '</label>'
+        )
 
         body += (
             '<label>Digest model'
@@ -2824,6 +2954,7 @@ def cmd_serve(args) -> int:
     @app.route("/settings/save", methods=["POST"])
     def settings_save():
         from flask import redirect, request
+        from urllib.parse import quote_plus
         s = load_settings()
         for key in ("digest_model", "panel_model", "whisper_model",
                     "cookies_from_browser", "digest_language"):
@@ -2831,7 +2962,97 @@ def cmd_serve(args) -> int:
             if v is not None:
                 s[key] = v.strip()
         save_settings(s)
+
+        # API key is stored separately (.env, not settings.json) so non-secret
+        # config can be checked into a shared settings file without leaking it.
+        new_key = (request.form.get("anthropic_api_key") or "").strip()
+        if new_key:
+            err = validate_api_key(new_key)
+            if err:
+                return redirect(
+                    f"/settings?msg=Settings+saved+but+API+key+rejected:+{quote_plus(err)}"
+                )
+            set_env_var("ANTHROPIC_API_KEY", new_key)
+            return redirect("/settings?msg=Saved+(API+key+validated).")
         return redirect("/settings?msg=Saved.")
+
+    @app.route("/setup", methods=["GET"])
+    def setup_page():
+        from flask import request
+        from html import escape as h
+        flash = request.args.get("msg", "")
+
+        cur_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        already_set = bool(cur_key)
+
+        body = "<h1>Set up your Anthropic API key</h1>"
+        if flash:
+            body += f'<div class="flash">{h(flash)}</div>'
+
+        if already_set:
+            body += (
+                '<div class="flash" style="border-left-color: var(--accent);">'
+                f'<strong>A key is already configured</strong> '
+                f'(<code>{h(cur_key[:7])}…{h(cur_key[-4:])}</code>). '
+                'Submit a new one below to replace it, or '
+                '<a href="/">go to your library</a>.'
+                '</div>'
+            )
+        else:
+            body += (
+                '<p class="meta-info">yt2md uses your own Anthropic API key to '
+                'generate digests and panel discussions. The key is stored '
+                'locally in <code>~/yt2md/.env</code> and never leaves your '
+                'machine except when calling Anthropic.</p>'
+            )
+
+        body += (
+            '<div class="next-step">'
+            '<strong>Steps</strong>'
+            '<ol style="margin: 8px 0 0 20px; padding: 0;">'
+            '<li>Sign in to <a href="https://console.anthropic.com/settings/keys" '
+            'target="_blank" rel="noopener">console.anthropic.com/settings/keys</a> '
+            '(create an account if you don\'t have one).</li>'
+            '<li>Add a payment method at '
+            '<a href="https://console.anthropic.com/settings/billing" '
+            'target="_blank" rel="noopener">Billing</a> — note: your Claude.ai '
+            'subscription does not cover API usage; they\'re billed separately.</li>'
+            '<li>Click <strong>Create Key</strong>, copy the value (starts with '
+            '<code>sk-ant-</code>), and paste it below.</li>'
+            '</ol>'
+            f'<p style="margin-top: 12px;">{API_KEY_COST_NOTE}</p>'
+            '</div>'
+        )
+
+        body += '<form method="post" action="/setup/save" class="schedule-form">'
+        body += '<div class="schedule-fields" style="grid-template-columns: 1fr;">'
+        body += (
+            '<label>Anthropic API key'
+            '  <input type="password" name="anthropic_api_key" '
+            '    placeholder="sk-ant-..." autocomplete="off" autofocus required>'
+            '  <span class="suffix" style="display:block;">'
+            '    Validated with a 1-token test call before being saved.'
+            '  </span>'
+            '</label>'
+        )
+        body += '</div>'
+        body += '<button type="submit" class="primary">Save and validate</button>'
+        body += '</form>'
+
+        return page(body, title="Set up", current="setup")
+
+    @app.route("/setup/save", methods=["POST"])
+    def setup_save():
+        from flask import redirect, request
+        from urllib.parse import quote_plus
+        new_key = (request.form.get("anthropic_api_key") or "").strip()
+        if not new_key:
+            return redirect("/setup?msg=Paste+a+key+first.")
+        err = validate_api_key(new_key)
+        if err:
+            return redirect(f"/setup?msg=Key+rejected:+{quote_plus(err)}")
+        set_env_var("ANTHROPIC_API_KEY", new_key)
+        return redirect("/?msg=API+key+saved.+You+can+now+generate+digests.")
 
     @app.route("/one-off", methods=["GET"])
     def one_off_page():
@@ -3012,6 +3233,9 @@ def cmd_serve(args) -> int:
     def one_off_submit():
         from flask import redirect, request
         import time as _t
+        gate = _require_api_key_or_redirect()
+        if gate is not None:
+            return gate
         url = request.form.get("url", "").strip()
         if not url:
             return redirect("/one-off?msg=URL+is+required")
@@ -3331,6 +3555,9 @@ def cmd_serve(args) -> int:
     @app.route("/digests/<video_id>/discuss", methods=["POST"])
     def generate_panel(video_id):
         from flask import redirect
+        gate = _require_api_key_or_redirect()
+        if gate is not None:
+            return gate
         digest_md = digests_dir / video_id / "digest.md"
         if not digest_md.exists():
             abort(404)
@@ -3405,6 +3632,11 @@ def cmd_serve(args) -> int:
     url = f"http://127.0.0.1:{args.port}/"
     print(f"yt2md reader: {url}")
     print(f"Data dir: {data_dir}")
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        print(f"API key: set ({api_key[:7]}…{api_key[-4:]})")
+    else:
+        print(f"API key: (not set — first-run setup at {url}setup)")
     # Surface the YouTube prerequisites at startup so the user notices missing
     # cookies / JS runtime before a one-off digest fails 30s later.
     cookies_browser = os.environ.get("YT2MD_COOKIES_FROM_BROWSER")
@@ -3672,6 +3904,8 @@ def main():
     fetch_meta: dict = {
         "used_whisper": False, "whisper_model": None,
     }
+    video_title: Optional[str] = None
+    video_url: Optional[str] = None
 
     if is_url(args.video):
         print(f"[0/5] Fetching YouTube video: {args.video}")
@@ -3685,6 +3919,8 @@ def main():
         video_path = result["mp4"]
         srt_path = result["srt"]
         source_lang = result["lang"]
+        video_title = result.get("title")
+        video_url = result.get("webpage_url")
         timings["download"] = round(result["download_secs"], 3)
         timings["whisper"] = round(result["whisper_secs"], 3)
         fetch_meta["used_whisper"] = result["used_whisper"]
@@ -3756,7 +3992,7 @@ def main():
             print(f"[+] Generating digest with {args.digest_model} -> {digest_path}")
             _digest_t0 = _time.monotonic()
             digest, usage = generate_digest(
-                segments, video_path.stem, args.digest_model,
+                segments, video_title or video_path.stem, args.digest_model,
                 source_lang=source_lang,
                 output_language=args.digest_language,
             )
@@ -3779,7 +4015,10 @@ def main():
                       f"input: {v_usage.input_tokens} tokens  |  "
                       f"output: {v_usage.output_tokens} tokens")
 
-            write_markdown_digest(digest, frames, duration, digest_path, images_dir, vision_picks)
+            write_markdown_digest(
+                digest, frames, duration, digest_path, images_dir, vision_picks,
+                video_title=video_title, video_url=video_url,
+            )
             print(f"      Digest written. Images in {images_dir}/")
 
         if args.keep_frames:
