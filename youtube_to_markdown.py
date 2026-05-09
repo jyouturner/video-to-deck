@@ -298,6 +298,7 @@ def classify_slides_via_grids(
     backend,
     model: str,
     workdir: Path,
+    log_video_id: Optional[str] = None,
 ) -> List[Tuple[Path, float]]:
     """Use vision LLM (typically Haiku via grids) to filter frames down to
     distinct deck slides. Returns the kept frames in chronological order.
@@ -305,6 +306,9 @@ def classify_slides_via_grids(
     On any failure (LLM error, malformed response, or implausibly small
     output), returns the input frames unchanged so the caller still gets a
     deck — just a less-pruned one.
+
+    log_video_id (optional): when provided, each per-grid LLM call is
+    recorded to the cost-audit log under kind='slide_classifier'.
     """
     from pydantic import BaseModel
     from typing import List as TList, Literal
@@ -368,7 +372,7 @@ def classify_slides_via_grids(
              "Classify each cell. Return one label per real cell, in order."},
         ]
         try:
-            parsed, _usage = backend.vision_parse(
+            parsed, grid_usage = backend.vision_parse(
                 system=system_prompt,
                 content_blocks=content_blocks,
                 model=model,
@@ -378,6 +382,11 @@ def classify_slides_via_grids(
         except Exception:
             # Defensive: any LLM failure leaves the candidate set intact.
             return frames
+        if log_video_id is not None:
+            record_llm_usage(
+                video_id=log_video_id, kind="slide_classifier",
+                model=model, backend_name=backend.name, usage=grid_usage,
+            )
 
         for cell_label in parsed.labels:
             cell_pos = cell_label.cell - 1  # back to 0-indexed
@@ -635,10 +644,17 @@ def validate_api_key(key: str) -> Optional[str]:
 
     try:
         client = anthropic.Anthropic(api_key=key)
-        client.messages.create(
+        resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=1,
             messages=[{"role": "user", "content": "ok"}],
+        )
+        # Even validation pings cost a few tokens — record so the audit
+        # log is complete.
+        record_llm_usage(
+            video_id=None, kind="validation",
+            model="claude-haiku-4-5-20251001",
+            backend_name="api", usage=resp.usage,
         )
         return None
     except anthropic.AuthenticationError:
@@ -1392,6 +1408,142 @@ class VisionUnsupported(Exception):
 def _zero_usage() -> _SN:
     return _SN(input_tokens=0, output_tokens=0,
                cache_read_input_tokens=0, cache_creation_input_tokens=0)
+
+
+# ---------- Cost audit / pricing ----------
+#
+# Per-million-token rates in USD. Used for the cost-transparency layer
+# so the user can see per-call and aggregate spend. Update when Anthropic
+# adjusts pricing; users can override via the `model_pricing` setting.
+# Ranges as of May 2026; treat as estimates.
+#
+# Cache-read is the discounted price for tokens the API serves from prompt
+# cache; cache-creation is the surcharge for the FIRST time the cached
+# block is seen. Anthropic publishes both; both matter for our usage shape
+# (digest + panel + takeaway re-cite the transcript).
+
+DEFAULT_MODEL_PRICING: dict = {
+    # Sonnet 4.6 — digest, takeaway, vision-pick, on-demand panel re-runs
+    "claude-sonnet-4-6": {
+        "input": 3.0, "output": 15.0,
+        "cache_read": 0.30, "cache_creation": 3.75,
+    },
+    # Opus 4.7 — panel discussion (highest-quality multi-perspective)
+    "claude-opus-4-7": {
+        "input": 15.0, "output": 75.0,
+        "cache_read": 1.50, "cache_creation": 18.75,
+    },
+    # Haiku 4.5 — slide classifier, validation pings
+    "claude-haiku-4-5-20251001": {
+        "input": 0.80, "output": 4.0,
+        "cache_read": 0.08, "cache_creation": 1.0,
+    },
+    # Older / aliases that may show up in saved settings.json:
+    "claude-haiku-4-5": {
+        "input": 0.80, "output": 4.0,
+        "cache_read": 0.08, "cache_creation": 1.0,
+    },
+}
+
+
+def _model_pricing(model: str) -> Optional[dict]:
+    """Resolve pricing for a model name. Settings can override via
+    settings['model_pricing'][model]; falls back to the default table.
+    """
+    try:
+        s = load_settings()
+        override = (s.get("model_pricing") or {}).get(model)
+        if override:
+            return override
+    except Exception:
+        pass
+    return DEFAULT_MODEL_PRICING.get(model)
+
+
+def estimate_cost_usd(model: str, usage) -> float:
+    """Dollar estimate for a single LLM call. Returns 0.0 when pricing is
+    unknown for the model — caller can choose to surface that as 'n/a'.
+    Token attributes default to 0 if missing (Claude Code backend).
+    """
+    rates = _model_pricing(model)
+    if not rates:
+        return 0.0
+
+    def _tok(name: str) -> int:
+        return int(getattr(usage, name, 0) or 0)
+
+    return (
+        _tok("input_tokens") / 1_000_000 * rates.get("input", 0.0)
+        + _tok("output_tokens") / 1_000_000 * rates.get("output", 0.0)
+        + _tok("cache_read_input_tokens") / 1_000_000 * rates.get("cache_read", 0.0)
+        + _tok("cache_creation_input_tokens") / 1_000_000 * rates.get("cache_creation", 0.0)
+    )
+
+
+def _llm_usage_log_path() -> Path:
+    p = get_data_dir() / "logs" / "llm_usage.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def record_llm_usage(
+    *,
+    video_id: Optional[str],
+    kind: str,
+    model: str,
+    backend_name: str,
+    usage,
+) -> dict:
+    """Append a single usage record to ~/yt2md/logs/llm_usage.jsonl and
+    return the recorded dict. Cost is set to 0.0 for the claude-code backend
+    (subscription bills the user via their Anthropic plan, not per-call) so
+    the audit log stays consistent — token counts still recorded for
+    rate-limit awareness.
+    """
+    import time as _t
+
+    cost = 0.0 if backend_name == "claude-code" else estimate_cost_usd(model, usage)
+    entry = {
+        "ts": _t.time(),
+        "video_id": video_id or "",
+        "kind": kind,
+        "model": model,
+        "backend": backend_name,
+        "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
+        "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+        "cache_read_input_tokens": int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+        "cache_creation_input_tokens": int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
+        "cost_usd": round(cost, 6),
+    }
+    try:
+        with open(_llm_usage_log_path(), "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass  # Audit log must never break the digest pipeline.
+    return entry
+
+
+def read_llm_usage_log() -> List[dict]:
+    """Load the full usage log into memory. The file stays small in
+    practice (a few hundred bytes per entry, one entry per LLM call).
+    """
+    p = _llm_usage_log_path()
+    if not p.exists():
+        return []
+    rows: List[dict] = []
+    try:
+        with open(p) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return rows
 
 
 class AnthropicAPIBackend:
@@ -4822,6 +4974,55 @@ def cmd_serve(args) -> int:
         body = "<h1>Activity</h1>"
         body += '<p class="meta-info">Every completed one-off digest, success or failure. Persists across server restarts.</p>'
 
+        # Cost summary across windows. Reads the central LLM usage log once
+        # and bucket-totals — cheap, runs in a few ms even with thousands
+        # of entries.
+        usage_entries = read_llm_usage_log()
+        now_ts = _t.time()
+        WINDOWS = [
+            ("today", 24 * 3600),
+            ("7d", 7 * 24 * 3600),
+            ("30d", 30 * 24 * 3600),
+            ("all", None),
+        ]
+        window_totals: dict = {label: 0.0 for label, _ in WINDOWS}
+        window_counts: dict = {label: 0 for label, _ in WINDOWS}
+        backend_counts: dict = {}
+        for e in usage_entries:
+            cost = float(e.get("cost_usd", 0.0) or 0.0)
+            ts = float(e.get("ts", 0) or 0)
+            backend_counts[e.get("backend", "?")] = (
+                backend_counts.get(e.get("backend", "?"), 0) + 1
+            )
+            for label, window in WINDOWS:
+                if window is None or (now_ts - ts) <= window:
+                    window_totals[label] += cost
+                    window_counts[label] += 1
+        backend_summary = ", ".join(
+            f"{n} {b}" for b, n in sorted(backend_counts.items(), key=lambda kv: -kv[1])
+        ) if backend_counts else ""
+        body += (
+            "<div class='schedule-form' style='display: grid; "
+            "grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); "
+            "gap: 12px 20px;'>"
+        )
+        for label, _ in WINDOWS:
+            body += (
+                f"<div><div style='color: var(--muted); font-size: 12px;'>"
+                f"{h(label)}</div>"
+                f"<div style='font-size: 22px; font-weight: 600;'>"
+                f"${window_totals[label]:.2f}</div>"
+                f"<div style='color: var(--muted); font-size: 11px;'>"
+                f"{window_counts[label]} call(s)</div></div>"
+            )
+        body += "</div>"
+        if backend_summary:
+            body += (
+                f"<p class='meta-info'>By backend: {h(backend_summary)}. "
+                "Subscription (Claude Code) calls report $0 — billed via the "
+                "user's plan. Pricing is estimated; treat as a guide.</p>"
+            )
+
         # In-progress section — live one-off jobs the reaper hasn't logged yet.
         # Hidden by default; populated by the polling JS at the bottom of the page.
         active_now = _list_active_oneoff_jobs()
@@ -4924,11 +5125,18 @@ def cmd_serve(args) -> int:
             return f"{n:,}"
 
         now = _t.time()
+        # Index usage by video_id for O(1) per-row cost lookup. Each row's
+        # cost = sum of entries whose ts is within the row's [started_at,
+        # ended_at] window AND video_id matches.
+        usage_by_vid: dict = {}
+        for e in usage_entries:
+            usage_by_vid.setdefault(e.get("video_id", ""), []).append(e)
+
         body += "<table class='activity-table'>"
         body += (
             "<thead><tr>"
             "<th>When</th><th>Video</th><th>Outcome</th>"
-            "<th>Duration</th><th>Stages</th><th>Tokens</th>"
+            "<th>Duration</th><th>Stages</th><th>Tokens</th><th>Cost</th>"
             "</tr></thead><tbody>"
         )
         for r in rows:
@@ -4972,6 +5180,24 @@ def cmd_serve(args) -> int:
             else:
                 tokens_cell = "—"
 
+            # Per-row cost: every LLM call recorded for this video_id whose
+            # ts falls in the run's [started_at, ended_at] window.
+            row_cost = 0.0
+            row_backend = None
+            started_at = r.get("started_at") or 0
+            ended_at = r.get("ended_at") or now
+            for e in usage_by_vid.get(video_id, []):
+                ets = float(e.get("ts", 0) or 0)
+                if started_at <= ets <= ended_at:
+                    row_cost += float(e.get("cost_usd", 0.0) or 0.0)
+                    row_backend = e.get("backend") or row_backend
+            if row_cost > 0:
+                cost_cell = f"${row_cost:.4f}"
+            elif row_backend == "claude-code":
+                cost_cell = "<span style='color: var(--muted);'>subscription</span>"
+            else:
+                cost_cell = "—"
+
             body += "<tr>"
             body += f"<td title='{h(url)}'>{h(ago)}</td>"
             body += f"<td>{title}"
@@ -4991,6 +5217,7 @@ def cmd_serve(args) -> int:
             body += f"<td>{h(dur)}</td>"
             body += f"<td class='activity-stages'>{stages_cell}</td>"
             body += f"<td class='activity-tokens'>{tokens_cell}</td>"
+            body += f"<td class='activity-cost'>{cost_cell}</td>"
             body += "</tr>"
         body += "</tbody></table>"
         body += (
@@ -5168,12 +5395,19 @@ def cmd_serve(args) -> int:
         s = load_settings()
         try:
             segments = parse_srt(srt_path)
-            text, _usage = generate_panel_discussion(
+            backend = select_backend()
+            panel_model = s.get("panel_model") or DEFAULT_PANEL_MODEL
+            text, p_usage = generate_panel_discussion(
                 digest_md.read_text(),
                 segments,
-                model=s.get("panel_model") or DEFAULT_PANEL_MODEL,
+                model=panel_model,
                 source_lang=lang,
                 output_language=s.get("digest_language") or "auto",
+                backend=backend,
+            )
+            record_llm_usage(
+                video_id=video_id, kind="panel", model=panel_model,
+                backend_name=backend.name, usage=p_usage,
             )
         except Exception as e:
             return redirect(f"/digests/{video_id}/?msg=Panel+generation+failed:+{e}")
@@ -5211,13 +5445,20 @@ def cmd_serve(args) -> int:
         s = load_settings()
         try:
             segments = parse_srt(srt_path)
-            takeaway_text, _usage = generate_takeaway(
+            backend = select_backend()
+            takeaway_model = (os.environ.get("YT2MD_TAKEAWAY_MODEL")
+                              or DEFAULT_TAKEAWAY_MODEL)
+            takeaway_text, t_usage = generate_takeaway(
                 digest_md.read_text(), panel_text, segments,
-                model=os.environ.get("YT2MD_TAKEAWAY_MODEL")
-                      or DEFAULT_TAKEAWAY_MODEL,
+                model=takeaway_model,
                 publish_date=None,
                 source_lang=lang,
                 output_language=s.get("digest_language") or "auto",
+                backend=backend,
+            )
+            record_llm_usage(
+                video_id=video_id, kind="takeaway", model=takeaway_model,
+                backend_name=backend.name, usage=t_usage,
             )
             body = render_takeaway_markdown(
                 takeaway_text,
@@ -5374,6 +5615,7 @@ def cmd_serve(args) -> int:
                             model=settings.get("slide_classifier_model")
                                   or "claude-haiku-4-5-20251001",
                             workdir=workdir,
+                            log_video_id=video_id,
                         )
                 except Exception:
                     # Backend unavailable / call failed → use pHash-only set.
@@ -5743,6 +5985,10 @@ def main():
     video_title: Optional[str] = None
     video_url: Optional[str] = None
     upload_date: Optional[str] = None
+    # Run-start timestamp lets the summary block aggregate cost from the
+    # usage log without needing to thread a list through every call site
+    # (slide_classifier in particular records from inside its function).
+    _run_start_ts = _time.time()
 
     if is_url(args.video):
         print(f"[0/5] Fetching YouTube video: {args.video}")
@@ -5871,6 +6117,7 @@ def main():
                                    or settings.get("slide_classifier_model")
                                    or "claude-haiku-4-5-20251001"),
                             workdir=workdir,
+                            log_video_id=video_path.stem,
                         )
                         timings["slide_classify"] = round(
                             _time.monotonic() - _classify_t0, 3,
@@ -5897,6 +6144,7 @@ def main():
             digest_path.parent.mkdir(parents=True, exist_ok=True)
             images_dir = digest_path.parent / f"{digest_path.stem}_images"
             backend = select_backend()
+            log_video_id = video_path.stem
             print(f"[+] Generating digest with {args.digest_model} via {backend.name} backend -> {digest_path}")
             _digest_t0 = _time.monotonic()
             digest, usage = generate_digest(
@@ -5905,12 +6153,17 @@ def main():
                 output_language=args.digest_language,
                 backend=backend,
             )
+            digest_log_entry = record_llm_usage(
+                video_id=log_video_id, kind="digest", model=args.digest_model,
+                backend_name=backend.name, usage=usage,
+            )
             timings["digest"] = round(_time.monotonic() - _digest_t0, 3)
             print(f"      {len(digest.topics)} topics  |  "
                   f"input: {usage.input_tokens} tokens "
                   f"(cache read: {getattr(usage, 'cache_read_input_tokens', 0)}, "
                   f"cache write: {getattr(usage, 'cache_creation_input_tokens', 0)})  |  "
-                  f"output: {usage.output_tokens} tokens")
+                  f"output: {usage.output_tokens} tokens  |  "
+                  f"cost: ${digest_log_entry['cost_usd']:.4f}")
 
             vision_picks = None
             if not args.no_vision:
@@ -5925,10 +6178,16 @@ def main():
                             digest, frames, duration, args.digest_model,
                             segments=segments, backend=backend,
                         )
+                        v_log_entry = record_llm_usage(
+                            video_id=log_video_id, kind="vision_pick",
+                            model=args.digest_model,
+                            backend_name=backend.name, usage=v_usage,
+                        )
                         timings["vision"] = round(_time.monotonic() - _vision_t0, 3)
                         print(f"      vision-selected {len(vision_picks)}/{len(digest.topics)} topics  |  "
                               f"input: {v_usage.input_tokens} tokens  |  "
-                              f"output: {v_usage.output_tokens} tokens")
+                              f"output: {v_usage.output_tokens} tokens  |  "
+                              f"cost: ${v_log_entry['cost_usd']:.4f}")
                     except VisionUnsupported as e:
                         print(f"      vision unsupported: {e}; falling back to timestamp picks.")
 
@@ -5956,11 +6215,17 @@ def main():
                         output_language=args.digest_language,
                         backend=backend,
                     )
+                    p_log_entry = record_llm_usage(
+                        video_id=log_video_id, kind="panel",
+                        model=args.panel_model,
+                        backend_name=backend.name, usage=p_usage,
+                    )
                     panel_path.write_text(panel_md_text)
                     timings["panel"] = round(_time.monotonic() - _panel_t0, 3)
                     print(f"      Panel written -> {panel_path}  |  "
                           f"input: {p_usage.input_tokens} tokens  |  "
-                          f"output: {p_usage.output_tokens} tokens")
+                          f"output: {p_usage.output_tokens} tokens  |  "
+                          f"cost: ${p_log_entry['cost_usd']:.4f}")
                 except Exception as e:
                     # Takeaway can still run without a panel — just with less
                     # explicit pushback to weave in. Don't take the whole
@@ -5981,6 +6246,11 @@ def main():
                         output_language=args.digest_language,
                         backend=backend,
                     )
+                    t_log_entry = record_llm_usage(
+                        video_id=log_video_id, kind="takeaway",
+                        model=args.takeaway_model,
+                        backend_name=backend.name, usage=t_usage,
+                    )
                     body = render_takeaway_markdown(
                         takeaway_text, video_url=video_url,
                     )
@@ -5988,7 +6258,8 @@ def main():
                     timings["takeaway"] = round(_time.monotonic() - _take_t0, 3)
                     print(f"      Takeaway written -> {takeaway_path}  |  "
                           f"input: {t_usage.input_tokens} tokens  |  "
-                          f"output: {t_usage.output_tokens} tokens")
+                          f"output: {t_usage.output_tokens} tokens  |  "
+                          f"cost: ${t_log_entry['cost_usd']:.4f}")
                 except Exception as e:
                     print(f"      Takeaway failed ({type(e).__name__}: {e}); "
                           "digest is still complete without it.")
@@ -6008,6 +6279,39 @@ def main():
             outputs.append(str(deck_path))
         print(f"\nDone. Wrote: {', '.join(outputs)}")
 
+        # Cost audit: aggregate every LLM call recorded during this run.
+        # Reads from the canonical usage log so it picks up records made
+        # inside helper functions (e.g. slide_classifier) too.
+        try:
+            log_video_id = video_path.stem
+            run_log_entries = [
+                e for e in read_llm_usage_log()
+                if e.get("ts", 0) >= _run_start_ts
+                and e.get("video_id") == log_video_id
+            ]
+            costs_by_kind: dict = {}
+            for e in run_log_entries:
+                costs_by_kind[e["kind"]] = (
+                    costs_by_kind.get(e["kind"], 0.0) + float(e.get("cost_usd", 0.0))
+                )
+            total_cost = round(sum(costs_by_kind.values()), 4)
+            costs_by_kind = {k: round(v, 4) for k, v in costs_by_kind.items()}
+            backend_used = (
+                run_log_entries[0]["backend"] if run_log_entries else None
+            )
+        except Exception:
+            costs_by_kind, total_cost, backend_used = {}, 0.0, None
+
+        # Print a human-readable cost summary above the structured line.
+        if costs_by_kind:
+            print(f"\nCost summary (backend: {backend_used}):")
+            for kind in ("digest", "vision_pick", "panel", "takeaway",
+                         "slide_classifier", "validation"):
+                if kind in costs_by_kind:
+                    print(f"  {kind:18s} ${costs_by_kind[kind]:.4f}")
+            note = " (subscription — no per-call billing)" if backend_used == "claude-code" else ""
+            print(f"  {'TOTAL':18s} ${total_cost:.4f}{note}")
+
         # Structured one-line summary parsed by the web reaper. Keep this on
         # one line and as the LAST thing printed on success.
         summary = {
@@ -6021,6 +6325,11 @@ def main():
                 "cache_read": getattr(usage, "cache_read_input_tokens", None) if usage else None,
                 "cache_creation": getattr(usage, "cache_creation_input_tokens", None) if usage else None,
             } if usage else None,
+            "cost": {
+                "total_usd": total_cost,
+                "by_kind": costs_by_kind,
+                "backend": backend_used,
+            },
             "digest_path": str(digest_path) if do_digest else None,
         }
         print("[summary] " + json.dumps(summary))
