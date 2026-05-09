@@ -418,6 +418,332 @@ def ensure_api_key() -> None:
         os.environ["ANTHROPIC_API_KEY"] = key
 
 
+# ---------- Claude Code sandbox (alternative auth path) ----------
+#
+# yt2md ships a private Claude Code install under <data dir>/claude-code/.
+# Driving the official `claude` binary as a subprocess is the supported way
+# for a third-party tool to leverage a user's Claude.ai subscription auth
+# without violating ToS (vs. extracting OAuth tokens, which is forbidden).
+#
+# Sandbox layout:
+#   <data>/claude-code/node_modules/.bin/claude   <- the binary we invoke
+#   <data>/claude-code/config/                     <- CLAUDE_CONFIG_DIR target
+#       settings.json, projects/, plugins/, .credentials.json (Linux/Win)
+# On macOS, CLAUDE_CONFIG_DIR isolates settings/projects but credentials still
+# go to the system Keychain — this is a documented Claude Code limitation.
+
+CLAUDE_CODE_NPM_PACKAGE = "@anthropic-ai/claude-code"  # always pulls latest
+MIN_NODE_MAJOR = 18
+
+
+def claude_sandbox_dir() -> Path:
+    return get_data_dir() / "claude-code"
+
+
+def claude_config_dir() -> Path:
+    return claude_sandbox_dir() / "config"
+
+
+def claude_binary_path() -> Path:
+    return claude_sandbox_dir() / "node_modules" / ".bin" / "claude"
+
+
+def claude_subprocess_env() -> dict:
+    """Env dict for invoking the sandboxed claude binary. Pins CLAUDE_CONFIG_DIR
+    into our sandbox so settings/projects/plugins don't collide with any
+    system-wide Claude Code install. (macOS Keychain owns credentials regardless.)
+    """
+    env = os.environ.copy()
+    env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir())
+    return env
+
+
+def detect_node() -> Optional[Tuple[int, str]]:
+    """Returns (major_version, full_version_string) if Node ≥ 18 is available,
+    else None. We need npm to install the sandbox; npm requires Node.
+    """
+    node = shutil.which("node")
+    if not node:
+        return None
+    try:
+        out = subprocess.check_output([node, "-v"], text=True, timeout=5).strip()
+    except (subprocess.SubprocessError, OSError):
+        return None
+    # `node -v` prints e.g. "v18.19.0"
+    m = re.match(r"^v(\d+)\.", out)
+    if not m:
+        return None
+    major = int(m.group(1))
+    if major < MIN_NODE_MAJOR:
+        return None
+    return major, out
+
+
+def claude_code_installed() -> bool:
+    """True if our sandbox has a working claude binary."""
+    return claude_binary_path().exists()
+
+
+def install_claude_code(stream_to: Optional[Path] = None) -> Tuple[int, str]:
+    """Run `npm install --prefix <sandbox> <package>` to materialize a private
+    Claude Code install. Returns (returncode, combined_output). If stream_to
+    is given, output is appended there as it's produced (for live UI polling).
+    """
+    sandbox = claude_sandbox_dir()
+    sandbox.mkdir(parents=True, exist_ok=True)
+    claude_config_dir().mkdir(parents=True, exist_ok=True)
+
+    npm = shutil.which("npm")
+    if npm is None:
+        return 127, "npm not found on PATH (install Node.js 18+ first)."
+
+    cmd = [npm, "install", "--prefix", str(sandbox),
+           "--no-fund", "--no-audit", "--silent",
+           CLAUDE_CODE_NPM_PACKAGE]
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    chunks: list = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        chunks.append(line)
+        if stream_to is not None:
+            try:
+                with open(stream_to, "a") as f:
+                    f.write(line)
+            except OSError:
+                pass
+    proc.wait()
+    return proc.returncode, "".join(chunks)
+
+
+def claude_code_logged_in() -> bool:
+    """Heuristic: if there's a working binary AND `claude /status` (or a tiny
+    -p call) succeeds without auth error, we're logged in. Cheap probe via the
+    presence of credentials state."""
+    if not claude_code_installed():
+        return False
+    # The cheapest probe is a 1-token --print call; cache the result for the
+    # lifetime of the process (set when we explicitly log in/out).
+    return _claude_code_session_state.get("logged_in", False)
+
+
+# Module-level cache of login probe state. Populated by validate_claude_code()
+# after install/login; checked by claude_code_logged_in() to avoid spawning a
+# subprocess on every page load.
+_claude_code_session_state: dict = {}
+
+
+def _claude_login_sentinel() -> Path:
+    """Touched after a successful validation; lets us assume logged-in across
+    server restarts without burning a token-cost probe per boot. Cleared by
+    claude_logout(). Real auth failures still reset the session state when
+    encountered."""
+    return claude_config_dir() / ".yt2md-logged-in"
+
+
+def claude_probe_login_state() -> None:
+    """Cheap startup-time probe: read the sentinel file and populate the
+    session-state cache. No subprocess call. Real auth-failure reset happens
+    in validate_claude_code() and on first failed LLM call.
+    """
+    if claude_code_installed() and _claude_login_sentinel().exists():
+        _claude_code_session_state["logged_in"] = True
+    else:
+        _claude_code_session_state["logged_in"] = False
+
+
+def validate_claude_code() -> Optional[str]:
+    """Run a 1-token call through the sandboxed claude binary. Returns None on
+    success, otherwise a short error string. Updates the session-state cache
+    and the on-disk sentinel.
+    """
+    if not claude_code_installed():
+        return "Claude Code is not installed in the sandbox."
+    cmd = [
+        str(claude_binary_path()), "-p", "ok",
+        "--model", "claude-haiku-4-5-20251001",
+        "--output-format", "json",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, env=claude_subprocess_env(),
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        _claude_code_session_state["logged_in"] = False
+        _claude_login_sentinel().unlink(missing_ok=True)
+        return "validation timed out (60s) — the OAuth flow may not have completed."
+    except OSError as e:
+        _claude_code_session_state["logged_in"] = False
+        _claude_login_sentinel().unlink(missing_ok=True)
+        return f"could not invoke claude binary: {e}"
+    if proc.returncode != 0:
+        _claude_code_session_state["logged_in"] = False
+        _claude_login_sentinel().unlink(missing_ok=True)
+        msg = (proc.stderr or proc.stdout or "").strip().splitlines()
+        last = msg[-1] if msg else f"exit code {proc.returncode}"
+        return f"claude returned an error: {last}"
+    _claude_code_session_state["logged_in"] = True
+    try:
+        _claude_login_sentinel().parent.mkdir(parents=True, exist_ok=True)
+        _claude_login_sentinel().touch()
+    except OSError:
+        pass
+    return None
+
+
+# In-memory tracker for async setup jobs (install, login). Keyed by job name
+# ("install" | "login"). Each entry: {"proc": Popen, "log": Path, "started":
+# epoch, "error": Optional[str]}. The web reader is single-process, so a plain
+# dict suffices. State resets on server restart, which is fine — finished jobs
+# leave their result on disk (sandbox dir exists; credentials persist).
+
+_claude_setup_jobs: dict = {}
+
+
+def _claude_setup_log(name: str) -> Path:
+    p = get_data_dir() / "logs" / f"claude-setup-{name}.log"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def claude_setup_job_running(name: str) -> bool:
+    job = _claude_setup_jobs.get(name)
+    if job is None:
+        return False
+    proc = job.get("proc")
+    return proc is not None and proc.poll() is None
+
+
+def start_install_job() -> Optional[str]:
+    """Spawn `npm install` for Claude Code in the sandbox. Idempotent: returns
+    None if it's already running, or an error string if Node is missing.
+    """
+    if claude_setup_job_running("install"):
+        return None
+    if detect_node() is None:
+        return (
+            f"Node.js {MIN_NODE_MAJOR}+ is required. Install with "
+            "`brew install node` (macOS) or your package manager, then retry."
+        )
+    sandbox = claude_sandbox_dir()
+    sandbox.mkdir(parents=True, exist_ok=True)
+    claude_config_dir().mkdir(parents=True, exist_ok=True)
+    log_path = _claude_setup_log("install")
+    log_path.write_text("")  # truncate prior run
+    npm = shutil.which("npm") or "npm"
+    cmd = [npm, "install", "--prefix", str(sandbox),
+           "--no-fund", "--no-audit",
+           CLAUDE_CODE_NPM_PACKAGE]
+    log_f = open(log_path, "a")
+    proc = subprocess.Popen(
+        cmd, stdout=log_f, stderr=subprocess.STDOUT, text=True,
+        start_new_session=True,
+    )
+    import time as _t
+    _claude_setup_jobs["install"] = {
+        "proc": proc, "log": log_path, "started": _t.time(),
+        "log_f": log_f, "error": None,
+    }
+    return None
+
+
+def start_login_job() -> Optional[str]:
+    """Spawn `claude /login`. The CLI auto-opens the user's default browser
+    via `open` for OAuth; the random localhost callback is captured by the
+    subprocess itself. We wait for exit-0 then validate.
+    """
+    if claude_setup_job_running("login"):
+        return None
+    if not claude_code_installed():
+        return "Claude Code is not installed yet. Install it first."
+    log_path = _claude_setup_log("login")
+    log_path.write_text("")
+    cmd = [str(claude_binary_path()), "/login"]
+    log_f = open(log_path, "a")
+    proc = subprocess.Popen(
+        cmd, env=claude_subprocess_env(),
+        stdout=log_f, stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,  # no terminal stdin → CLI relies on browser callback
+        text=True,
+        start_new_session=True,
+    )
+    import time as _t
+    _claude_setup_jobs["login"] = {
+        "proc": proc, "log": log_path, "started": _t.time(),
+        "log_f": log_f, "error": None, "validated": False,
+    }
+    return None
+
+
+def claude_logout() -> Tuple[int, str]:
+    """Run `claude /logout` to clear stored credentials. Resets session cache."""
+    if not claude_code_installed():
+        return 0, "(not installed)"
+    cmd = [str(claude_binary_path()), "/logout"]
+    proc = subprocess.run(
+        cmd, env=claude_subprocess_env(),
+        capture_output=True, text=True, timeout=30,
+    )
+    _claude_code_session_state["logged_in"] = False
+    _claude_login_sentinel().unlink(missing_ok=True)
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+def claude_setup_snapshot() -> dict:
+    """Status blob consumed by the /setup polling JS. Reaps finished jobs and
+    runs validation after a successful login.
+    """
+    install_job = _claude_setup_jobs.get("install")
+    login_job = _claude_setup_jobs.get("login")
+
+    # Reap install if it finished — surface the exit code as an error if non-zero.
+    if install_job and install_job["proc"].poll() is not None:
+        rc = install_job["proc"].returncode
+        if rc != 0 and not install_job.get("error"):
+            install_job["error"] = f"npm install failed (exit {rc}). See log."
+        try:
+            install_job["log_f"].close()
+        except Exception:
+            pass
+
+    # Reap login. On success, validate with a 1-token call (cached).
+    if login_job and login_job["proc"].poll() is not None:
+        try:
+            login_job["log_f"].close()
+        except Exception:
+            pass
+        if not login_job.get("validated"):
+            rc = login_job["proc"].returncode
+            if rc == 0:
+                err = validate_claude_code()
+                if err:
+                    login_job["error"] = err
+            else:
+                login_job["error"] = f"login subprocess exited with code {rc}. See log."
+            login_job["validated"] = True
+
+    def _tail(path: Path, n: int = 30) -> str:
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+            return "\n".join(lines[-n:])
+        except OSError:
+            return ""
+
+    return {
+        "node_ok": detect_node() is not None,
+        "installed": claude_code_installed(),
+        "logged_in": _claude_code_session_state.get("logged_in", False),
+        "install_running": claude_setup_job_running("install"),
+        "login_running": claude_setup_job_running("login"),
+        "install_log_tail": _tail(install_job["log"]) if install_job else "",
+        "login_log_tail": _tail(login_job["log"]) if login_job else "",
+        "install_error": install_job.get("error") if install_job else None,
+        "login_error": login_job.get("error") if login_job else None,
+    }
+
+
 # ---------- YouTube fetch ----------
 
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
@@ -769,6 +1095,245 @@ def fetch_youtube(
     }
 
 
+# ---------- LLM backend abstraction ----------
+#
+# Two backends:
+#   AnthropicAPIBackend   — direct anthropic.Anthropic() SDK calls; uses
+#                           messages.parse for structured output and
+#                           cache_control for prompt caching. Requires
+#                           ANTHROPIC_API_KEY.
+#   ClaudeCodeBackend     — shells out to the sandboxed `claude` binary with
+#                           --output-format json (and --json-schema for parse).
+#                           Uses the user's Claude.ai subscription auth as
+#                           configured in our sandbox. No prompt caching
+#                           (each subprocess starts cold) and vision support
+#                           is opt-in (off by default per user preference).
+#
+# Both expose: text(...), parse(schema=...), vision_parse(content_blocks=...).
+# Returns (response, usage_namespace) where usage has .input_tokens,
+# .output_tokens, .cache_read_input_tokens, .cache_creation_input_tokens.
+#
+# Backends raise VisionUnsupported when vision is requested but unavailable;
+# callers fall back to non-vision paths.
+
+from types import SimpleNamespace as _SN
+
+
+class VisionUnsupported(Exception):
+    """Raised when a backend cannot process image inputs in the current config."""
+
+
+def _zero_usage() -> _SN:
+    return _SN(input_tokens=0, output_tokens=0,
+               cache_read_input_tokens=0, cache_creation_input_tokens=0)
+
+
+class AnthropicAPIBackend:
+    name = "api"
+    vision_supported = True
+
+    def __init__(self):
+        import anthropic
+        self._client = anthropic.Anthropic()
+
+    def text(self, *, system: str, user_text: str, model: str,
+             max_tokens: int, cache: bool = False):
+        block = {"type": "text", "text": user_text}
+        if cache:
+            block["cache_control"] = {"type": "ephemeral"}
+        response = self._client.messages.create(
+            model=model, max_tokens=max_tokens, system=system,
+            messages=[{"role": "user", "content": [block]}],
+        )
+        text = next(b.text for b in response.content if b.type == "text")
+        return text, response.usage
+
+    def parse(self, *, system: str, user_text: str, model: str,
+              max_tokens: int, schema, cache: bool = False):
+        block = {"type": "text", "text": user_text}
+        if cache:
+            block["cache_control"] = {"type": "ephemeral"}
+        response = self._client.messages.parse(
+            model=model, max_tokens=max_tokens, system=system,
+            messages=[{"role": "user", "content": [block]}],
+            output_format=schema,
+        )
+        return response.parsed_output, response.usage
+
+    def vision_parse(self, *, system: str, content_blocks: list,
+                     model: str, max_tokens: int, schema):
+        response = self._client.messages.parse(
+            model=model, max_tokens=max_tokens, system=system,
+            messages=[{"role": "user", "content": content_blocks}],
+            output_format=schema,
+        )
+        return response.parsed_output, response.usage
+
+
+class ClaudeCodeBackend:
+    name = "claude-code"
+
+    def __init__(self, *, vision_enabled: bool = False):
+        if not claude_code_installed():
+            raise RuntimeError("Claude Code is not installed in the sandbox.")
+        self._binary = str(claude_binary_path())
+        self._env = claude_subprocess_env()
+        self._vision_enabled = vision_enabled
+
+    @property
+    def vision_supported(self) -> bool:
+        return self._vision_enabled
+
+    def _run(self, *, prompt: str, model: str, schema=None,
+             timeout: float = 600.0):
+        cmd = [self._binary, "-p", prompt, "--model", model,
+               "--output-format", "json"]
+        if schema is not None:
+            cmd += ["--json-schema", json.dumps(schema.model_json_schema())]
+        proc = subprocess.run(
+            cmd, env=self._env, capture_output=True, text=True, timeout=timeout,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"claude -p failed (exit {proc.returncode}): "
+                f"{(proc.stderr or proc.stdout or '').strip()[:500]}"
+            )
+        return self._parse_output(proc.stdout)
+
+    @staticmethod
+    def _parse_output(stdout: str):
+        """`claude -p --output-format json` emits a JSON envelope. Extract the
+        text/result and a usage namespace. Tolerant of envelope shape changes.
+        Raises RuntimeError when the envelope's `is_error` flag is set (which
+        Claude Code uses for auth + tool failures even when the process exits 0).
+        """
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            # Defensive fallback: treat raw stdout as the result.
+            return stdout.strip(), _zero_usage()
+        result_text = (
+            payload.get("result")
+            or payload.get("text")
+            or payload.get("response")
+            or ""
+        )
+        if payload.get("is_error"):
+            raise RuntimeError(f"claude reported error: {result_text or '(no message)'}")
+        usage_dict = payload.get("usage") or {}
+        usage = _SN(
+            input_tokens=int(usage_dict.get("input_tokens") or 0),
+            output_tokens=int(usage_dict.get("output_tokens") or 0),
+            cache_read_input_tokens=int(usage_dict.get("cache_read_input_tokens") or 0),
+            cache_creation_input_tokens=int(
+                usage_dict.get("cache_creation_input_tokens") or 0
+            ),
+        )
+        return result_text, usage
+
+    def text(self, *, system: str, user_text: str, model: str,
+             max_tokens: int, cache: bool = False):
+        # No system-prompt CLI flag we rely on — combine system + user into
+        # one prompt with explicit delineation. cache is ignored (subprocess
+        # invocations don't share Anthropic's prompt cache).
+        prompt = f"<system>\n{system}\n</system>\n\n{user_text}"
+        return self._run(prompt=prompt, model=model)
+
+    def parse(self, *, system: str, user_text: str, model: str,
+              max_tokens: int, schema, cache: bool = False):
+        prompt = f"<system>\n{system}\n</system>\n\n{user_text}"
+        result_text, usage = self._run(prompt=prompt, model=model, schema=schema)
+        # --json-schema constrains the output to the schema; the result string
+        # IS the JSON we need to parse into the Pydantic model.
+        try:
+            data = json.loads(result_text) if isinstance(result_text, str) else result_text
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"claude returned non-JSON for a schema-constrained call: {e}\n"
+                f"Output: {result_text[:500]}"
+            )
+        return schema.model_validate(data), usage
+
+    def vision_parse(self, *, system: str, content_blocks: list,
+                     model: str, max_tokens: int, schema):
+        if not self._vision_enabled:
+            raise VisionUnsupported(
+                "Claude Code vision is disabled. Enable claude_code_vision in "
+                "Settings to base64-embed images in prompts (token-heavy)."
+            )
+        # Opt-in path: serialize image blocks as base64 markers in the prompt.
+        # This is expensive — each image expands ~33% over its byte size and
+        # there's no native multipart in the CLI -p mode.
+        text_parts: list = []
+        for block in content_blocks:
+            if block.get("type") == "text":
+                text_parts.append(block["text"])
+            elif block.get("type") == "image":
+                src = block.get("source") or {}
+                if src.get("type") == "base64":
+                    text_parts.append(
+                        f"[image media_type={src.get('media_type','image/jpeg')} "
+                        f"data:base64]\n{src.get('data','')}\n[/image]"
+                    )
+        prompt = (
+            f"<system>\n{system}\n</system>\n\n" + "\n".join(text_parts)
+        )
+        result_text, usage = self._run(prompt=prompt, model=model, schema=schema)
+        try:
+            data = json.loads(result_text) if isinstance(result_text, str) else result_text
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"claude returned non-JSON for vision call: {e}\nOutput: {result_text[:500]}"
+            )
+        return schema.model_validate(data), usage
+
+
+def select_backend(*, vision_enabled: Optional[bool] = None):
+    """Resolve the active LLM backend from settings + environment.
+
+    Honors settings["llm_backend"] in {"auto", "api", "claude-code"}:
+      - "auto":        prefer "api" when ANTHROPIC_API_KEY is set, else
+                       "claude-code" when sandboxed claude is installed and
+                       logged in, else raises RuntimeError.
+      - "api":         requires ANTHROPIC_API_KEY.
+      - "claude-code": requires sandbox install + login.
+    """
+    s = load_settings()
+    choice = (s.get("llm_backend") or "auto").lower()
+    if vision_enabled is None:
+        vision_enabled = bool(s.get("claude_code_vision", False))
+
+    if choice == "api":
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError(
+                "llm_backend=api but ANTHROPIC_API_KEY is not set. "
+                "Configure it in Settings or switch backend to claude-code."
+            )
+        return AnthropicAPIBackend()
+
+    if choice == "claude-code":
+        if not claude_code_installed():
+            raise RuntimeError(
+                "llm_backend=claude-code but Claude Code is not installed. "
+                "Run /setup to install it."
+            )
+        return ClaudeCodeBackend(vision_enabled=vision_enabled)
+
+    # auto: prefer API when key is set (keeps prompt caching + native vision);
+    # else fall through to Claude Code only when both installed AND we have a
+    # cached login signal (sentinel). Otherwise raise so the caller redirects
+    # to /setup rather than burning a doomed call.
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return AnthropicAPIBackend()
+    if (claude_code_installed()
+            and _claude_code_session_state.get("logged_in", False)):
+        return ClaudeCodeBackend(vision_enabled=vision_enabled)
+    raise RuntimeError(
+        "No LLM backend configured. Set ANTHROPIC_API_KEY or install + sign "
+        "in to Claude Code via /setup."
+    )
+
+
 # ---------- Markdown digest (transcript-primary, LLM-summarized) ----------
 
 DIGEST_SYSTEM_PROMPT = (
@@ -797,13 +1362,14 @@ def generate_digest(
     model: str,
     source_lang: str = "en",
     output_language: str = "auto",
+    backend=None,
 ):
     """Call Claude to segment the transcript into topics. Returns a parsed VideoDigest.
 
     source_lang is the BCP-47 language code of the transcript (e.g. 'en', 'zh-Hans').
     output_language: 'auto' (write in source language) or 'en' (force English).
+    backend: an LLMBackend; defaults to select_backend() (auto-resolved).
     """
-    import anthropic
     from pydantic import BaseModel
     from typing import List as TList
 
@@ -849,22 +1415,12 @@ def generate_digest(
         f"Timestamped transcript:\n\n{transcript}"
     )
 
-    client = anthropic.Anthropic()
-    response = client.messages.parse(
-        model=model,
-        max_tokens=16000,
-        system=DIGEST_SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": [{
-                "type": "text",
-                "text": user_text,
-                "cache_control": {"type": "ephemeral"},
-            }],
-        }],
-        output_format=VideoDigest,
+    if backend is None:
+        backend = select_backend()
+    return backend.parse(
+        system=DIGEST_SYSTEM_PROMPT, user_text=user_text,
+        model=model, max_tokens=16000, schema=VideoDigest, cache=True,
     )
-    return response.parsed_output, response.usage
 
 
 DEFAULT_PANEL_MODEL = "claude-opus-4-7"
@@ -901,6 +1457,7 @@ def generate_panel_discussion(
     model: str,
     source_lang: str = "en",
     output_language: str = "auto",
+    backend=None,
 ):
     """Call Claude to simulate a panel of domain-relevant experts discussing a video.
     Returns (markdown_text, usage).
@@ -911,8 +1468,6 @@ def generate_panel_discussion(
     Costs ~one Opus call per click (≈ 4–8k input + 2–4k output tokens). Output is
     one markdown document the caller writes to digests/<id>/panel.md.
     """
-    import anthropic
-
     transcript_str = "\n".join(
         f"[{format_timestamp(seg.start)}] {seg.text}" for seg in segments
     )
@@ -940,21 +1495,12 @@ def generate_panel_discussion(
         "Now: introduce the panelists, then run the discussion."
     )
 
-    client = anthropic.Anthropic()
-    response = client.messages.create(
-        model=model,
-        max_tokens=8000,
-        system=PANEL_SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": [{
-                "type": "text", "text": user_text,
-                "cache_control": {"type": "ephemeral"},
-            }],
-        }],
+    if backend is None:
+        backend = select_backend()
+    return backend.text(
+        system=PANEL_SYSTEM_PROMPT, user_text=user_text,
+        model=model, max_tokens=8000, cache=True,
     )
-    text = next(b.text for b in response.content if b.type == "text")
-    return text, response.usage
 
 
 def _transcript_slice(
@@ -1024,6 +1570,7 @@ def vision_pick_frames(
     video_duration: float,
     model: str,
     segments: Optional[List["TranscriptSegment"]] = None,
+    backend=None,
 ):
     """Use Claude's vision to pick the best frame per topic from in-window candidates.
 
@@ -1033,8 +1580,10 @@ def vision_pick_frames(
     If `segments` is provided, the per-topic transcript slice is included so vision
     can ground picks on what the narrator is saying at each candidate's timestamp
     (e.g. "speaker says 'as you can see in this diagram' at 04:23 → frame at 04:23").
+
+    Raises VisionUnsupported when the active backend can't process images
+    (e.g. Claude Code with vision opt-out). Caller should fall back.
     """
-    import anthropic
     from pydantic import BaseModel
     from typing import List as TList
 
@@ -1122,22 +1671,25 @@ def vision_pick_frames(
         "candidate frame was captured. Skip topics that say 'no candidates available'."
     )
 
-    client = anthropic.Anthropic()
-    response = client.messages.parse(
-        model=model,
-        max_tokens=4000,
-        system=system,
-        messages=[{"role": "user", "content": content}],
-        output_format=FrameChoices,
+    if backend is None:
+        backend = select_backend()
+    if not getattr(backend, "vision_supported", False):
+        raise VisionUnsupported(
+            f"Backend {backend.name!r} does not support vision in the current "
+            "configuration."
+        )
+    parsed, usage = backend.vision_parse(
+        system=system, content_blocks=content,
+        model=model, max_tokens=4000, schema=FrameChoices,
     )
 
     chosen: dict = {}
-    for choice in response.parsed_output.choices:
+    for choice in parsed.choices:
         if 0 <= choice.topic_index < len(topics):
             cands = per_topic[choice.topic_index]
             if 0 <= choice.candidate_index < len(cands):
                 chosen[choice.topic_index] = cands[choice.candidate_index][0]
-    return chosen, response.usage
+    return chosen, usage
 
 
 def _pick_topic_frame(
@@ -1530,6 +2082,17 @@ DEFAULT_SETTINGS = {
     # "en" = always translate to English. Applies to both the per-video digest
     # and the panel discussion.
     "digest_language": "auto",
+    # Which auth path to use for LLM calls.
+    #   "auto":        prefer ANTHROPIC_API_KEY when set; else use the bundled
+    #                  Claude Code sandbox if installed + logged in.
+    #   "api":         force direct Anthropic API (requires ANTHROPIC_API_KEY).
+    #   "claude-code": force the bundled Claude Code subprocess backend.
+    "llm_backend": "auto",
+    # Vision frame-picking is automatic for the API backend (cheap & native)
+    # but disabled by default for Claude Code (no -p image flag; we'd have to
+    # base64-embed → token-heavy). Toggle on if you want vision via Claude
+    # Code despite the cost.
+    "claude_code_vision": False,
 }
 
 
@@ -1571,6 +2134,12 @@ def _settings_to_env(settings: dict) -> dict:
         out["YT2MD_PANEL_MODEL"] = settings["panel_model"]
     if settings.get("digest_language"):
         out["YT2MD_DIGEST_LANGUAGE"] = settings["digest_language"]
+    # Spawned subprocesses re-resolve llm_backend / claude_code_vision via
+    # load_settings() in the child — no env-var passthrough needed for those.
+    # CLAUDE_CONFIG_DIR is required so the bundled `claude` binary in the
+    # child finds our sandboxed credentials/settings instead of any system
+    # install's defaults.
+    out["CLAUDE_CONFIG_DIR"] = str(claude_config_dir())
     return out
 
 
@@ -2548,16 +3117,22 @@ def cmd_serve(args) -> int:
             d["unread"] = d["id"] not in read_digests
         unread_digest_count = sum(1 for d in digests if d["unread"])
 
-        # Persistent banner above every page when the API key is missing. Reading
-        # cached digests still works without it; only generation does, so we
-        # warn rather than gate. The Setup page is the one place this is hidden
-        # (the page itself IS the configuration UI).
-        if current != "setup" and not os.environ.get("ANTHROPIC_API_KEY"):
+        # Persistent banner above every page when neither auth path is
+        # configured. Reading cached digests still works; only generation does,
+        # so we warn rather than gate. The Setup page is the one place this is
+        # hidden (the page itself IS the configuration UI).
+        has_api_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        has_claude_code = (
+            claude_code_installed()
+            and _claude_code_session_state.get("logged_in", False)
+        )
+        if current != "setup" and not (has_api_key or has_claude_code):
             banner = (
                 '<div class="flash" style="border-left-color: #c00;">'
-                '<strong>API key not configured.</strong> '
-                'Anthropic API access is required to generate digests and panel '
-                'discussions. Reading existing digests still works. '
+                '<strong>LLM auth not configured.</strong> '
+                'Generating digests and panel discussions requires either an '
+                'Anthropic API key or a Claude Code subscription login. '
+                'Reading existing digests still works. '
                 '<a href="/setup">Set it up →</a>'
                 '</div>'
             )
@@ -2574,13 +3149,16 @@ def cmd_serve(args) -> int:
             unread_digest_count=unread_digest_count,
         )
 
-    def _require_api_key_or_redirect():
-        """Helper for action endpoints: returns a redirect Response if no key,
-        else None. Use as: r = _require_api_key_or_redirect(); if r: return r."""
+    def _require_llm_or_redirect():
+        """Helper for action endpoints: returns a redirect Response if neither
+        an API key nor a logged-in Claude Code sandbox is configured. Use as:
+        r = _require_llm_or_redirect(); if r is not None: return r."""
         from flask import redirect
         if os.environ.get("ANTHROPIC_API_KEY"):
             return None
-        return redirect("/setup?msg=API+key+required+to+run+this+action.")
+        if claude_code_installed() and _claude_code_session_state.get("logged_in"):
+            return None
+        return redirect("/setup?msg=Auth+required+to+run+this+action.")
 
     @app.route("/")
     def home():
@@ -2588,12 +3166,16 @@ def cmd_serve(args) -> int:
         digests = _list_digests(digests_dir)
         channels = read_channels()
 
-        # True first-run (no key, no digests, no channels): land directly on
-        # the setup page so the user isn't asked to subscribe before they can
-        # generate anything. Skip when there are existing digests — those
+        # True first-run (no auth at all + nothing on disk yet): land directly
+        # on the setup page so the user isn't asked to subscribe before they
+        # can generate anything. Skip when there are existing digests — those
         # should still be readable even without a key.
-        if (not digests and not channels
-                and not os.environ.get("ANTHROPIC_API_KEY")):
+        has_api_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        has_claude_code = (
+            claude_code_installed()
+            and _claude_code_session_state.get("logged_in", False)
+        )
+        if not digests and not channels and not (has_api_key or has_claude_code):
             return redirect("/setup")
 
         # Empty states first — show a real CTA, not a list of zero items.
@@ -2802,7 +3384,7 @@ def cmd_serve(args) -> int:
     @app.route("/schedule/run/<job>", methods=["POST"])
     def schedule_run(job):
         from flask import redirect
-        gate = _require_api_key_or_redirect()
+        gate = _require_llm_or_redirect()
         if gate is not None:
             return gate
         if job != "poll":
@@ -2946,6 +3528,41 @@ def cmd_serve(args) -> int:
             '</label>'
         )
 
+        # LLM backend selector
+        backend_choices = (
+            ("auto", "auto — pick API when ANTHROPIC_API_KEY is set, else Claude Code"),
+            ("api", "api — direct Anthropic API (requires ANTHROPIC_API_KEY)"),
+            ("claude-code", "claude-code — bundled Claude Code subprocess (requires Claude.ai login)"),
+        )
+        body += '<label>LLM backend'
+        body += '  <select name="llm_backend">'
+        for code, label in backend_choices:
+            sel = ' selected' if s.get("llm_backend", "auto") == code else ''
+            body += f'    <option value="{code}"{sel}>{h(label)}</option>'
+        body += '  </select>'
+        body += (
+            '  <span class="suffix" style="display:block;">'
+            'Which auth path to use for digest / panel calls. The "auto" mode '
+            'picks the cheapest available path. Switch from <a href="/setup">/setup</a>.'
+            '</span>'
+            '</label>'
+        )
+
+        # Claude Code vision toggle
+        cc_vision_checked = ' checked' if s.get("claude_code_vision") else ''
+        body += (
+            '<label>'
+            f'  <input type="checkbox" name="claude_code_vision" value="1"{cc_vision_checked}> '
+            'Enable vision frame-picking under Claude Code backend'
+            '  <span class="suffix" style="display:block;">'
+            'Off by default. The Claude Code CLI has no native image flag, so '
+            'enabling this base64-embeds frames into prompts (token-heavy). '
+            'Has no effect when the API backend is in use (which always uses '
+            'native vision).'
+            '  </span>'
+            '</label>'
+        )
+
         body += '</div>'  # schedule-fields
         body += '<button type="submit" class="primary">Save</button>'
         body += '</form>'
@@ -2957,10 +3574,12 @@ def cmd_serve(args) -> int:
         from urllib.parse import quote_plus
         s = load_settings()
         for key in ("digest_model", "panel_model", "whisper_model",
-                    "cookies_from_browser", "digest_language"):
+                    "cookies_from_browser", "digest_language", "llm_backend"):
             v = request.form.get(key)
             if v is not None:
                 s[key] = v.strip()
+        # Checkboxes are absent from request.form when unchecked.
+        s["claude_code_vision"] = bool(request.form.get("claude_code_vision"))
         save_settings(s)
 
         # API key is stored separately (.env, not settings.json) so non-secret
@@ -2982,67 +3601,263 @@ def cmd_serve(args) -> int:
         from html import escape as h
         flash = request.args.get("msg", "")
 
-        cur_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        already_set = bool(cur_key)
-
-        body = "<h1>Set up your Anthropic API key</h1>"
+        body = "<h1>Connect Claude</h1>"
         if flash:
             body += f'<div class="flash">{h(flash)}</div>'
+        body += (
+            '<p class="meta-info">Pick one of the two paths below. yt2md needs '
+            'access to a Claude model to generate digests and panel discussions; '
+            'either an Anthropic API key (per-call billing) or a Claude.ai '
+            'subscription via the bundled Claude Code (no extra billing).</p>'
+        )
 
-        if already_set:
-            body += (
-                '<div class="flash" style="border-left-color: var(--accent);">'
-                f'<strong>A key is already configured</strong> '
+        # --- Side-by-side dual-auth grid ---
+        body += (
+            '<div class="auth-grid" style="display: grid; '
+            'grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); '
+            'gap: 20px; margin-top: 20px;">'
+        )
+
+        # API key panel
+        cur_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        api_already_set = bool(cur_key)
+        api_panel = '<div class="schedule-form">'
+        api_panel += '<h2 style="margin-top: 0;">Anthropic API key</h2>'
+        if api_already_set:
+            api_panel += (
+                '<div class="flash" style="border-left-color: var(--accent); '
+                'margin-top: 0;">'
+                f'<strong>Configured</strong> '
                 f'(<code>{h(cur_key[:7])}…{h(cur_key[-4:])}</code>). '
-                'Submit a new one below to replace it, or '
-                '<a href="/">go to your library</a>.'
+                '<a href="/">Go to library →</a>'
                 '</div>'
             )
-        else:
-            body += (
-                '<p class="meta-info">yt2md uses your own Anthropic API key to '
-                'generate digests and panel discussions. The key is stored '
-                'locally in <code>~/yt2md/.env</code> and never leaves your '
-                'machine except when calling Anthropic.</p>'
-            )
-
-        body += (
-            '<div class="next-step">'
-            '<strong>Steps</strong>'
-            '<ol style="margin: 8px 0 0 20px; padding: 0;">'
-            '<li>Sign in to <a href="https://console.anthropic.com/settings/keys" '
-            'target="_blank" rel="noopener">console.anthropic.com/settings/keys</a> '
-            '(create an account if you don\'t have one).</li>'
-            '<li>Add a payment method at '
-            '<a href="https://console.anthropic.com/settings/billing" '
-            'target="_blank" rel="noopener">Billing</a> — note: your Claude.ai '
-            'subscription does not cover API usage; they\'re billed separately.</li>'
-            '<li>Click <strong>Create Key</strong>, copy the value (starts with '
-            '<code>sk-ant-</code>), and paste it below.</li>'
+        api_panel += (
+            '<p class="meta-info" style="margin-top: 0;">'
+            'For developers / users who already have an Anthropic API account. '
+            'Pay-per-call. Native vision support, prompt caching.'
+            '</p>'
+            '<ol style="margin: 8px 0 16px 20px; padding: 0; font-size: 14px;">'
+            '<li>Get a key at <a href="https://console.anthropic.com/settings/keys" '
+            'target="_blank" rel="noopener">console.anthropic.com</a>.</li>'
+            '<li>Add a payment method (subscription does NOT cover API usage).</li>'
+            '<li>Paste below.</li>'
             '</ol>'
-            f'<p style="margin-top: 12px;">{API_KEY_COST_NOTE}</p>'
+            f'<p class="meta-info" style="font-size: 13px;">{API_KEY_COST_NOTE}</p>'
+            '<form method="post" action="/setup/save-api-key">'
+            '<label>API key'
+            '  <input type="password" name="anthropic_api_key" '
+            '    placeholder="sk-ant-..." autocomplete="off" '
+            'style="width: 100%; box-sizing: border-box;">'
+            '</label>'
+            '<button type="submit" class="primary" style="margin-top: 12px;">'
+            'Save and validate</button>'
+            '</form>'
             '</div>'
         )
 
-        body += '<form method="post" action="/setup/save" class="schedule-form">'
-        body += '<div class="schedule-fields" style="grid-template-columns: 1fr;">'
-        body += (
-            '<label>Anthropic API key'
-            '  <input type="password" name="anthropic_api_key" '
-            '    placeholder="sk-ant-..." autocomplete="off" autofocus required>'
-            '  <span class="suffix" style="display:block;">'
-            '    Validated with a 1-token test call before being saved.'
-            '  </span>'
-            '</label>'
+        # Claude Code panel — installation + login flow
+        snap = claude_setup_snapshot()
+        cc_panel = '<div class="schedule-form">'
+        cc_panel += '<h2 style="margin-top: 0;">Claude.ai subscription</h2>'
+        cc_panel += (
+            '<p class="meta-info" style="margin-top: 0;">'
+            'Uses your Pro/Max plan via a bundled, sandboxed copy of Claude Code. '
+            'No extra billing. Vision off by default (toggle in Settings). '
+            'Prompt caching disappears, so very long videos may use more tokens.'
+            '</p>'
         )
-        body += '</div>'
-        body += '<button type="submit" class="primary">Save and validate</button>'
-        body += '</form>'
+
+        # Status & action area, populated by JS poll, with a server-rendered
+        # initial state for users who hit the page without JS.
+        cc_panel += '<div id="cc-status" style="margin-bottom: 12px;">'
+        if snap["logged_in"]:
+            cc_panel += (
+                '<div class="flash" style="border-left-color: var(--accent); margin: 0;">'
+                '<strong>Signed in.</strong> '
+                '<a href="/">Go to library →</a>'
+                '</div>'
+            )
+        elif not snap["node_ok"]:
+            cc_panel += (
+                '<div class="flash" style="border-left-color: #c00; margin: 0;">'
+                f'<strong>Node.js {MIN_NODE_MAJOR}+ required.</strong> '
+                'Install with <code>brew install node</code> (macOS) or your '
+                'package manager, then refresh this page.'
+                '</div>'
+            )
+        elif not snap["installed"]:
+            cc_panel += (
+                '<p class="meta-info" style="margin: 0;">'
+                f'Step 1: install Claude Code into <code>~/yt2md/claude-code/</code> '
+                f'(~200&nbsp;MB; isolated from any system install).'
+                '</p>'
+            )
+        else:
+            cc_panel += (
+                '<p class="meta-info" style="margin: 0;">'
+                'Step 2: sign in. A new browser tab will open for Claude.ai OAuth. '
+                'Complete sign-in there; this page will update automatically.'
+                '</p>'
+            )
+        cc_panel += '</div>'
+
+        # Action buttons (the JS toggles these based on status).
+        install_disabled = (
+            ' disabled' if not snap["node_ok"] or snap["install_running"]
+            or snap["installed"] else ''
+        )
+        login_visible = snap["installed"] and not snap["logged_in"]
+        cc_panel += '<div id="cc-actions" style="display: flex; gap: 8px; flex-wrap: wrap;">'
+        cc_panel += (
+            f'<form method="post" action="/setup/install-claude" style="display:inline;">'
+            f'<button type="submit" class="primary"{install_disabled} '
+            'id="cc-install-btn">Install Claude Code</button>'
+            '</form>'
+        )
+        if login_visible:
+            cc_panel += (
+                '<form method="post" action="/setup/login-claude" style="display:inline;">'
+                '<button type="submit" class="primary" id="cc-login-btn">'
+                'Sign in with Claude.ai</button>'
+                '</form>'
+            )
+        if snap["logged_in"]:
+            cc_panel += (
+                '<form method="post" action="/setup/logout-claude" style="display:inline;" '
+                'onsubmit="return confirm(\'Sign out of Claude Code?\');">'
+                '<button type="submit">Sign out</button>'
+                '</form>'
+            )
+        cc_panel += '</div>'
+
+        # Live log tail (hidden when both logs are empty).
+        cc_panel += (
+            '<details id="cc-log-details" style="margin-top: 12px;'
+            + ('' if (snap["install_log_tail"] or snap["login_log_tail"]) else ' display: none;')
+            + '">'
+            '<summary>Recent log</summary>'
+            '<pre id="cc-log-tail" class="log-block" style="max-height: 200px; '
+            'overflow: auto; font-size: 11px;">'
+            + h((snap["login_log_tail"] or snap["install_log_tail"] or "").strip())
+            + '</pre>'
+            '</details>'
+        )
+        cc_panel += '</div>'
+
+        body += api_panel + cc_panel + "</div>"  # close auth-grid
+
+        # Polling JS: refreshes the Claude Code panel every 2s while a job is
+        # running, so the user sees install / login progress without refreshing.
+        body += """
+<script>
+(function () {
+  const statusEl = document.getElementById('cc-status');
+  const actionsEl = document.getElementById('cc-actions');
+  const logDetailsEl = document.getElementById('cc-log-details');
+  const logTailEl = document.getElementById('cc-log-tail');
+  if (!statusEl) return;
+  let pollTimer = null;
+
+  function escapeHtml(s) {
+    const d = document.createElement('div'); d.textContent = String(s ?? ''); return d.innerHTML;
+  }
+
+  function renderStatus(s) {
+    if (s.logged_in) {
+      statusEl.innerHTML =
+        '<div class="flash" style="border-left-color: var(--accent); margin: 0;">' +
+        '<strong>Signed in.</strong> <a href="/">Go to library →</a></div>';
+    } else if (!s.node_ok) {
+      statusEl.innerHTML =
+        '<div class="flash" style="border-left-color: #c00; margin: 0;">' +
+        '<strong>Node.js ' + 18 + '+ required.</strong> ' +
+        'Install with <code>brew install node</code> (macOS) or your package manager, then refresh this page.' +
+        '</div>';
+    } else if (s.install_running) {
+      statusEl.innerHTML =
+        '<p class="meta-info" style="margin: 0;">Installing Claude Code… this takes ~30s.</p>';
+    } else if (s.login_running) {
+      statusEl.innerHTML =
+        '<p class="meta-info" style="margin: 0;">Waiting for Claude.ai OAuth to complete in the browser tab that just opened…</p>';
+    } else if (s.install_error) {
+      statusEl.innerHTML =
+        '<div class="flash" style="border-left-color: #c00; margin: 0;"><strong>Install failed.</strong> ' +
+        escapeHtml(s.install_error) + '</div>';
+    } else if (s.login_error) {
+      statusEl.innerHTML =
+        '<div class="flash" style="border-left-color: #c00; margin: 0;"><strong>Login failed.</strong> ' +
+        escapeHtml(s.login_error) + '</div>';
+    } else if (!s.installed) {
+      statusEl.innerHTML = '<p class="meta-info" style="margin: 0;">Step 1: install Claude Code into <code>~/yt2md/claude-code/</code>.</p>';
+    } else {
+      statusEl.innerHTML = '<p class="meta-info" style="margin: 0;">Step 2: sign in. A new browser tab will open for Claude.ai OAuth.</p>';
+    }
+  }
+
+  function renderActions(s) {
+    let html = '';
+    const installDisabled = (!s.node_ok || s.install_running || s.installed) ? ' disabled' : '';
+    html += '<form method="post" action="/setup/install-claude" style="display:inline;">' +
+            '<button type="submit" class="primary"' + installDisabled + ' id="cc-install-btn">' +
+            (s.install_running ? 'Installing…' : 'Install Claude Code') + '</button></form>';
+    if (s.installed && !s.logged_in) {
+      html += '<form method="post" action="/setup/login-claude" style="display:inline;">' +
+              '<button type="submit" class="primary"' + (s.login_running ? ' disabled' : '') + ' id="cc-login-btn">' +
+              (s.login_running ? 'Waiting for OAuth…' : 'Sign in with Claude.ai') + '</button></form>';
+    }
+    if (s.logged_in) {
+      html += '<form method="post" action="/setup/logout-claude" style="display:inline;" ' +
+              'onsubmit="return confirm(\\'Sign out of Claude Code?\\');">' +
+              '<button type="submit">Sign out</button></form>';
+    }
+    actionsEl.innerHTML = html;
+  }
+
+  function renderLog(s) {
+    const tail = (s.login_log_tail || s.install_log_tail || '').trim();
+    if (!tail) {
+      logDetailsEl.style.display = 'none';
+      return;
+    }
+    logDetailsEl.style.display = '';
+    logTailEl.textContent = tail;
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch('/setup/claude-status');
+      if (!res.ok) return;
+      const s = await res.json();
+      renderStatus(s);
+      renderActions(s);
+      renderLog(s);
+      // Auto-redirect home once login lands.
+      if (s.logged_in) {
+        clearInterval(pollTimer);
+        setTimeout(() => { window.location.href = '/?msg=Signed+in+via+Claude.ai+subscription.'; }, 1500);
+        return;
+      }
+      // Stop polling if nothing is in flight (saves cycles).
+      if (!s.install_running && !s.login_running) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    } catch (e) { /* network blip — try again next tick */ }
+  }
+
+  // Always do an immediate poll so transient state from a just-submitted
+  // form is reflected without the 2s delay.
+  poll();
+  pollTimer = setInterval(poll, 2000);
+})();
+</script>
+"""
 
         return page(body, title="Set up", current="setup")
 
-    @app.route("/setup/save", methods=["POST"])
-    def setup_save():
+    @app.route("/setup/save-api-key", methods=["POST"])
+    def setup_save_api_key():
         from flask import redirect, request
         from urllib.parse import quote_plus
         new_key = (request.form.get("anthropic_api_key") or "").strip()
@@ -3053,6 +3868,43 @@ def cmd_serve(args) -> int:
             return redirect(f"/setup?msg=Key+rejected:+{quote_plus(err)}")
         set_env_var("ANTHROPIC_API_KEY", new_key)
         return redirect("/?msg=API+key+saved.+You+can+now+generate+digests.")
+
+    # Legacy route name retained for back-compat with bookmarks/redirects.
+    @app.route("/setup/save", methods=["POST"])
+    def setup_save_legacy():
+        return setup_save_api_key()
+
+    @app.route("/setup/install-claude", methods=["POST"])
+    def setup_install_claude():
+        from flask import redirect
+        err = start_install_job()
+        if err:
+            from urllib.parse import quote_plus
+            return redirect(f"/setup?msg={quote_plus(err)}")
+        return redirect("/setup")
+
+    @app.route("/setup/login-claude", methods=["POST"])
+    def setup_login_claude():
+        from flask import redirect
+        err = start_login_job()
+        if err:
+            from urllib.parse import quote_plus
+            return redirect(f"/setup?msg={quote_plus(err)}")
+        return redirect("/setup")
+
+    @app.route("/setup/logout-claude", methods=["POST"])
+    def setup_logout_claude():
+        from flask import redirect
+        rc, out = claude_logout()
+        if rc != 0:
+            from urllib.parse import quote_plus
+            return redirect(f"/setup?msg=Logout+failed:+{quote_plus(out[:200])}")
+        return redirect("/setup?msg=Signed+out+of+Claude+Code.")
+
+    @app.route("/setup/claude-status")
+    def setup_claude_status():
+        from flask import jsonify
+        return jsonify(claude_setup_snapshot())
 
     @app.route("/one-off", methods=["GET"])
     def one_off_page():
@@ -3233,7 +4085,7 @@ def cmd_serve(args) -> int:
     def one_off_submit():
         from flask import redirect, request
         import time as _t
-        gate = _require_api_key_or_redirect()
+        gate = _require_llm_or_redirect()
         if gate is not None:
             return gate
         url = request.form.get("url", "").strip()
@@ -3555,7 +4407,7 @@ def cmd_serve(args) -> int:
     @app.route("/digests/<video_id>/discuss", methods=["POST"])
     def generate_panel(video_id):
         from flask import redirect
-        gate = _require_api_key_or_redirect()
+        gate = _require_llm_or_redirect()
         if gate is not None:
             return gate
         digest_md = digests_dir / video_id / "digest.md"
@@ -3636,7 +4488,18 @@ def cmd_serve(args) -> int:
     if api_key:
         print(f"API key: set ({api_key[:7]}…{api_key[-4:]})")
     else:
-        print(f"API key: (not set — first-run setup at {url}setup)")
+        print(f"API key: (not set)")
+    # Cheap sentinel-based probe to populate the session-state cache so the
+    # banner / gate know whether Claude Code is logged in across restarts.
+    claude_probe_login_state()
+    cc_status = (
+        "logged in" if _claude_code_session_state.get("logged_in")
+        else ("installed (run /setup to log in)" if claude_code_installed()
+              else "not installed")
+    )
+    print(f"Claude Code: {cc_status}")
+    if not api_key and not _claude_code_session_state.get("logged_in"):
+        print(f"  → first-run setup at {url}setup")
     # Surface the YouTube prerequisites at startup so the user notices missing
     # cookies / JS runtime before a one-off digest fails 30s later.
     cookies_browser = os.environ.get("YT2MD_COOKIES_FROM_BROWSER")
@@ -3989,12 +4852,14 @@ def main():
         if do_digest:
             digest_path.parent.mkdir(parents=True, exist_ok=True)
             images_dir = digest_path.parent / f"{digest_path.stem}_images"
-            print(f"[+] Generating digest with {args.digest_model} -> {digest_path}")
+            backend = select_backend()
+            print(f"[+] Generating digest with {args.digest_model} via {backend.name} backend -> {digest_path}")
             _digest_t0 = _time.monotonic()
             digest, usage = generate_digest(
                 segments, video_title or video_path.stem, args.digest_model,
                 source_lang=source_lang,
                 output_language=args.digest_language,
+                backend=backend,
             )
             timings["digest"] = round(_time.monotonic() - _digest_t0, 3)
             print(f"      {len(digest.topics)} topics  |  "
@@ -4005,15 +4870,23 @@ def main():
 
             vision_picks = None
             if not args.no_vision:
-                print(f"[+] Vision-picking frames with {args.digest_model}...")
-                _vision_t0 = _time.monotonic()
-                vision_picks, v_usage = vision_pick_frames(
-                    digest, frames, duration, args.digest_model, segments=segments
-                )
-                timings["vision"] = round(_time.monotonic() - _vision_t0, 3)
-                print(f"      vision-selected {len(vision_picks)}/{len(digest.topics)} topics  |  "
-                      f"input: {v_usage.input_tokens} tokens  |  "
-                      f"output: {v_usage.output_tokens} tokens")
+                if not getattr(backend, "vision_supported", False):
+                    print(f"[+] Vision skipped — {backend.name} backend has vision disabled "
+                          "(timestamp-based picks will be used).")
+                else:
+                    print(f"[+] Vision-picking frames with {args.digest_model}...")
+                    _vision_t0 = _time.monotonic()
+                    try:
+                        vision_picks, v_usage = vision_pick_frames(
+                            digest, frames, duration, args.digest_model,
+                            segments=segments, backend=backend,
+                        )
+                        timings["vision"] = round(_time.monotonic() - _vision_t0, 3)
+                        print(f"      vision-selected {len(vision_picks)}/{len(digest.topics)} topics  |  "
+                              f"input: {v_usage.input_tokens} tokens  |  "
+                              f"output: {v_usage.output_tokens} tokens")
+                    except VisionUnsupported as e:
+                        print(f"      vision unsupported: {e}; falling back to timestamp picks.")
 
             write_markdown_digest(
                 digest, frames, duration, digest_path, images_dir, vision_picks,
