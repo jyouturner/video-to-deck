@@ -2839,11 +2839,15 @@ def _read_digest_ids() -> set:
 
 # ---- serve subcommand (local reader UI) ----
 
-# Shared between digest + panel viewers. The button has data-copy-target
-# pointing at a hidden <textarea> elsewhere on the page; on click we read
-# its raw value and copy to the clipboard. Falls back to a select+execCommand
-# path for browsers / contexts (eg http on a non-localhost) where the modern
-# clipboard API is unavailable.
+# Shared between digest + panel + takeaway viewers. The button has
+# data-copy-target pointing at a hidden <textarea> elsewhere on the page; on
+# click we read its raw value and copy to the clipboard. Falls back to a
+# select+execCommand path for browsers / contexts (eg http on a non-localhost)
+# where the modern clipboard API is unavailable.
+#
+# Optional attribute data-then-open="<url>" navigates to the URL in a new tab
+# after a successful copy — used by the "Continue in chat" handoff to land
+# the user in claude.ai with the context already in their clipboard.
 _COPY_BUTTON_JS = """
 <script>
 (function () {
@@ -2852,6 +2856,12 @@ _COPY_BUTTON_JS = """
     btn.setAttribute('data-orig-text', orig);
     btn.textContent = text;
     setTimeout(() => { btn.textContent = orig; }, 1500);
+  }
+  function maybeOpen(btn) {
+    const url = btn.getAttribute('data-then-open');
+    if (!url) return;
+    // Brief delay so the user sees the "Copied!" feedback before the new tab.
+    setTimeout(() => window.open(url, '_blank', 'noopener'), 600);
   }
   document.addEventListener('click', async (ev) => {
     const btn = ev.target.closest('[data-copy-target]');
@@ -2864,6 +2874,7 @@ _COPY_BUTTON_JS = """
       if (navigator.clipboard && navigator.clipboard.writeText) {
         await navigator.clipboard.writeText(text);
         flash(btn, 'Copied!');
+        maybeOpen(btn);
         return;
       }
     } catch (e) { /* fall through to legacy path */ }
@@ -2875,6 +2886,7 @@ _COPY_BUTTON_JS = """
       document.execCommand('copy');
       src.setAttribute('hidden', '');
       flash(btn, 'Copied!');
+      maybeOpen(btn);
     } catch (e) {
       flash(btn, 'Copy failed');
     }
@@ -2882,6 +2894,49 @@ _COPY_BUTTON_JS = """
 })();
 </script>
 """
+
+
+def build_chat_handoff_prompt(video_id: str, digests_dir: Path) -> str:
+    """Assemble a prompt the user can paste into claude.ai (or any chat) to
+    continue thinking about a video. Includes whichever artifacts exist on
+    disk — digest, panel, takeaway — so the chat has full context without
+    a manual paste of each.
+    """
+    digest_md = digests_dir / video_id / "digest.md"
+    panel_md = digests_dir / video_id / "panel.md"
+    takeaway_md = digests_dir / video_id / "takeaway.md"
+
+    have = []
+    if digest_md.exists():
+        have.append("digest")
+    if panel_md.exists():
+        have.append("panel-of-experts critique")
+    if takeaway_md.exists():
+        have.append("bottom-line takeaway")
+    if not have:
+        artifacts_phrase = "summary"
+    elif len(have) == 1:
+        artifacts_phrase = have[0]
+    elif len(have) == 2:
+        artifacts_phrase = f"{have[0]} and {have[1]}"
+    else:
+        artifacts_phrase = ", ".join(have[:-1]) + ", and " + have[-1]
+
+    parts: List[str] = [
+        f"I just read a distilled summary of a YouTube video. Below is the "
+        f"{artifacts_phrase}. I have a follow-up question.",
+        "",
+        f"Source: https://www.youtube.com/watch?v={video_id}",
+        "",
+    ]
+    if digest_md.exists():
+        parts += ["# Digest", "", digest_md.read_text().rstrip(), ""]
+    if panel_md.exists():
+        parts += ["# Panel discussion", "", panel_md.read_text().rstrip(), ""]
+    if takeaway_md.exists():
+        parts += ["# Takeaway", "", takeaway_md.read_text().rstrip(), ""]
+    parts += ["---", "", "My question: "]
+    return "\n".join(parts)
 
 
 SERVE_PAGE_TEMPLATE = """<!doctype html>
@@ -4769,10 +4824,20 @@ def cmd_serve(args) -> int:
             abort(404)
         md_source = takeaway_md.read_text()
         rendered = _render_markdown(md_source)
+        # Pre-assemble the chat handoff prompt server-side so the button can
+        # just copy a hidden textarea (same pattern as Copy markdown). Loads
+        # whichever artifacts exist (digest + panel + takeaway).
+        chat_prompt = build_chat_handoff_prompt(video_id, digests_dir)
         nav = (
             '<div class="digest-actions digest-toolbar" style="margin-top:0;">'
             f'<a href="/digests/{h(video_id)}/" class="discuss-btn-secondary" '
             'style="text-decoration:none; padding: 6px 12px;">← Back to digest</a>'
+            "<button type='button' class='discuss-btn' "
+            "data-copy-target='chat-handoff-source' "
+            "data-then-open='https://claude.ai/new' "
+            "title='Copies digest + panel + takeaway to your clipboard and "
+            "opens claude.ai in a new tab — paste to continue the discussion "
+            "with full context.'>Continue in chat</button>"
             "<button type='button' class='discuss-btn-secondary' "
             "data-copy-target='takeaway-md-source' "
             "title='Copy the takeaway markdown'>Copy markdown</button>"
@@ -4781,6 +4846,8 @@ def cmd_serve(args) -> int:
         hidden_md = (
             f'<textarea id="takeaway-md-source" hidden aria-hidden="true">'
             f'{h(md_source)}</textarea>'
+            f'<textarea id="chat-handoff-source" hidden aria-hidden="true">'
+            f'{h(chat_prompt)}</textarea>'
         )
         return page(nav + hidden_md + _COPY_BUTTON_JS + rendered,
                     title=f"Takeaway · {video_id}",
