@@ -4707,17 +4707,32 @@ def cmd_serve(args) -> int:
                 "Generate panel</button>"
                 "</form>"
             )
-        # Slides download — sibling artifact alongside takeaway/panel. The
-        # visual layer (intelligently-picked frames + transcript snippets)
-        # is the tool's main differentiator vs. a pure-LLM workflow.
+        # Slides — sibling artifact alongside takeaway/panel. The visual
+        # layer (intelligently-picked frames + transcript snippets) is the
+        # tool's main differentiator vs. a pure-LLM workflow. Generation
+        # uses cached MP4 + SRT, no LLM calls, ~30–90s depending on video.
         slides_path = digests_dir / video_id / "slides.pptx"
         if slides_path.exists():
             toolbar += (
                 f"<a class='discuss-btn-secondary' style='text-decoration:none;' "
                 f"href='/digests/{h(video_id)}/slides.pptx' "
-                "title='Download the auto-generated PowerPoint deck '"
-                "'(one slide per topic, with intelligently-picked frames).'>"
+                "title='Download the auto-generated PowerPoint deck "
+                "(one slide per topic, with intelligently-picked frames).'>"
                 "Download slides</a>"
+            )
+        else:
+            gen_submit_js_slides = (
+                "this.querySelector('button').disabled=true;"
+                "this.querySelector('button').textContent='Generating slides… (~30–90s)';"
+            )
+            toolbar += (
+                f"<form method='post' action='/digests/{h(video_id)}/slides' "
+                f"style='display:inline;' onsubmit=\"{gen_submit_js_slides}\">"
+                "<button type='submit' class='discuss-btn-secondary' "
+                "title='Builds slides.pptx from the cached video — local frame "
+                "extraction + alignment + PowerPoint assembly. No LLM call.'>"
+                "Generate slides</button>"
+                "</form>"
             )
         # Copy markdown — lets the reader paste into Notion, Obsidian, an
         # email, another LLM, etc. Markdown is the most-portable form.
@@ -4937,6 +4952,63 @@ def cmd_serve(args) -> int:
             digests_dir / video_id, "slides.pptx",
             as_attachment=True, download_name=f"{video_id}.pptx",
         )
+
+    @app.route("/digests/<video_id>/slides", methods=["POST"])
+    def generate_slides_route(video_id):
+        from flask import redirect
+        from concurrent.futures import ThreadPoolExecutor
+        cache_dir = digests_dir / video_id / "downloads" / video_id
+        if not cache_dir.exists():
+            return redirect(
+                f"/digests/{video_id}/?msg=No+cached+video.+Re-digest+the+video+first."
+            )
+        mp4_path = cache_dir / f"{video_id}.mp4"
+        srt_files = list(cache_dir.glob("*.srt"))
+        if not mp4_path.exists() or not srt_files:
+            return redirect(
+                f"/digests/{video_id}/?msg=Cached+video+or+SRT+missing.+Re-digest+the+video+first."
+            )
+        srt_path = srt_files[0]
+
+        # Pure local pipeline — no LLM. Mirrors the slides leg of main()
+        # but reads from the digest's existing cache instead of downloading.
+        workdir = Path(tempfile.mkdtemp(prefix="v2d_slides_"))
+        scene_dir = workdir / "scene"
+        interval_dir = workdir / "interval"
+        try:
+            duration = get_video_duration(mp4_path)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                scene_fut = pool.submit(extract_scene_frames, mp4_path, scene_dir, 0.2)
+                interval_fut = pool.submit(
+                    extract_interval_frames, mp4_path, interval_dir, 20.0, duration,
+                )
+                scene_frames = scene_fut.result()
+                interval_frames = interval_fut.result()
+            frames = merge_frames(scene_frames, interval_frames)
+            frames = dedupe_frames(frames, 4)
+            segments = parse_srt(srt_path)
+            slides_data = assign_transcript_to_frames(frames, segments, duration)
+            # Title for the deck's title slide. Prefer the digest's H1 (the
+            # original YouTube title) — falls back to the video_id if absent.
+            digest_md_path = digests_dir / video_id / "digest.md"
+            title = video_id
+            if digest_md_path.exists():
+                for line in digest_md_path.read_text().splitlines():
+                    if line.startswith("# "):
+                        title = line[2:].strip()
+                        break
+            build_deck(
+                slides_data,
+                digests_dir / video_id / "slides.pptx",
+                title,
+            )
+        except Exception as e:
+            return redirect(
+                f"/digests/{video_id}/?msg=Slides+generation+failed:+{type(e).__name__}:+{e}"
+            )
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        return redirect(f"/digests/{video_id}/?msg=Slides+generated.")
 
     @app.errorhandler(404)
     def not_found(e):
