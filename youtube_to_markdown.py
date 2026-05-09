@@ -1762,7 +1762,16 @@ def write_markdown_digest(
     lines.append("")
     for i, topic in enumerate(topics):
         ts = format_timestamp(topic.start_time)
-        lines.append(f"## {topic.title}  <sub>*{ts}*</sub>")
+        # Deep-link the timestamp when we know the source URL: clicking
+        # jumps the viewer straight to that moment in the original video.
+        # Without a URL (local-file digests), keep the bare timestamp.
+        if video_url:
+            sec = int(topic.start_time)
+            sep = "&" if "?" in video_url else "?"
+            ts_link = f"[{ts}]({video_url}{sep}t={sec}s)"
+            lines.append(f"## {topic.title}  <sub>*{ts_link}*</sub>")
+        else:
+            lines.append(f"## {topic.title}  <sub>*{ts}*</sub>")
         lines.append("")
         if topic_images[i] is not None:
             # Use the topic title as alt text — accessible to screen readers and
@@ -3131,6 +3140,15 @@ def _render_markdown(text: str) -> str:
     html = md_lib.markdown(text, extensions=["fenced_code", "tables", "sane_lists"])
     # Rewrite cross-references to other digests (e.g. ../digests/X/digest.md) into view URLs.
     html = re.sub(r'href="[^"]*digests/([^"/]+)/digest\.md"', r'href="/digests/\1/"', html)
+    # Open external links in a new tab so the reader doesn't lose their place
+    # when clicking a YouTube timestamp / "Watch on YouTube" link. rel=noopener
+    # blocks the new tab from manipulating window.opener (web-security best
+    # practice). Skip anchors that already have a target= attribute.
+    html = re.sub(
+        r'<a (href="https?://[^"]+")(?![^>]*\btarget=)',
+        r'<a \1 target="_blank" rel="noopener"',
+        html,
+    )
     return html
 
 
