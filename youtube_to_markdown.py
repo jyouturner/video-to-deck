@@ -1917,91 +1917,42 @@ def write_markdown_digest(
     output_md.write_text("\n".join(lines).rstrip() + "\n")
 
 
-# Sentinel headers so we can detect (and replace) an existing takeaway section
-# idempotently. The current heading is "## Takeaway"; the legacy prefix
-# "## Distillation" is recognized too so digests written by the previous
-# (atom-based) implementation get rewritten cleanly on regeneration.
-_TAKEAWAY_HEADER = "## Takeaway"
-_LEGACY_DISTILLATION_HEADER = "## Distillation"
-
-
 def render_takeaway_markdown(
     takeaway_text: str,
     *,
     video_url: Optional[str] = None,
 ) -> str:
-    """Render the LLM's takeaway prose as a Markdown section ready to append
-    to digest.md. Post-processes [M:SS] / [H:MM:SS] bracket markers in the
-    prose into clickable [M:SS](video_url&t=Ns) links when video_url is known.
+    """Post-process the LLM's takeaway prose for writing to takeaway.md.
+    Converts the LLM's bracketed [M:SS] / [H:MM:SS] markers into clickable
+    markdown links to the source video when video_url is known. Returns the
+    body text alone — the file's heading is rendered by the viewer chrome,
+    not embedded in the markdown.
     """
     body = takeaway_text.strip()
 
-    if video_url:
-        sep = "&" if "?" in video_url else "?"
+    if not video_url:
+        return body + "\n"
 
-        def _ts_to_seconds(ts: str) -> int:
-            parts = [int(p) for p in ts.split(":")]
-            if len(parts) == 2:
-                return parts[0] * 60 + parts[1]
-            if len(parts) == 3:
-                return parts[0] * 3600 + parts[1] * 60 + parts[2]
-            return 0
+    sep = "&" if "?" in video_url else "?"
 
-        # Match bare bracketed timestamps like [3:15] or [1:02:48], but not
-        # ones that are already a markdown link's display text — i.e. skip
-        # patterns immediately followed by '(' which would indicate the LLM
-        # already wrote a full [text](url) link.
-        def _link(m):
-            ts = m.group(1)
-            sec = _ts_to_seconds(ts)
-            return f"[{ts}]({video_url}{sep}t={sec}s)"
-
-        body = re.sub(
-            r"\[(\d+:\d+(?::\d+)?)\](?!\()",
-            _link,
-            body,
-        )
-
-    return f"{_TAKEAWAY_HEADER}\n\n{body}\n"
-
-
-def _find_section_index(text: str, prefix: str) -> int:
-    """Locate the start of a section whose heading starts with `prefix`.
-    Returns the index of the heading character, or -1 if not found.
-    """
-    idx = text.find("\n" + prefix)
-    if idx == -1 and text.startswith(prefix):
+    def _ts_to_seconds(ts: str) -> int:
+        parts = [int(p) for p in ts.split(":")]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
         return 0
-    return idx + 1 if idx >= 0 else -1
 
+    # Match bare bracketed timestamps like [3:15] or [1:02:48], but not ones
+    # that are already a markdown link's display text — skip patterns
+    # immediately followed by '(' which indicates the LLM already wrote a
+    # full [text](url) link.
+    def _link(m):
+        ts = m.group(1)
+        sec = _ts_to_seconds(ts)
+        return f"[{ts}]({video_url}{sep}t={sec}s)"
 
-def append_or_replace_takeaway(digest_md_path: Path, section_md: str) -> None:
-    """Idempotent write: replaces an existing takeaway section (or legacy
-    distillation section) if present, otherwise appends to the end of
-    digest.md.
-    """
-    text = digest_md_path.read_text()
-    idx = _find_section_index(text, _TAKEAWAY_HEADER)
-    if idx == -1:
-        idx = _find_section_index(text, _LEGACY_DISTILLATION_HEADER)
-    if idx == -1:
-        sep = "" if text.endswith("\n") else "\n"
-        digest_md_path.write_text(text + sep + "\n" + section_md.rstrip() + "\n")
-        return
-    head = text[:idx]
-    digest_md_path.write_text(
-        (head.rstrip() + "\n\n" if head.strip() else "")
-        + section_md.rstrip() + "\n"
-    )
-
-
-def has_takeaway_section(digest_md_path: Path) -> bool:
-    """True if digest.md already has a Takeaway section (or a legacy
-    Distillation section that the regen path will replace)."""
-    if not digest_md_path.exists():
-        return False
-    text = digest_md_path.read_text()
-    return _TAKEAWAY_HEADER in text or _LEGACY_DISTILLATION_HEADER in text
+    return re.sub(r"\[(\d+:\d+(?::\d+)?)\](?!\()", _link, body) + "\n"
 
 
 # ---------- Subcommands: watch / meta / serve ----------
@@ -4633,54 +4584,56 @@ def cmd_serve(args) -> int:
         rendered = _render_markdown(md_source)
 
         # Build the action toolbar. Lives at the TOP of the page so the user
-        # doesn't have to scroll past the whole digest to find these. Discuss
-        # POST is synchronous (~60–120s for the Opus call); the JS handler
-        # disables the button on submit and swaps its label so the wait is
-        # visible. The form still posts normally; the browser navigates to the
-        # panel page on redirect.
+        # doesn't have to scroll past the whole digest to find these. Reading
+        # order in the toolbar mirrors the typical "fast food" path: takeaway
+        # first (the synthesized bottom line), panel second (the deeper
+        # critique), then utility actions.
         panel_md = digests_dir / video_id / "panel.md"
         panel_exists = panel_md.exists()
-        discuss_submit_js = (
+        takeaway_md = digests_dir / video_id / "takeaway.md"
+        takeaway_exists = takeaway_md.exists()
+        gen_submit_js_panel = (
             "this.querySelector('button').disabled=true;"
             "this.querySelector('button').textContent='Generating panel… (~60–120s)';"
         )
+        gen_submit_js_takeaway = (
+            "this.querySelector('button').disabled=true;"
+            "this.querySelector('button').textContent='Generating takeaway… (~30s)';"
+        )
+
         toolbar = "<div class='digest-actions digest-toolbar'>"
-        if panel_exists:
+        # Takeaway: primary CTA when present (it's what most readers want
+        # next). When missing, offer to generate it.
+        if takeaway_exists:
             toolbar += (
-                f"<a class='discuss-btn' href='/digests/{h(video_id)}/panel/'>"
-                "View panel discussion</a>"
-                f"<form method='post' action='/digests/{h(video_id)}/discuss' "
-                f"style='display:inline;' onsubmit=\"{discuss_submit_js}\">"
-                "<button type='submit' class='discuss-btn-secondary' "
-                "title='Re-runs the panel; replaces existing panel.md'>Regenerate panel</button>"
-                "</form>"
+                f"<a class='discuss-btn' href='/digests/{h(video_id)}/takeaway/'>"
+                "View takeaway</a>"
             )
         else:
-            # Pre-pipeline-update digests; offer the on-demand panel generator.
-            toolbar += (
-                f"<form method='post' action='/digests/{h(video_id)}/discuss' "
-                f"style='display:inline;' onsubmit=\"{discuss_submit_js}\">"
-                "<button type='submit' class='discuss-btn' "
-                "title='Generates a panel-of-experts discussion (~60–120s, one Opus call)'>"
-                "Generate panel</button>"
-                "</form>"
-            )
-        # Takeaway button: shown when the digest doesn't already have a
-        # Takeaway section. Pre-pipeline-update digests can generate one on
-        # demand. The same button regenerates a legacy "## Distillation"
-        # section into the new "## Takeaway" form (the renderer handles the
-        # in-place replacement).
-        if not has_takeaway_section(digest_md):
-            takeaway_submit_js = (
-                "this.querySelector('button').disabled=true;"
-                "this.querySelector('button').textContent='Generating… (~30s)';"
-            )
             toolbar += (
                 f"<form method='post' action='/digests/{h(video_id)}/takeaway' "
-                f"style='display:inline;' onsubmit=\"{takeaway_submit_js}\">"
-                "<button type='submit' class='discuss-btn-secondary' "
-                "title='Writes a 1–3 paragraph takeaway and appends it to digest.md'>"
+                f"style='display:inline;' onsubmit=\"{gen_submit_js_takeaway}\">"
+                "<button type='submit' class='discuss-btn' "
+                "title='Writes a 1–3 paragraph takeaway and saves it to takeaway.md'>"
                 "Generate takeaway</button>"
+                "</form>"
+            )
+        # Panel: secondary nav when present. Regenerate button removed —
+        # without prompt editability there's no useful reason to spend
+        # another Opus call. Legacy digests without a panel can still
+        # generate one on demand (auto-pipeline didn't run for them).
+        if panel_exists:
+            toolbar += (
+                f"<a class='discuss-btn-secondary' style='text-decoration:none;' "
+                f"href='/digests/{h(video_id)}/panel/'>View panel discussion</a>"
+            )
+        else:
+            toolbar += (
+                f"<form method='post' action='/digests/{h(video_id)}/discuss' "
+                f"style='display:inline;' onsubmit=\"{gen_submit_js_panel}\">"
+                "<button type='submit' class='discuss-btn-secondary' "
+                "title='Generates a panel-of-experts discussion (~60–120s, one Opus call)'>"
+                "Generate panel</button>"
                 "</form>"
             )
         # Copy markdown — lets the reader paste into Notion, Obsidian, an
@@ -4795,16 +4748,44 @@ def cmd_serve(args) -> int:
                 source_lang=lang,
                 output_language=s.get("digest_language") or "auto",
             )
-            section_md = render_takeaway_markdown(
+            body = render_takeaway_markdown(
                 takeaway_text,
                 video_url=f"https://www.youtube.com/watch?v={video_id}",
             )
-            append_or_replace_takeaway(digest_md, section_md)
+            (digests_dir / video_id / "takeaway.md").write_text(body)
         except Exception as e:
             return redirect(
                 f"/digests/{video_id}/?msg=Takeaway+failed:+{type(e).__name__}:+{e}"
             )
-        return redirect(f"/digests/{video_id}/?msg=Takeaway+added.")
+        # Drop the user straight into the takeaway — that's what they
+        # clicked Generate to read.
+        return redirect(f"/digests/{video_id}/takeaway/")
+
+    @app.route("/digests/<video_id>/takeaway/")
+    def view_takeaway(video_id):
+        from html import escape as h
+        takeaway_md = digests_dir / video_id / "takeaway.md"
+        if not takeaway_md.exists():
+            abort(404)
+        md_source = takeaway_md.read_text()
+        rendered = _render_markdown(md_source)
+        nav = (
+            '<div class="digest-actions digest-toolbar" style="margin-top:0;">'
+            f'<a href="/digests/{h(video_id)}/" class="discuss-btn-secondary" '
+            'style="text-decoration:none; padding: 6px 12px;">← Back to digest</a>'
+            "<button type='button' class='discuss-btn-secondary' "
+            "data-copy-target='takeaway-md-source' "
+            "title='Copy the takeaway markdown'>Copy markdown</button>"
+            "</div>"
+        )
+        hidden_md = (
+            f'<textarea id="takeaway-md-source" hidden aria-hidden="true">'
+            f'{h(md_source)}</textarea>'
+        )
+        return page(nav + hidden_md + _COPY_BUTTON_JS + rendered,
+                    title=f"Takeaway · {video_id}",
+                    current=f"digest:{video_id}",
+                    base_href=f"/digests/{video_id}/takeaway/")
 
     @app.route("/digests/<video_id>/panel/")
     def view_panel(video_id):
@@ -5317,6 +5298,7 @@ def main():
                     print(f"      Panel generation failed ({type(e).__name__}: {e}); "
                           "continuing without panel.")
 
+            takeaway_path = digest_path.parent / "takeaway.md"
             if not args.no_takeaway:
                 print(f"[+] Generating takeaway with {args.takeaway_model}...")
                 _take_t0 = _time.monotonic()
@@ -5329,12 +5311,12 @@ def main():
                         output_language=args.digest_language,
                         backend=backend,
                     )
-                    section_md = render_takeaway_markdown(
+                    body = render_takeaway_markdown(
                         takeaway_text, video_url=video_url,
                     )
-                    append_or_replace_takeaway(digest_path, section_md)
+                    takeaway_path.write_text(body)
                     timings["takeaway"] = round(_time.monotonic() - _take_t0, 3)
-                    print(f"      Takeaway appended  |  "
+                    print(f"      Takeaway written -> {takeaway_path}  |  "
                           f"input: {t_usage.input_tokens} tokens  |  "
                           f"output: {t_usage.output_tokens} tokens")
                 except Exception as e:
