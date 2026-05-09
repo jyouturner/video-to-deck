@@ -147,6 +147,255 @@ def dedupe_frames(frames: List[Tuple[Path, float]], hash_distance: int = 4) -> L
     return kept
 
 
+def global_phash_cluster(
+    frames: List[Tuple[Path, float]],
+    distance: int = 6,
+) -> List[Tuple[Path, float]]:
+    """Drop frames whose perceptual hash is close to ANY earlier kept frame.
+
+    Consecutive dedup (dedupe_frames) merges runs of similar adjacent frames
+    but doesn't catch the talk-deck pattern where the camera cuts speaker→
+    slide→speaker→same-slide. Each return to the slide creates a new
+    consecutive cluster, so we end up with N copies of the same slide.
+
+    This is an O(N²) pass that compares each new frame against every
+    previously-kept hash. N is small after consecutive dedup (typically
+    <200), so the cost is negligible. The chronologically-first occurrence
+    of a slide is kept; later returns are dropped.
+
+    The default distance (6) is looser than dedupe_frames' default (4) —
+    we want to merge "same slide with speaker overlay in the corner" or
+    "same chart at 480p vs 720p", which can drift past 4 in pHash space.
+    """
+    if not frames:
+        return []
+    import imagehash
+    from PIL import Image
+
+    kept: List[Tuple[Path, float]] = []
+    kept_hashes: List["imagehash.ImageHash"] = []
+    for path, ts in frames:
+        with Image.open(path) as im:
+            h = imagehash.phash(im)
+        if any((h - kh) <= distance for kh in kept_hashes):
+            continue
+        kept.append((path, ts))
+        kept_hashes.append(h)
+    return kept
+
+
+# ---------- Vision-grid slide classifier ----------
+#
+# Tile candidate frames into 3×3 grid images and ask Claude (Haiku, by
+# default) to classify each cell as NEW_SLIDE / SAME_AS_PREVIOUS_CELL /
+# TALKING_HEAD / TRANSITION. Sending grids instead of single frames is
+# ~10× cheaper in input tokens and lets the LLM compare adjacent cells
+# directly — easier than reasoning across separate API calls.
+
+_GRID_COLS = 3
+_GRID_ROWS = 3
+_GRID_CELLS = _GRID_COLS * _GRID_ROWS  # 9
+_GRID_CELL_W = 400  # 16:9 thumbnails
+_GRID_CELL_H = 225
+
+
+def _render_classification_grids(
+    frames: List[Tuple[Path, float]],
+    out_dir: Path,
+) -> List[Tuple[Path, List[int]]]:
+    """Render frames into one or more numbered 3×3 grid images.
+
+    Returns a list of (grid_path, [original_frame_index_for_each_cell]). The
+    last grid may be padded with blank cells; the index list reflects only
+    real frames (length ≤ 9 per grid). Cells are numbered 1..9 with a small
+    overlay so the LLM can address them unambiguously.
+
+    Each grid carries a 1-cell overlap from the previous grid (the last real
+    frame of grid N-1 is duplicated as cell 1 of grid N) so the LLM has
+    context for the SAME-AS-PREVIOUS judgement at boundaries.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not frames:
+        return []
+
+    # Try a system font for legibility; fall back to PIL default if not available.
+    try:
+        font = ImageFont.truetype(
+            "/System/Library/Fonts/Helvetica.ttc", 32,
+        )
+    except (OSError, IOError):
+        font = ImageFont.load_default()
+
+    grids: List[Tuple[Path, List[int]]] = []
+    grid_w = _GRID_CELL_W * _GRID_COLS
+    grid_h = _GRID_CELL_H * _GRID_ROWS
+
+    # Walk the frame list in chunks of 8 (leaving cell 0 of each grid for
+    # the overlap from the previous grid). The first grid has no overlap so
+    # it gets all 9 cells.
+    i = 0
+    grid_idx = 0
+    prev_last_idx: Optional[int] = None
+    while i < len(frames):
+        canvas = Image.new("RGB", (grid_w, grid_h), color="black")
+        draw = ImageDraw.Draw(canvas)
+        cell_indices: List[int] = []
+
+        # Position 0: overlap cell from previous grid (None on the first grid).
+        # We embed the overlap so the model can judge "is cell 1 the same as
+        # cell 0?" right at the grid boundary.
+        if prev_last_idx is not None and grid_idx > 0:
+            cells_to_fill = [prev_last_idx]
+            slots_for_new = _GRID_CELLS - 1
+        else:
+            cells_to_fill = []
+            slots_for_new = _GRID_CELLS
+
+        # Fill the remaining cells with new frames.
+        end = min(i + slots_for_new, len(frames))
+        cells_to_fill.extend(range(i, end))
+
+        for cell_pos, frame_idx in enumerate(cells_to_fill):
+            row, col = divmod(cell_pos, _GRID_COLS)
+            x0 = col * _GRID_CELL_W
+            y0 = row * _GRID_CELL_H
+            with Image.open(frames[frame_idx][0]) as im:
+                im.thumbnail((_GRID_CELL_W, _GRID_CELL_H))
+                # Center the thumbnail in its cell (frames may not be exact 16:9).
+                tw, th = im.size
+                px = x0 + (_GRID_CELL_W - tw) // 2
+                py = y0 + (_GRID_CELL_H - th) // 2
+                canvas.paste(im, (px, py))
+            # Big numbered label, white-on-black with a small offset, so it
+            # stands out against either light or dark cell backgrounds.
+            label = str(cell_pos + 1)
+            draw.rectangle(
+                [(x0 + 4, y0 + 4), (x0 + 44, y0 + 44)],
+                fill="black", outline="white",
+            )
+            draw.text((x0 + 12, y0 + 4), label, fill="white", font=font)
+            cell_indices.append(frame_idx)
+
+        grid_path = out_dir / f"grid_{grid_idx:03d}.jpg"
+        canvas.save(grid_path, "JPEG", quality=85)
+        # Subtract 1 from cell_indices to get the "real new frames" range
+        # (cell 0 may be the overlap, which the caller should skip when
+        # mapping LLM responses back).
+        grids.append((grid_path, cell_indices))
+
+        prev_last_idx = cells_to_fill[-1]
+        i = end
+        grid_idx += 1
+
+    return grids
+
+
+def classify_slides_via_grids(
+    frames: List[Tuple[Path, float]],
+    *,
+    backend,
+    model: str,
+    workdir: Path,
+) -> List[Tuple[Path, float]]:
+    """Use vision LLM (typically Haiku via grids) to filter frames down to
+    distinct deck slides. Returns the kept frames in chronological order.
+
+    On any failure (LLM error, malformed response, or implausibly small
+    output), returns the input frames unchanged so the caller still gets a
+    deck — just a less-pruned one.
+    """
+    from pydantic import BaseModel
+    from typing import List as TList, Literal
+
+    class CellLabel(BaseModel):
+        cell: int  # 1..9
+        label: Literal["NEW_SLIDE", "SAME_AS_PREVIOUS_CELL",
+                       "TALKING_HEAD", "TRANSITION"]
+
+    class GridLabels(BaseModel):
+        labels: TList[CellLabel]
+
+    if not frames:
+        return frames
+    if not getattr(backend, "vision_supported", False):
+        return frames  # backend without vision (e.g. Claude Code w/o opt-in)
+
+    grid_dir = workdir / "slide_classifier_grids"
+    grids = _render_classification_grids(frames, grid_dir)
+    if not grids:
+        return frames
+
+    system_prompt = (
+        "You classify frames extracted from a video that contains a slide "
+        "deck. Each grid image you receive is a 3×3 layout (cells numbered "
+        "1–9, top-left to bottom-right). For each cell, decide what the "
+        "frame is and whether it shows a slide we haven't already seen.\n\n"
+        "Labels:\n"
+        "- NEW_SLIDE — a slide whose content (text, layout, charts) is "
+        "different from cell N-1 in the same grid AND from any slide you've "
+        "already labeled NEW_SLIDE in earlier grids.\n"
+        "- SAME_AS_PREVIOUS_CELL — visually the same slide as cell N-1 (or, "
+        "for cell 1 of grids after the first, the same as the overlap cell). "
+        "Animations and reveals count as same.\n"
+        "- TALKING_HEAD — frame is dominated by the speaker, no slide visible.\n"
+        "- TRANSITION — fade, blur, mid-cut, or otherwise not a clean slide.\n\n"
+        "Important:\n"
+        "- Cell 1 of grids 2+ duplicates the LAST real cell of the previous "
+        "grid as boundary context. Use it to compare cell 2 against the "
+        "previous grid's last frame.\n"
+        "- Output exactly one label per cell present in the grid, in cell-"
+        "number order. If the grid has fewer than 9 real frames, only "
+        "output labels for the cells that contain images (skip blank ones)."
+    )
+
+    kept_global: set = set()  # original frame indices we've decided to keep
+    for grid_idx, (grid_path, cell_indices) in enumerate(grids):
+        # Build the message: grid image + a short reminder of cell count.
+        with open(grid_path, "rb") as f:
+            grid_bytes = f.read()
+        import base64 as _b64
+        b64 = _b64.b64encode(grid_bytes).decode("ascii")
+        content_blocks = [
+            {"type": "text", "text":
+             f"Grid {grid_idx + 1} of {len(grids)} — "
+             f"{len(cell_indices)} cell(s) populated."},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/jpeg", "data": b64,
+            }},
+            {"type": "text", "text":
+             "Classify each cell. Return one label per real cell, in order."},
+        ]
+        try:
+            parsed, _usage = backend.vision_parse(
+                system=system_prompt,
+                content_blocks=content_blocks,
+                model=model,
+                max_tokens=600,
+                schema=GridLabels,
+            )
+        except Exception:
+            # Defensive: any LLM failure leaves the candidate set intact.
+            return frames
+
+        for cell_label in parsed.labels:
+            cell_pos = cell_label.cell - 1  # back to 0-indexed
+            if cell_pos < 0 or cell_pos >= len(cell_indices):
+                continue
+            frame_idx = cell_indices[cell_pos]
+            # Skip the overlap cell on grids 2+ (cell 0) — already considered.
+            if grid_idx > 0 and cell_pos == 0:
+                continue
+            if cell_label.label == "NEW_SLIDE":
+                kept_global.add(frame_idx)
+
+    if not kept_global:
+        # Implausible result (LLM said no NEW_SLIDE anywhere) — fall back.
+        return frames
+    return [frames[i] for i in sorted(kept_global)]
+
+
 # ---------- Step 3: SRT parser ----------
 
 @dataclass
@@ -2284,6 +2533,12 @@ DEFAULT_SETTINGS = {
     # base64-embed → token-heavy). Toggle on if you want vision via Claude
     # Code despite the cost.
     "claude_code_vision": False,
+    # When generating slides, use a vision-LLM (typically Haiku) to filter
+    # raw extracted frames down to actual deck slides. Trades a small LLM
+    # cost (~$0.005 per video via 3×3 grid batching with Haiku) for a much
+    # cleaner deck. Set False to use pure pHash dedup only.
+    "slide_classification": True,
+    "slide_classifier_model": "claude-haiku-4-5-20251001",
 }
 
 
@@ -5104,8 +5359,27 @@ def cmd_serve(args) -> int:
                 interval_frames = interval_fut.result()
             frames = merge_frames(scene_frames, interval_frames)
             frames = dedupe_frames(frames, 4)
+            # Slide-aware filtering: global pHash cluster (talk-deck pattern)
+            # then optional vision-LLM classifier via 3×3 grids. Same logic
+            # as the CLI auto-pipeline path.
+            deck_frames = global_phash_cluster(frames, distance=6)
+            settings = load_settings()
+            if (settings.get("slide_classification", True)
+                    and len(deck_frames) > _GRID_CELLS):
+                try:
+                    backend = select_backend()
+                    if getattr(backend, "vision_supported", False):
+                        deck_frames = classify_slides_via_grids(
+                            deck_frames, backend=backend,
+                            model=settings.get("slide_classifier_model")
+                                  or "claude-haiku-4-5-20251001",
+                            workdir=workdir,
+                        )
+                except Exception:
+                    # Backend unavailable / call failed → use pHash-only set.
+                    pass
             segments = parse_srt(srt_path)
-            slides_data = assign_transcript_to_frames(frames, segments, duration)
+            slides_data = assign_transcript_to_frames(deck_frames, segments, duration)
             # Title for the deck's title slide. Prefer the digest's H1 (the
             # original YouTube title) — falls back to the video_id if absent.
             digest_md_path = digests_dir / video_id / "digest.md"
@@ -5379,6 +5653,15 @@ def main():
                          "written alongside the digest — the visual layer (intelligently-"
                          "selected frames + transcript snippets) is the tool's main "
                          "differentiator and worth shipping for every digest.")
+    ap.add_argument("--no-slide-classification", action="store_true",
+                    help="When building slides, skip the vision-LLM classifier that filters "
+                         "raw frames down to actual deck slides. Falls back to pHash dedup "
+                         "only — cheaper but typically produces 2-3x more (mostly redundant) "
+                         "slides for talks where the speaker has a deck.")
+    ap.add_argument("--slide-classifier-model",
+                    default=os.environ.get("YT2MD_SLIDE_CLASSIFIER_MODEL"),
+                    help="Vision model for the slide-classification step (default: "
+                         "claude-haiku-4-5-20251001 — cheap and accurate enough for the task).")
     ap.add_argument("--deck", nargs="?", const="__default__", default=None, metavar="PATH",
                     help="Override the slides output path (default: <digest_dir>/slides.pptx).")
     ap.add_argument("--deck-only", action="store_true",
@@ -5560,13 +5843,54 @@ def main():
         print(f"      {len(segments)} transcript segments")
 
         print("[4/5] Aligning transcript to frames...")
-        slides_data = assign_transcript_to_frames(frames, segments, duration)
 
         if deck_path is not None:
-            print(f"[5/5] Building slides -> {deck_path}")
+            # Build a slides-specific frame set: pHash cluster globally to
+            # collapse "speaker → slide → speaker → same slide" into one
+            # representative, then (optionally) ask a vision LLM to filter
+            # to actual deck slides only. The digest's vision-pick step
+            # still uses the richer `frames` pool — the two consumers want
+            # different shapes of the same data.
+            deck_frames = global_phash_cluster(frames, distance=6)
+            print(f"      slides: {len(frames)} candidates → "
+                  f"{len(deck_frames)} after global pHash dedup")
+            settings = load_settings()
+            slide_classify_enabled = (
+                settings.get("slide_classification", True)
+                and not args.no_slide_classification
+            )
+            if slide_classify_enabled and len(deck_frames) > _GRID_CELLS:
+                try:
+                    classifier_backend = select_backend()
+                    if getattr(classifier_backend, "vision_supported", False):
+                        _classify_t0 = _time.monotonic()
+                        deck_frames = classify_slides_via_grids(
+                            deck_frames,
+                            backend=classifier_backend,
+                            model=(args.slide_classifier_model
+                                   or settings.get("slide_classifier_model")
+                                   or "claude-haiku-4-5-20251001"),
+                            workdir=workdir,
+                        )
+                        timings["slide_classify"] = round(
+                            _time.monotonic() - _classify_t0, 3,
+                        )
+                        print(f"      slides: vision-classified → "
+                              f"{len(deck_frames)} kept "
+                              f"({timings['slide_classify']}s)")
+                except Exception as e:
+                    print(f"      slides: classification skipped "
+                          f"({type(e).__name__}: {e}); using pHash dedup only.")
+            slides_data = assign_transcript_to_frames(
+                deck_frames, segments, duration,
+            )
+            print(f"[5/5] Building slides ({len(slides_data)} slides) -> {deck_path}")
             build_deck(slides_data, deck_path, video_title or video_path.stem)
         else:
             print("[5/5] Slides skipped (--no-slides)")
+            # Still need slides_data for downstream code if any consumes it,
+            # though currently only build_deck does. Use the rich pool.
+            slides_data = assign_transcript_to_frames(frames, segments, duration)
 
         usage = None
         if do_digest:
