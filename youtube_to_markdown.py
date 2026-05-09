@@ -1005,6 +1005,7 @@ def fetch_youtube(
     video_id = info["id"]
     title = info.get("title") or video_id
     webpage_url = info.get("webpage_url") or url
+    upload_date = info.get("upload_date")  # YYYYMMDD per yt-dlp; None if missing
     out_dir = cache_root / video_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1017,7 +1018,7 @@ def fetch_youtube(
         print(f"      using cached {out_dir}/ (lang: {lang})")
         return {
             "mp4": mp4_path, "srt": existing_srt, "lang": lang,
-            "title": title, "webpage_url": webpage_url,
+            "title": title, "webpage_url": webpage_url, "upload_date": upload_date,
             "download_secs": 0.0, "whisper_secs": 0.0,
             "used_whisper": False, "whisper_model": None,
         }
@@ -1079,7 +1080,7 @@ def fetch_youtube(
         lang = srt_found.stem[len(video_id) + 1:]
         return {
             "mp4": mp4_path, "srt": srt_found, "lang": lang,
-            "title": title, "webpage_url": webpage_url,
+            "title": title, "webpage_url": webpage_url, "upload_date": upload_date,
             "download_secs": download_secs, "whisper_secs": 0.0,
             "used_whisper": False, "whisper_model": None,
         }
@@ -1089,7 +1090,7 @@ def fetch_youtube(
     whisper_secs = _time.monotonic() - whisper_t0
     return {
         "mp4": mp4_path, "srt": srt_path, "lang": lang,
-        "title": title, "webpage_url": webpage_url,
+        "title": title, "webpage_url": webpage_url, "upload_date": upload_date,
         "download_secs": download_secs, "whisper_secs": whisper_secs,
         "used_whisper": True, "whisper_model": whisper_model,
     }
@@ -1503,6 +1504,153 @@ def generate_panel_discussion(
     )
 
 
+DEFAULT_DISTILLATION_MODEL = "claude-sonnet-4-6"
+
+
+DISTILLATION_SYSTEM_PROMPT = (
+    "You distill a video into a small set of atomic, declarative takeaways "
+    "suitable for ingestion into a personal knowledge base (think Karpathy-"
+    "style AI wiki). The reader will scan these in 30 seconds; an agent / "
+    "retriever may pull individual atoms later when answering questions.\n\n"
+    "First, classify the video's genre as a free-form short label (e.g. "
+    "'AI/CS explainer', 'market analysis', 'product launch review', 'startup "
+    "interview', 'history talk', 'how-to tutorial', 'live political "
+    "commentary'). Choose the label that best describes what kind of value "
+    "this video delivers; coin a new one if none of the above fits.\n\n"
+    "Then emit 10–30 atoms. Each atom must be:\n"
+    "- One declarative sentence that stands alone — readable a year from now "
+    "without re-watching the video. No 'as the speaker mentioned earlier' or "
+    "pronouns referring to off-page context.\n"
+    "- Tagged with a `type` you choose from a vocabulary appropriate to the "
+    "genre. Examples: claim, definition, framework, prediction, observation, "
+    "thesis, level, catalyst, risk, step, prerequisite, gotcha, principle, "
+    "quote, figure. Mix types within a video as content demands.\n"
+    "- Tagged with `confidence`:\n"
+    "  * solid       — the speaker stated this as fact AND the panel did "
+    "not push back on it (or the panel didn't address it but it's the kind "
+    "of thing that's well-established).\n"
+    "  * contested   — the panel pushed back, OR the claim is materially "
+    "disputed by a recognizable competing school of thought.\n"
+    "  * speculative — the speaker framed this as their prediction, "
+    "extrapolation, or opinion (use sparingly; only when the speaker hedged).\n"
+    "- Tagged with the `timestamp` (in seconds) of where this atom is "
+    "supported in the transcript.\n\n"
+    "When the atom is time-sensitive — a market level, a current state, a "
+    "news event, a 'right now' observation — also include `as_of` in "
+    "YYYY-MM-DD format using the video's publish date provided in the user "
+    "message. Leave `as_of` empty for evergreen knowledge (definitions, "
+    "frameworks, well-established claims).\n\n"
+    "Phrase atoms in the audience's voice: neutral 'X is the case' for "
+    "facts/definitions, attributed 'Speaker argues X' for opinions / "
+    "predictions / contested theses. The `type` tag should make the "
+    "distinction visible without forcing it into the text.\n\n"
+    "Style:\n"
+    "- Skip filler topics (intros, sponsor reads, personal anecdotes "
+    "without insight value).\n"
+    "- Don't restate the digest's structure — atoms cut across topics, "
+    "ordered by importance / dependency, not by video time.\n"
+    "- Concrete > abstract: prefer 'The Fed's 2024 balance-sheet runoff "
+    "totaled $1.2T' over 'The Fed reduced its balance sheet'.\n"
+    "- One claim per atom. Don't pack multiple claims into a single sentence "
+    "with 'and' or semicolons."
+)
+
+
+def generate_distillation(
+    digest_md_text: str,
+    panel_md_text: Optional[str],
+    segments: List["TranscriptSegment"],
+    model: str,
+    *,
+    publish_date: Optional[str] = None,
+    source_lang: str = "en",
+    output_language: str = "auto",
+    backend=None,
+):
+    """Final pipeline step: emit a structured set of atomic takeaways for the
+    knowledge-base / quick-scan reader.
+
+    publish_date: YYYYMMDD or YYYY-MM-DD as returned by yt-dlp's
+    `info["upload_date"]`; threaded into the prompt so time-sensitive atoms
+    can carry an `as_of` date.
+
+    Returns (Distillation, usage). Distillation has fields:
+      genre: str
+      atoms: list[DistillationAtom(type, text, timestamp, confidence, as_of)]
+    """
+    from pydantic import BaseModel
+    from typing import List as TList, Literal, Optional as TOptional
+
+    class DistillationAtom(BaseModel):
+        type: str
+        text: str
+        timestamp: int
+        confidence: Literal["solid", "contested", "speculative"]
+        as_of: TOptional[str] = None
+
+    class Distillation(BaseModel):
+        genre: str
+        atoms: TList[DistillationAtom]
+
+    transcript_str = "\n".join(
+        f"[{format_timestamp(seg.start)}] {seg.text}" for seg in segments
+    )
+
+    # Normalize publish_date to YYYY-MM-DD for the prompt (yt-dlp returns
+    # YYYYMMDD by default).
+    pub_str = ""
+    if publish_date:
+        pd = publish_date.replace("-", "")
+        if len(pd) == 8 and pd.isdigit():
+            pub_str = f"{pd[0:4]}-{pd[4:6]}-{pd[6:8]}"
+        else:
+            pub_str = publish_date
+
+    is_english_source = (source_lang or "").lower().startswith("en")
+    lang_directive = ""
+    if not is_english_source and output_language == "auto":
+        lang_directive = (
+            f"\n\nIMPORTANT: The transcript is in language code '{source_lang}'. "
+            "Write the genre label and every atom's `text` in the SAME "
+            "language as the transcript. Preserve proper nouns and technical "
+            "terms in their original form when the field uses them that way."
+        )
+
+    panel_section = ""
+    if panel_md_text:
+        panel_section = (
+            "## Panel discussion (use this to set `confidence`)\n\n"
+            f"{panel_md_text}\n\n"
+        )
+    else:
+        panel_section = (
+            "## Panel discussion\n\n"
+            "(no panel discussion was generated for this video — set "
+            "`confidence` based on speaker framing alone; default to `solid` "
+            "for stated facts and `speculative` for the speaker's hedged "
+            "predictions / opinions.)\n\n"
+        )
+
+    user_text = (
+        f"Video publish date: {pub_str or '(unknown)'}\n\n"
+        "## Digest (the reader has seen this)\n\n"
+        f"{digest_md_text}\n\n"
+        f"{panel_section}"
+        "## Full timestamped transcript\n\n"
+        f"{transcript_str}"
+        f"{lang_directive}\n\n"
+        "Now: classify the genre and emit the atoms."
+    )
+
+    if backend is None:
+        backend = select_backend()
+    return backend.parse(
+        system=DISTILLATION_SYSTEM_PROMPT, user_text=user_text,
+        model=model, max_tokens=6000, schema=Distillation, cache=True,
+    )
+
+
+
 def _transcript_slice(
     segments: List["TranscriptSegment"],
     topic_start: float,
@@ -1787,6 +1935,86 @@ def write_markdown_digest(
             lines.append("")
 
     output_md.write_text("\n".join(lines).rstrip() + "\n")
+
+
+# Sentinel header so we can detect (and replace) an existing Distillation
+# section idempotently. Anchor on the literal "## Distillation" prefix so a
+# regenerated section overwrites the prior one cleanly.
+_DISTILLATION_HEADER_PREFIX = "## Distillation"
+
+
+def render_distillation_markdown(
+    distillation,
+    *,
+    video_url: Optional[str] = None,
+) -> str:
+    """Render a Distillation object as a Markdown section ready to append to
+    digest.md. Atom timestamps deep-link to the source video when video_url is
+    known. Returns the section as a string starting with the H2 heading.
+    """
+    # Genre suffix: when any atom is time-stamped, surface a max as_of in the
+    # header so the reader knows the distillation has a freshness window.
+    as_of_dates = sorted({a.as_of for a in distillation.atoms if a.as_of})
+    header_suffix = f" — {distillation.genre}"
+    if as_of_dates:
+        header_suffix += f" (as of {as_of_dates[-1]})"
+
+    confidence_glyph = {"solid": "✓", "contested": "⚠", "speculative": "?"}
+
+    lines: List[str] = []
+    lines.append(f"{_DISTILLATION_HEADER_PREFIX}{header_suffix}")
+    lines.append("")
+    lines.append(
+        "*Atomic takeaways for quick scan / knowledge-base ingestion. Each "
+        "atom links to where it's grounded in the video.*"
+    )
+    lines.append("")
+    for atom in distillation.atoms:
+        ts = format_timestamp(atom.timestamp)
+        if video_url:
+            sep = "&" if "?" in video_url else "?"
+            ts_md = f"[{ts}]({video_url}{sep}t={int(atom.timestamp)}s)"
+        else:
+            ts_md = ts
+        glyph = confidence_glyph.get(atom.confidence, "")
+        # Emit each atom as a single bullet; type and confidence are inline
+        # tags so a markdown KB ingester can grep them. Format:
+        #   - **[type]** text *(timestamp · confidence)*
+        as_of_str = f" · as of {atom.as_of}" if atom.as_of else ""
+        lines.append(
+            f"- **[{atom.type}]** {atom.text} "
+            f"<sub>*({ts_md} · {glyph} {atom.confidence}{as_of_str})*</sub>"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def append_or_replace_distillation(digest_md_path: Path, section_md: str) -> None:
+    """Idempotent write: replaces an existing Distillation section if present,
+    otherwise appends to the end of digest.md.
+    """
+    text = digest_md_path.read_text()
+    idx = text.find("\n" + _DISTILLATION_HEADER_PREFIX)
+    if idx == -1 and text.startswith(_DISTILLATION_HEADER_PREFIX):
+        idx = 0  # section is at the very top of the file
+    if idx == -1:
+        # No existing section — append.
+        sep = "" if text.endswith("\n") else "\n"
+        digest_md_path.write_text(text + sep + "\n" + section_md.rstrip() + "\n")
+        return
+    # Replace from the heading onward to EOF (distillation is always last).
+    head = text[: idx + 1] if idx > 0 else ""  # +1 to keep the leading newline
+    digest_md_path.write_text(
+        (head.rstrip() + "\n\n" if head.strip() else "")
+        + section_md.rstrip() + "\n"
+    )
+
+
+def has_distillation_section(digest_md_path: Path) -> bool:
+    if not digest_md_path.exists():
+        return False
+    text = digest_md_path.read_text()
+    return _DISTILLATION_HEADER_PREFIX in text
 
 
 # ---------- Subcommands: watch / meta / serve ----------
@@ -4437,16 +4665,33 @@ def cmd_serve(args) -> int:
                 f"<form method='post' action='/digests/{h(video_id)}/discuss' "
                 f"style='display:inline;' onsubmit=\"{discuss_submit_js}\">"
                 "<button type='submit' class='discuss-btn-secondary' "
-                "title='Re-runs the panel; replaces existing panel.md'>Regenerate</button>"
+                "title='Re-runs the panel; replaces existing panel.md'>Regenerate panel</button>"
                 "</form>"
             )
         else:
+            # Pre-pipeline-update digests; offer the on-demand panel generator.
             toolbar += (
                 f"<form method='post' action='/digests/{h(video_id)}/discuss' "
                 f"style='display:inline;' onsubmit=\"{discuss_submit_js}\">"
                 "<button type='submit' class='discuss-btn' "
-                "title='Generates a panel-of-experts discussion (~60–120s, one Opus 4.7 call)'>"
-                "Discuss with experts</button>"
+                "title='Generates a panel-of-experts discussion (~60–120s, one Opus call)'>"
+                "Generate panel</button>"
+                "</form>"
+            )
+        # Distillation button: only shown when the digest doesn't already
+        # have a Distillation section. Older digests created before the
+        # auto-pipeline can generate one on demand.
+        if not has_distillation_section(digest_md):
+            distill_submit_js = (
+                "this.querySelector('button').disabled=true;"
+                "this.querySelector('button').textContent='Distilling… (~30s)';"
+            )
+            toolbar += (
+                f"<form method='post' action='/digests/{h(video_id)}/distill' "
+                f"style='display:inline;' onsubmit=\"{distill_submit_js}\">"
+                "<button type='submit' class='discuss-btn-secondary' "
+                "title='Generates atomic takeaways and appends them to digest.md'>"
+                "Generate distillation</button>"
                 "</form>"
             )
         # Copy markdown — lets the reader paste into Notion, Obsidian, an
@@ -4521,6 +4766,55 @@ def cmd_serve(args) -> int:
             return redirect(f"/digests/{video_id}/?msg=Panel+generation+failed:+{e}")
         (digests_dir / video_id / "panel.md").write_text(text)
         return redirect(f"/digests/{video_id}/panel/")
+
+    @app.route("/digests/<video_id>/distill", methods=["POST"])
+    def generate_distillation_route(video_id):
+        from flask import redirect
+        gate = _require_llm_or_redirect()
+        if gate is not None:
+            return gate
+        digest_md = digests_dir / video_id / "digest.md"
+        if not digest_md.exists():
+            abort(404)
+        # Look up the cached SRT (same convention as the panel route).
+        srt_dir = digests_dir / video_id / "downloads" / video_id
+        srt_files = list(srt_dir.glob("*.srt")) if srt_dir.exists() else []
+        if not srt_files:
+            return redirect(
+                f"/digests/{video_id}/?msg=No+cached+transcript.+Re-digest+the+video+first."
+            )
+        srt_path = srt_files[0]
+        lang = (
+            srt_path.stem[len(video_id) + 1:]
+            if srt_path.stem.startswith(video_id + ".") else "en"
+        )
+        # Pull the panel text if it exists so the distillation can use it for
+        # confidence tagging; otherwise pass None and the prompt copes.
+        panel_md_path = digests_dir / video_id / "panel.md"
+        panel_text = panel_md_path.read_text() if panel_md_path.exists() else None
+        # We don't track the publish_date in saved metadata; pass None and the
+        # `as_of` field will simply stay empty for these on-demand backfills.
+        s = load_settings()
+        try:
+            segments = parse_srt(srt_path)
+            distillation, _usage = generate_distillation(
+                digest_md.read_text(), panel_text, segments,
+                model=os.environ.get("YT2MD_DISTILLATION_MODEL")
+                      or DEFAULT_DISTILLATION_MODEL,
+                publish_date=None,
+                source_lang=lang,
+                output_language=s.get("digest_language") or "auto",
+            )
+            section_md = render_distillation_markdown(
+                distillation,
+                video_url=f"https://www.youtube.com/watch?v={video_id}",
+            )
+            append_or_replace_distillation(digest_md, section_md)
+        except Exception as e:
+            return redirect(
+                f"/digests/{video_id}/?msg=Distillation+failed:+{type(e).__name__}:+{e}"
+            )
+        return redirect(f"/digests/{video_id}/?msg=Distillation+added.")
 
     @app.route("/digests/<video_id>/panel/")
     def view_panel(video_id):
@@ -4803,10 +5097,23 @@ def main():
     ap.add_argument("--no-vision", action="store_true",
                     help="Disable vision-based frame picking for the digest. Cheaper but the "
                          "frames may be less illustrative.")
+    ap.add_argument("--no-panel", action="store_true",
+                    help="Skip the panel-of-experts discussion (saves ~1 Opus call per video). "
+                         "Distillation will still run but without panel-informed confidence tags.")
+    ap.add_argument("--no-distillation", action="store_true",
+                    help="Skip the distillation step (atomic takeaways) appended to digest.md.")
     ap.add_argument("--digest-model",
                     default=os.environ.get("YT2MD_DIGEST_MODEL") or "claude-sonnet-4-6",
                     help="Claude model for the digest (default: claude-sonnet-4-6). "
                          "Use claude-opus-4-7 for the highest-quality summarization.")
+    ap.add_argument("--panel-model",
+                    default=os.environ.get("YT2MD_PANEL_MODEL") or DEFAULT_PANEL_MODEL,
+                    help=f"Claude model for the panel discussion (default: {DEFAULT_PANEL_MODEL}). "
+                         "Multi-perspective synthesis benefits from a stronger model.")
+    ap.add_argument("--distillation-model",
+                    default=os.environ.get("YT2MD_DISTILLATION_MODEL") or DEFAULT_DISTILLATION_MODEL,
+                    help=f"Claude model for the distillation step (default: "
+                         f"{DEFAULT_DISTILLATION_MODEL}).")
     ap.add_argument("--scene-threshold", type=float, default=0.2,
                     help="Scene-detection sensitivity, 0.1=lots of frames, 0.5=only major changes (default: 0.2)")
     ap.add_argument("--interval", type=float, default=20.0,
@@ -4863,6 +5170,7 @@ def main():
     }
     video_title: Optional[str] = None
     video_url: Optional[str] = None
+    upload_date: Optional[str] = None
 
     if is_url(args.video):
         print(f"[0/5] Fetching YouTube video: {args.video}")
@@ -4878,6 +5186,7 @@ def main():
         source_lang = result["lang"]
         video_title = result.get("title")
         video_url = result.get("webpage_url")
+        upload_date = result.get("upload_date")
         timings["download"] = round(result["download_secs"], 3)
         timings["whisper"] = round(result["whisper_secs"], 3)
         fetch_meta["used_whisper"] = result["used_whisper"]
@@ -4987,6 +5296,61 @@ def main():
                 video_title=video_title, video_url=video_url,
             )
             print(f"      Digest written. Images in {images_dir}/")
+
+            # Render the digest to markdown text once for the panel + distillation
+            # prompts (saves a re-read on each step). For the panel/distillation
+            # we want the source-of-truth digest the user will see, so read back
+            # the just-written file rather than reconstructing from `digest`.
+            digest_md_text = digest_path.read_text()
+
+            panel_md_text: Optional[str] = None
+            panel_path = digest_path.parent / "panel.md"
+            if not args.no_panel:
+                print(f"[+] Generating panel discussion with {args.panel_model}...")
+                _panel_t0 = _time.monotonic()
+                try:
+                    panel_md_text, p_usage = generate_panel_discussion(
+                        digest_md_text, segments, model=args.panel_model,
+                        source_lang=source_lang,
+                        output_language=args.digest_language,
+                        backend=backend,
+                    )
+                    panel_path.write_text(panel_md_text)
+                    timings["panel"] = round(_time.monotonic() - _panel_t0, 3)
+                    print(f"      Panel written -> {panel_path}  |  "
+                          f"input: {p_usage.input_tokens} tokens  |  "
+                          f"output: {p_usage.output_tokens} tokens")
+                except Exception as e:
+                    # Distillation can still run without a panel — just with
+                    # weaker confidence tags. Don't take the whole pipeline
+                    # down for one downstream step's failure.
+                    print(f"      Panel generation failed ({type(e).__name__}: {e}); "
+                          "continuing without panel.")
+
+            if not args.no_distillation:
+                print(f"[+] Generating distillation with {args.distillation_model}...")
+                _dist_t0 = _time.monotonic()
+                try:
+                    distillation, d_usage = generate_distillation(
+                        digest_md_text, panel_md_text, segments,
+                        model=args.distillation_model,
+                        publish_date=upload_date,
+                        source_lang=source_lang,
+                        output_language=args.digest_language,
+                        backend=backend,
+                    )
+                    section_md = render_distillation_markdown(
+                        distillation, video_url=video_url,
+                    )
+                    append_or_replace_distillation(digest_path, section_md)
+                    timings["distillation"] = round(_time.monotonic() - _dist_t0, 3)
+                    print(f"      Distillation appended  |  genre: {distillation.genre}  |  "
+                          f"{len(distillation.atoms)} atoms  |  "
+                          f"input: {d_usage.input_tokens} tokens  |  "
+                          f"output: {d_usage.output_tokens} tokens")
+                except Exception as e:
+                    print(f"      Distillation failed ({type(e).__name__}: {e}); "
+                          "digest is still complete without it.")
 
         if args.keep_frames:
             dest = Path.cwd() / f"frames_{video_path.stem}"
