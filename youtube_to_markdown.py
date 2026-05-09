@@ -2664,6 +2664,51 @@ def _read_digest_ids() -> set:
 
 # ---- serve subcommand (local reader UI) ----
 
+# Shared between digest + panel viewers. The button has data-copy-target
+# pointing at a hidden <textarea> elsewhere on the page; on click we read
+# its raw value and copy to the clipboard. Falls back to a select+execCommand
+# path for browsers / contexts (eg http on a non-localhost) where the modern
+# clipboard API is unavailable.
+_COPY_BUTTON_JS = """
+<script>
+(function () {
+  function flash(btn, text) {
+    const orig = btn.getAttribute('data-orig-text') || btn.textContent;
+    btn.setAttribute('data-orig-text', orig);
+    btn.textContent = text;
+    setTimeout(() => { btn.textContent = orig; }, 1500);
+  }
+  document.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('[data-copy-target]');
+    if (!btn) return;
+    const id = btn.getAttribute('data-copy-target');
+    const src = document.getElementById(id);
+    if (!src) return;
+    const text = src.value;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        flash(btn, 'Copied!');
+        return;
+      }
+    } catch (e) { /* fall through to legacy path */ }
+    try {
+      src.removeAttribute('hidden');
+      src.style.position = 'absolute';
+      src.style.left = '-9999px';
+      src.select();
+      document.execCommand('copy');
+      src.setAttribute('hidden', '');
+      flash(btn, 'Copied!');
+    } catch (e) {
+      flash(btn, 'Copy failed');
+    }
+  });
+})();
+</script>
+"""
+
+
 SERVE_PAGE_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
@@ -4351,7 +4396,8 @@ def cmd_serve(args) -> int:
             _mark_digest_read(video_id)
         except Exception:
             pass  # never block reading on a DB error
-        rendered = _render_markdown(digest_md.read_text())
+        md_source = digest_md.read_text()
+        rendered = _render_markdown(md_source)
 
         # Build the action toolbar. Lives at the TOP of the page so the user
         # doesn't have to scroll past the whole digest to find these. Discuss
@@ -4385,6 +4431,14 @@ def cmd_serve(args) -> int:
                 "Discuss with experts</button>"
                 "</form>"
             )
+        # Copy markdown — lets the reader paste into Notion, Obsidian, an
+        # email, another LLM, etc. Markdown is the most-portable form.
+        toolbar += (
+            "<button type='button' class='discuss-btn-secondary' "
+            "data-copy-target='digest-md-source' "
+            "title='Copy the markdown source — paste into your notes app, email, or another LLM'>"
+            "Copy markdown</button>"
+        )
         toolbar += (
             f"<form method='post' action='/digests/{h(video_id)}/delete' style='display:inline;' "
             "onsubmit=\"return confirm('Delete this digest? "
@@ -4396,8 +4450,18 @@ def cmd_serve(args) -> int:
         )
         toolbar += "</div>"
 
+        # Hidden textarea holds the raw markdown for clipboard copy. <textarea>
+        # treats content as raw text up to </textarea>, so escaping & and < is
+        # sufficient (html.escape handles both).
+        hidden_md = (
+            f'<textarea id="digest-md-source" hidden aria-hidden="true">'
+            f'{h(md_source)}</textarea>'
+        )
+
         body = (
             toolbar
+            + hidden_md
+            + _COPY_BUTTON_JS
             + "<hr style='margin: 16px 0 32px; border: none; border-top: 1px solid var(--border);'>"
             + rendered
         )
@@ -4442,15 +4506,27 @@ def cmd_serve(args) -> int:
 
     @app.route("/digests/<video_id>/panel/")
     def view_panel(video_id):
+        from html import escape as h
         panel_md = digests_dir / video_id / "panel.md"
         if not panel_md.exists():
             abort(404)
-        rendered = _render_markdown(panel_md.read_text())
+        md_source = panel_md.read_text()
+        rendered = _render_markdown(md_source)
         nav = (
-            f'<p class="meta-info" style="margin-top:0;">'
-            f'<a href="/digests/{video_id}/">← Back to digest</a></p>'
+            f'<div class="digest-actions digest-toolbar" style="margin-top:0;">'
+            f'<a href="/digests/{h(video_id)}/" class="discuss-btn-secondary" '
+            f'style="text-decoration:none; padding: 6px 12px;">← Back to digest</a>'
+            "<button type='button' class='discuss-btn-secondary' "
+            "data-copy-target='panel-md-source' "
+            "title='Copy the panel discussion markdown'>Copy markdown</button>"
+            "</div>"
         )
-        return page(nav + rendered, title=f"Panel · {video_id}",
+        hidden_md = (
+            f'<textarea id="panel-md-source" hidden aria-hidden="true">'
+            f'{h(md_source)}</textarea>'
+        )
+        return page(nav + hidden_md + _COPY_BUTTON_JS + rendered,
+                    title=f"Panel · {video_id}",
                     current=f"digest:{video_id}",
                     base_href=f"/digests/{video_id}/panel/")
 
