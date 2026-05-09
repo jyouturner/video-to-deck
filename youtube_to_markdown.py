@@ -33,6 +33,14 @@ from typing import List, Optional, Tuple
 
 # ---------- Step 1: Frame extraction (scene detection + periodic sampling) ----------
 
+# Hard cap on scene frames a single video can yield. Slide-heavy talks
+# with subtle reveal animations can blow past 500-1000 candidates at the
+# default threshold; beyond a few hundred there's negligible additional
+# visual signal but real hashing/IO overhead. Truncating keeps the dedupe
+# and vision-pick stages bounded.
+SCENE_FRAME_HARD_CAP = 500
+
+
 def extract_scene_frames(video: Path, out_dir: Path, threshold: float = 0.2) -> List[Tuple[Path, float]]:
     """Run ffmpeg scene detection. Returns list of (frame_path, timestamp_seconds)."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -54,6 +62,14 @@ def extract_scene_frames(video: Path, out_dir: Path, threshold: float = 0.2) -> 
     if len(frame_files) != len(timestamps):
         n = min(len(frame_files), len(timestamps))
         frame_files, timestamps = frame_files[:n], timestamps[:n]
+
+    if len(frame_files) > SCENE_FRAME_HARD_CAP:
+        # Evenly-spaced subsample so we keep visual diversity across the
+        # whole video, not just the first chunk.
+        step = len(frame_files) / SCENE_FRAME_HARD_CAP
+        keep = [int(i * step) for i in range(SCENE_FRAME_HARD_CAP)]
+        frame_files = [frame_files[i] for i in keep]
+        timestamps = [timestamps[i] for i in keep]
 
     return list(zip(frame_files, timestamps))
 
@@ -4691,6 +4707,18 @@ def cmd_serve(args) -> int:
                 "Generate panel</button>"
                 "</form>"
             )
+        # Slides download — sibling artifact alongside takeaway/panel. The
+        # visual layer (intelligently-picked frames + transcript snippets)
+        # is the tool's main differentiator vs. a pure-LLM workflow.
+        slides_path = digests_dir / video_id / "slides.pptx"
+        if slides_path.exists():
+            toolbar += (
+                f"<a class='discuss-btn-secondary' style='text-decoration:none;' "
+                f"href='/digests/{h(video_id)}/slides.pptx' "
+                "title='Download the auto-generated PowerPoint deck '"
+                "'(one slide per topic, with intelligently-picked frames).'>"
+                "Download slides</a>"
+            )
         # Copy markdown — lets the reader paste into Notion, Obsidian, an
         # email, another LLM, etc. Markdown is the most-portable form.
         toolbar += (
@@ -4899,6 +4927,16 @@ def cmd_serve(args) -> int:
     @app.route("/digests/<video_id>/digest_images/<path:filename>")
     def digest_image(video_id, filename):
         return send_from_directory(digests_dir / video_id / "digest_images", filename)
+
+    @app.route("/digests/<video_id>/slides.pptx")
+    def download_slides(video_id):
+        slides_path = digests_dir / video_id / "slides.pptx"
+        if not slides_path.exists():
+            abort(404)
+        return send_from_directory(
+            digests_dir / video_id, "slides.pptx",
+            as_attachment=True, download_name=f"{video_id}.pptx",
+        )
 
     @app.errorhandler(404)
     def not_found(e):
@@ -5127,9 +5165,13 @@ def main():
                          "ignored for URLs — fetched automatically)")
     ap.add_argument("-o", "--output", type=Path, default=None, metavar="PATH",
                     help="Digest output path (default: <video-name>_digest.md)")
+    ap.add_argument("--no-slides", action="store_true",
+                    help="Skip the PowerPoint deck. By default a slides.pptx file is "
+                         "written alongside the digest — the visual layer (intelligently-"
+                         "selected frames + transcript snippets) is the tool's main "
+                         "differentiator and worth shipping for every digest.")
     ap.add_argument("--deck", nargs="?", const="__default__", default=None, metavar="PATH",
-                    help="Also write a PowerPoint deck. With no path, defaults to "
-                         "<video-name>_deck.pptx.")
+                    help="Override the slides output path (default: <digest_dir>/slides.pptx).")
     ap.add_argument("--deck-only", action="store_true",
                     help="Skip the digest entirely — only build the deck. No API key needed.")
     ap.add_argument("--no-vision", action="store_true",
@@ -5246,14 +5288,17 @@ def main():
 
     base = video_path.stem
     digest_path = args.output if args.output is not None else Path(f"{base}_digest.md")
-    if args.deck == "__default__":
-        deck_path = Path(f"{base}_deck.pptx")
-    elif args.deck is not None:
-        deck_path = Path(args.deck)
+    # Slides default-on: write `slides.pptx` next to digest.md so the
+    # web reader (and any KB ingester) finds it at a predictable path.
+    # --no-slides opts out; --deck path overrides; --deck-only forces it
+    # on even when --no-slides was passed (the user explicitly asked
+    # for the deck).
+    if args.deck and args.deck != "__default__":
+        deck_path: Optional[Path] = Path(args.deck)
+    elif args.deck_only or not args.no_slides:
+        deck_path = digest_path.parent / "slides.pptx"
     else:
         deck_path = None
-    if args.deck_only and deck_path is None:
-        deck_path = Path(f"{base}_deck.pptx")
 
     workdir = Path(tempfile.mkdtemp(prefix="v2d_"))
     scene_dir = workdir / "scene"
@@ -5262,18 +5307,43 @@ def main():
     try:
         duration = get_video_duration(video_path)
 
+        # Run scene detection and interval sampling concurrently — each is
+        # an independent ffmpeg pass that decodes the full video, so doing
+        # them in parallel cuts wall time roughly in half on slide-heavy
+        # talks where scene detection is the slow leg. Each subprocess gets
+        # its own ffmpeg process; CPU contention is real but small.
+        from concurrent.futures import ThreadPoolExecutor
         print(f"[1/5] Extracting frames "
-              f"(scene threshold={args.scene_threshold}, interval={args.interval}s)...")
+              f"(scene threshold={args.scene_threshold}, interval={args.interval}s, "
+              f"in parallel)...")
         _frames_t0 = _time.monotonic()
-        scene_frames = extract_scene_frames(video_path, scene_dir, args.scene_threshold)
-        interval_frames = extract_interval_frames(video_path, interval_dir, args.interval, duration)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            scene_fut = pool.submit(
+                extract_scene_frames, video_path, scene_dir, args.scene_threshold,
+            )
+            interval_fut = pool.submit(
+                extract_interval_frames, video_path, interval_dir, args.interval, duration,
+            )
+            _scene_t0 = _time.monotonic()
+            scene_frames = scene_fut.result()
+            scene_secs = _time.monotonic() - _scene_t0
+            interval_frames = interval_fut.result()
+        timings["frames_extract"] = round(_time.monotonic() - _frames_t0, 3)
         frames = merge_frames(scene_frames, interval_frames)
-        print(f"      {len(scene_frames)} scene + {len(interval_frames)} interval = "
-              f"{len(frames)} candidate frames")
+        cap_note = (
+            f" (capped from >={SCENE_FRAME_HARD_CAP})"
+            if len(scene_frames) == SCENE_FRAME_HARD_CAP else ""
+        )
+        print(f"      {len(scene_frames)} scene{cap_note} + "
+              f"{len(interval_frames)} interval = {len(frames)} candidate frames "
+              f"({timings['frames_extract']}s)")
 
-        print(f"[2/5] Deduping consecutive near-identical frames (hash distance <= {args.hash_distance})...")
+        print(f"[2/5] Deduping consecutive near-identical frames "
+              f"(hash distance <= {args.hash_distance})...")
+        _dedupe_t0 = _time.monotonic()
         frames = dedupe_frames(frames, args.hash_distance)
-        print(f"      {len(frames)} unique frames")
+        timings["frames_dedupe"] = round(_time.monotonic() - _dedupe_t0, 3)
+        print(f"      {len(frames)} unique frames ({timings['frames_dedupe']}s)")
         timings["frames"] = round(_time.monotonic() - _frames_t0, 3)
 
         print(f"[3/5] Parsing SRT: {srt_path.name}")
@@ -5284,10 +5354,10 @@ def main():
         slides_data = assign_transcript_to_frames(frames, segments, duration)
 
         if deck_path is not None:
-            print(f"[5/5] Building deck -> {deck_path}")
-            build_deck(slides_data, deck_path, video_path.stem)
+            print(f"[5/5] Building slides -> {deck_path}")
+            build_deck(slides_data, deck_path, video_title or video_path.stem)
         else:
-            print("[5/5] Skipping deck (use --deck to also write one)")
+            print("[5/5] Slides skipped (--no-slides)")
 
         usage = None
         if do_digest:
