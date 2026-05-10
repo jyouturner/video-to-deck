@@ -3,22 +3,44 @@
 A local web app that turns long YouTube videos into something you can
 actually consume in a few minutes. Paste a URL or subscribe to channels;
 yt2md downloads the video, transcribes it, and generates four useful
-artifacts for each one:
+artifacts for each one — accessible from a tab-bar at the top of every
+page:
 
-- **Digest** — topic-segmented summary of what the video says, with the
-  most representative slide / frame embedded under each topic. Click any
-  timestamp to jump straight to that moment in the original video.
-- **Panel discussion** — a 1500–2500 word multi-perspective critique.
-  Three to five domain experts (chosen for the video's actual subject)
-  push back, surface what the speaker glossed over, and connect to
-  adjacent ideas.
-- **Takeaway** — a 1–3 paragraph synthesis written like a friend telling
-  you what they got out of the talk. Integrates the panel's pushback into
-  a single bottom-line read.
-- **Slides** — a clean PowerPoint deck reconstructing the speaker's
-  actual presentation. Vision models filter raw frames down to real deck
-  slides (no talking-head shots, no animation halves), so a 25-minute
-  talk becomes ~25–40 slides instead of hundreds of stills.
+### Digest
+
+Topic-segmented summary of what the video says, with the most
+representative slide / frame embedded under each topic. Click any
+timestamp to jump straight to that moment in the original video.
+
+<img src="docs/img/digest.jpg" alt="Digest viewer showing the tab-bar (View digest highlighted), the video title, a Watch on YouTube link, the overview, and the first topic with an embedded slide" width="720">
+
+### Panel discussion
+
+A 1500–2500 word multi-perspective critique. Three to five domain
+experts (chosen for the video's actual subject — a neuroscientist for a
+brain talk, an SRE for an operations talk, etc.) push back on what the
+speaker glossed over, bring contrary readings, and connect to adjacent
+ideas.
+
+<img src="docs/img/panel.jpg" alt="Panel discussion view introducing four named panelists chosen specifically for the video's subject — a memory neuroscientist, a distributed systems engineer, an ML continual-learning researcher, and a staff SRE — followed by the moderator's opening framing question" width="720">
+
+### Takeaway
+
+A 1–3 paragraph synthesis written like a friend telling you what they
+got out of the talk. Integrates the panel's pushback into a single
+bottom-line read, with inline timestamp links to specific moments
+worth verifying.
+
+<img src="docs/img/takeaway.jpg" alt="Takeaway viewer showing the synthesis prose with inline clickable timestamps grounding specific claims in the source video" width="720">
+
+### Slides
+
+A clean PowerPoint deck reconstructing the speaker's actual
+presentation. Vision models filter raw frames down to real deck slides
+(no talking-head shots, no animation halves), so a 25-minute talk
+becomes ~25–40 slides instead of hundreds of stills.
+
+---
 
 Everything runs on your machine — your videos, your transcripts, your
 markdown. The only thing that leaves is the prompts sent to Claude.
