@@ -3961,6 +3961,111 @@ def _render_markdown(text: str) -> str:
     return html
 
 
+def _viewer_nav(
+    video_id: str,
+    current_view: str,
+    digests_dir: Path,
+) -> str:
+    """Tab-bar style navigation shared across the digest / takeaway / panel
+    viewer pages. The current_view ("digest" | "takeaway" | "panel") gets
+    the primary highlighted styling; the other links are secondary outlines.
+    Generation buttons replace "View X" links when an artifact is missing.
+
+    Returns a single <div class='digest-actions digest-toolbar'>...</div>
+    block ready to inject at the top of a viewer page body.
+    """
+    from html import escape as h
+
+    takeaway_md = digests_dir / video_id / "takeaway.md"
+    panel_md = digests_dir / video_id / "panel.md"
+    slides_path = digests_dir / video_id / "slides.pptx"
+    slides_job = local_job_status(f"{video_id}:slides")
+    slides_running = slides_job.get("phase") == "running"
+
+    def cls(view: str) -> str:
+        return "discuss-btn" if view == current_view else "discuss-btn-secondary"
+
+    parts: List[str] = ["<div class='digest-actions digest-toolbar'>"]
+
+    # Always-visible: View digest. The page itself exists by definition (the
+    # caller would have 404'd before reaching this helper).
+    parts.append(
+        f"<a class='{cls('digest')}' style='text-decoration:none;' "
+        f"href='/digests/{h(video_id)}/'>View digest</a>"
+    )
+
+    # Panel — view link when present, generate button when missing.
+    if panel_md.exists():
+        parts.append(
+            f"<a class='{cls('panel')}' style='text-decoration:none;' "
+            f"href='/digests/{h(video_id)}/panel/'>View panel discussion</a>"
+        )
+    else:
+        submit_js = (
+            "this.querySelector('button').disabled=true;"
+            "this.querySelector('button').textContent='Generating panel… (~60–120s)';"
+        )
+        parts.append(
+            f"<form method='post' action='/digests/{h(video_id)}/discuss' "
+            f"style='display:inline;' onsubmit=\"{submit_js}\">"
+            "<button type='submit' class='discuss-btn-secondary' "
+            "title='Generates a panel-of-experts discussion "
+            "(~60–120s, one Opus call)'>"
+            "Generate panel</button></form>"
+        )
+
+    # Takeaway — view link or generate button.
+    if takeaway_md.exists():
+        parts.append(
+            f"<a class='{cls('takeaway')}' style='text-decoration:none;' "
+            f"href='/digests/{h(video_id)}/takeaway/'>View takeaway</a>"
+        )
+    else:
+        submit_js = (
+            "this.querySelector('button').disabled=true;"
+            "this.querySelector('button').textContent='Generating takeaway… (~30s)';"
+        )
+        parts.append(
+            f"<form method='post' action='/digests/{h(video_id)}/takeaway' "
+            f"style='display:inline;' onsubmit=\"{submit_js}\">"
+            "<button type='submit' class='discuss-btn-secondary' "
+            "title='Writes a 1–3 paragraph takeaway and saves it to takeaway.md'>"
+            "Generate takeaway</button></form>"
+        )
+
+    # Slides — download link, running indicator, or generate button. Async
+    # via the existing _local_jobs mechanism.
+    if slides_path.exists():
+        parts.append(
+            f"<a class='discuss-btn-secondary' style='text-decoration:none;' "
+            f"href='/digests/{h(video_id)}/slides.pptx' "
+            "title='Download the auto-generated PowerPoint deck "
+            "(one slide per topic, with intelligently-picked frames).'>"
+            "Download slides</a>"
+        )
+    elif slides_running:
+        elapsed = slides_job.get("elapsed", 0)
+        parts.append(
+            "<span class='discuss-btn-secondary' style='cursor: default;' "
+            f"data-poll-url='/digests/{h(video_id)}/job-status?kind=slides'>"
+            f"Generating slides… <span class='elapsed'>{elapsed}s</span>"
+            "</span>"
+        )
+    else:
+        parts.append(
+            f"<form method='post' action='/digests/{h(video_id)}/slides' "
+            f"style='display:inline;'>"
+            "<button type='submit' class='discuss-btn-secondary' "
+            "title='Builds slides.pptx from the cached video — local frame "
+            "extraction + alignment + PowerPoint assembly. No LLM call. "
+            "Runs in the background; the page will refresh when ready.'>"
+            "Generate slides</button></form>"
+        )
+
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def cmd_serve(args) -> int:
     try:
         from flask import Flask, render_template_string, abort, send_from_directory
@@ -5301,131 +5406,49 @@ def cmd_serve(args) -> int:
         md_source = digest_md.read_text()
         rendered = _render_markdown(md_source)
 
-        # Build the action toolbar. Lives at the TOP of the page so the user
-        # doesn't have to scroll past the whole digest to find these. Reading
-        # order in the toolbar mirrors the typical "fast food" path: takeaway
-        # first (the synthesized bottom line), panel second (the deeper
-        # critique), then utility actions.
-        panel_md = digests_dir / video_id / "panel.md"
-        panel_exists = panel_md.exists()
-        takeaway_md = digests_dir / video_id / "takeaway.md"
-        takeaway_exists = takeaway_md.exists()
-        gen_submit_js_panel = (
-            "this.querySelector('button').disabled=true;"
-            "this.querySelector('button').textContent='Generating panel… (~60–120s)';"
-        )
-        gen_submit_js_takeaway = (
-            "this.querySelector('button').disabled=true;"
-            "this.querySelector('button').textContent='Generating takeaway… (~30s)';"
+        nav = _viewer_nav(video_id, "digest", digests_dir)
+        slides_running = (
+            local_job_status(f"{video_id}:slides").get("phase") == "running"
         )
 
-        toolbar = "<div class='digest-actions digest-toolbar'>"
-        # Takeaway: primary CTA when present (it's what most readers want
-        # next). When missing, offer to generate it.
-        if takeaway_exists:
-            toolbar += (
-                f"<a class='discuss-btn' href='/digests/{h(video_id)}/takeaway/'>"
-                "View takeaway</a>"
-            )
-        else:
-            toolbar += (
-                f"<form method='post' action='/digests/{h(video_id)}/takeaway' "
-                f"style='display:inline;' onsubmit=\"{gen_submit_js_takeaway}\">"
-                "<button type='submit' class='discuss-btn' "
-                "title='Writes a 1–3 paragraph takeaway and saves it to takeaway.md'>"
-                "Generate takeaway</button>"
-                "</form>"
-            )
-        # Panel: secondary nav when present. Regenerate button removed —
-        # without prompt editability there's no useful reason to spend
-        # another Opus call. Legacy digests without a panel can still
-        # generate one on demand (auto-pipeline didn't run for them).
-        if panel_exists:
-            toolbar += (
-                f"<a class='discuss-btn-secondary' style='text-decoration:none;' "
-                f"href='/digests/{h(video_id)}/panel/'>View panel discussion</a>"
-            )
-        else:
-            toolbar += (
-                f"<form method='post' action='/digests/{h(video_id)}/discuss' "
-                f"style='display:inline;' onsubmit=\"{gen_submit_js_panel}\">"
-                "<button type='submit' class='discuss-btn-secondary' "
-                "title='Generates a panel-of-experts discussion (~60–120s, one Opus call)'>"
-                "Generate panel</button>"
-                "</form>"
-            )
-        # Slides — sibling artifact alongside takeaway/panel. The visual
-        # layer (intelligently-picked frames + transcript snippets) is the
-        # tool's main differentiator vs. a pure-LLM workflow. Generation
-        # is async (daemon thread); the toolbar renders three states.
-        slides_path = digests_dir / video_id / "slides.pptx"
-        slides_job = local_job_status(f"{video_id}:slides")
-        slides_running = slides_job.get("phase") == "running"
-        if slides_path.exists():
-            toolbar += (
-                f"<a class='discuss-btn-secondary' style='text-decoration:none;' "
-                f"href='/digests/{h(video_id)}/slides.pptx' "
-                "title='Download the auto-generated PowerPoint deck "
-                "(one slide per topic, with intelligently-picked frames).'>"
-                "Download slides</a>"
-            )
-        elif slides_running:
-            elapsed = slides_job.get("elapsed", 0)
-            toolbar += (
-                f"<span class='discuss-btn-secondary' style='cursor: default;' "
-                f"data-poll-url='/digests/{h(video_id)}/job-status?kind=slides'>"
-                f"Generating slides… <span class='elapsed'>{elapsed}s</span>"
-                "</span>"
-            )
-        else:
-            toolbar += (
-                f"<form method='post' action='/digests/{h(video_id)}/slides' "
-                f"style='display:inline;'>"
-                "<button type='submit' class='discuss-btn-secondary' "
-                "title='Builds slides.pptx from the cached video — local frame "
-                "extraction + alignment + PowerPoint assembly. No LLM call. "
-                "Runs in the background; this page will refresh when ready.'>"
-                "Generate slides</button>"
-                "</form>"
-            )
-        # Copy markdown — lets the reader paste into Notion, Obsidian, an
-        # email, another LLM, etc. Markdown is the most-portable form.
-        toolbar += (
+        # Bottom-of-page actions: Copy markdown is the canonical "take this
+        # elsewhere" affordance for any reader who scrolled to the end.
+        # Delete digest sits below it in a small "danger zone" — only on
+        # the digest viewer, not on takeaway/panel (must be on the main
+        # anchor page).
+        bottom_actions = (
+            "<hr style='margin: 32px 0 16px; border: none; "
+            "border-top: 1px solid var(--border);'>"
+            "<div class='digest-actions' style='margin-bottom: 16px;'>"
             "<button type='button' class='discuss-btn-secondary' "
-            "data-copy-target='digest-md-source' "
-            "title='Copy the markdown source — paste into your notes app, email, or another LLM'>"
-            "Copy markdown</button>"
-        )
-        toolbar += (
-            f"<form method='post' action='/digests/{h(video_id)}/delete' style='display:inline;' "
+            "data-copy-target='page-md-source' "
+            "title='Copy the markdown source — paste into your notes app, "
+            "email, or another LLM'>Copy markdown</button>"
+            "</div>"
+            f"<textarea id='page-md-source' hidden aria-hidden='true'>"
+            f"{h(md_source)}</textarea>"
+            "<hr style='margin: 24px 0 12px; border: none; "
+            "border-top: 1px solid var(--border);'>"
+            "<div style='display:flex; justify-content: flex-end;'>"
+            f"<form method='post' action='/digests/{h(video_id)}/delete' "
+            "style='display:inline;' "
             "onsubmit=\"return confirm('Delete this digest? "
             "The rendered output, frames, and cached video will be wiped.');\">"
             "<button type='submit' class='delete-btn' "
-            "title='Wipes digest.md, frames, and cached video. Re-submit via One-off digest to regenerate.'>"
-            "Delete digest</button>"
-            "</form>"
-        )
-        toolbar += "</div>"
-
-        # Hidden textarea holds the raw markdown for clipboard copy. <textarea>
-        # treats content as raw text up to </textarea>, so escaping & and < is
-        # sufficient (html.escape handles both).
-        hidden_md = (
-            f'<textarea id="digest-md-source" hidden aria-hidden="true">'
-            f'{h(md_source)}</textarea>'
+            "title='Wipes digest.md, panel.md, takeaway.md, slides.pptx, "
+            "frames, and the cached video. The video can be re-digested "
+            "via One-off later.'>Delete digest</button></form></div>"
         )
 
-        # Inject the polling JS only when there's actually a job in flight,
-        # so the steady state has zero JS overhead beyond the existing copy
-        # handler.
         poll_js = _JOB_POLL_JS if slides_running else ""
         body = (
-            toolbar
-            + hidden_md
+            nav
             + _COPY_BUTTON_JS
             + poll_js
-            + "<hr style='margin: 16px 0 32px; border: none; border-top: 1px solid var(--border);'>"
+            + "<hr style='margin: 16px 0 32px; border: none; "
+            "border-top: 1px solid var(--border);'>"
             + rendered
+            + bottom_actions
         )
         return page(body, title=video_id, current=f"digest:{video_id}",
                     base_href=f"/digests/{video_id}/")
@@ -5544,10 +5567,14 @@ def cmd_serve(args) -> int:
         # just copy a hidden textarea (same pattern as Copy markdown). Loads
         # whichever artifacts exist (digest + panel + takeaway).
         chat_prompt = build_chat_handoff_prompt(video_id, digests_dir)
-        nav = (
-            '<div class="digest-actions digest-toolbar" style="margin-top:0;">'
-            f'<a href="/digests/{h(video_id)}/" class="discuss-btn-secondary" '
-            'style="text-decoration:none; padding: 6px 12px;">← Back to digest</a>'
+        nav = _viewer_nav(video_id, "takeaway", digests_dir)
+        # Bottom-of-page actions: Copy markdown for the takeaway itself,
+        # plus Continue in chat (only on takeaway — that's the natural
+        # "I want to ask a follow-up" endpoint after reading the synthesis).
+        bottom_actions = (
+            "<hr style='margin: 32px 0 16px; border: none; "
+            "border-top: 1px solid var(--border);'>"
+            "<div class='digest-actions' style='margin-bottom: 16px;'>"
             "<button type='button' class='discuss-btn' "
             "data-copy-target='chat-handoff-source' "
             "data-then-open='https://claude.ai/new' "
@@ -5555,18 +5582,21 @@ def cmd_serve(args) -> int:
             "opens claude.ai in a new tab — paste to continue the discussion "
             "with full context.'>Continue in chat</button>"
             "<button type='button' class='discuss-btn-secondary' "
-            "data-copy-target='takeaway-md-source' "
+            "data-copy-target='page-md-source' "
             "title='Copy the takeaway markdown'>Copy markdown</button>"
             "</div>"
+            f"<textarea id='page-md-source' hidden aria-hidden='true'>"
+            f"{h(md_source)}</textarea>"
+            f"<textarea id='chat-handoff-source' hidden aria-hidden='true'>"
+            f"{h(chat_prompt)}</textarea>"
         )
-        hidden_md = (
-            f'<textarea id="takeaway-md-source" hidden aria-hidden="true">'
-            f'{h(md_source)}</textarea>'
-            f'<textarea id="chat-handoff-source" hidden aria-hidden="true">'
-            f'{h(chat_prompt)}</textarea>'
+        body = (
+            nav + _COPY_BUTTON_JS
+            + "<hr style='margin: 16px 0 32px; border: none; "
+            "border-top: 1px solid var(--border);'>"
+            + rendered + bottom_actions
         )
-        return page(nav + hidden_md + _COPY_BUTTON_JS + rendered,
-                    title=f"Takeaway · {video_id}",
+        return page(body, title=f"Takeaway · {video_id}",
                     current=f"digest:{video_id}",
                     base_href=f"/digests/{video_id}/takeaway/")
 
@@ -5578,21 +5608,25 @@ def cmd_serve(args) -> int:
             abort(404)
         md_source = panel_md.read_text()
         rendered = _render_markdown(md_source)
-        nav = (
-            f'<div class="digest-actions digest-toolbar" style="margin-top:0;">'
-            f'<a href="/digests/{h(video_id)}/" class="discuss-btn-secondary" '
-            f'style="text-decoration:none; padding: 6px 12px;">← Back to digest</a>'
+        nav = _viewer_nav(video_id, "panel", digests_dir)
+        bottom_actions = (
+            "<hr style='margin: 32px 0 16px; border: none; "
+            "border-top: 1px solid var(--border);'>"
+            "<div class='digest-actions' style='margin-bottom: 16px;'>"
             "<button type='button' class='discuss-btn-secondary' "
-            "data-copy-target='panel-md-source' "
+            "data-copy-target='page-md-source' "
             "title='Copy the panel discussion markdown'>Copy markdown</button>"
             "</div>"
+            f"<textarea id='page-md-source' hidden aria-hidden='true'>"
+            f"{h(md_source)}</textarea>"
         )
-        hidden_md = (
-            f'<textarea id="panel-md-source" hidden aria-hidden="true">'
-            f'{h(md_source)}</textarea>'
+        body = (
+            nav + _COPY_BUTTON_JS
+            + "<hr style='margin: 16px 0 32px; border: none; "
+            "border-top: 1px solid var(--border);'>"
+            + rendered + bottom_actions
         )
-        return page(nav + hidden_md + _COPY_BUTTON_JS + rendered,
-                    title=f"Panel · {video_id}",
+        return page(body, title=f"Panel · {video_id}",
                     current=f"digest:{video_id}",
                     base_href=f"/digests/{video_id}/panel/")
 
