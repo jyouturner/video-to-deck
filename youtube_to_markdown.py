@@ -1320,6 +1320,75 @@ def _pick_caption_lang(info: dict) -> Optional[Tuple[str, bool]]:
     return None
 
 
+def download_image(url: str, dest: Path, *, timeout: float = 15.0) -> bool:
+    """Save a remote image to dest. Returns True on success. Atomic write
+    via .tmp suffix → rename so a partial download never replaces an
+    existing file. Best-effort: any failure is swallowed and returned as
+    False, since thumbnails are nice-to-have, not load-bearing.
+    """
+    if not url:
+        return False
+    tmp: Optional[Path] = None
+    try:
+        import urllib.request
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "yt2md/1.0 (thumbnail fetch)"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            tmp.write_bytes(resp.read())
+        tmp.replace(dest)
+        return True
+    except Exception:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return False
+
+
+def probe_channel_thumbnail_url(
+    channel_url: str,
+    cookies_from_browser: Optional[str] = None,
+) -> Optional[str]:
+    """yt-dlp probe for the channel's avatar URL. Channel avatars aren't
+    in the standard video info, so this is a separate extract. Best-effort:
+    returns None on any failure (private channel, anti-bot wall, no
+    channel_url). The caller falls back to displaying just the channel
+    name without an avatar.
+    """
+    if not channel_url:
+        return None
+    try:
+        import yt_dlp
+        opts: dict = {
+            "quiet": True, "no_warnings": True, "skip_download": True,
+            "extract_flat": False, "playlist_items": "0",
+        }
+        if cookies_from_browser:
+            opts["cookiesfrombrowser"] = (cookies_from_browser,)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ch_info = ydl.extract_info(channel_url, download=False)
+    except Exception:
+        return None
+    if not isinstance(ch_info, dict):
+        return None
+    # Channel info shapes vary by extractor. Try the standard list-of-
+    # thumbnails first, picking the largest by pixel area, then fall back
+    # to a single `thumbnail` field.
+    thumbs = ch_info.get("thumbnails") or []
+    sized = [
+        t for t in thumbs
+        if isinstance(t, dict) and t.get("url")
+    ]
+    if sized:
+        sized.sort(key=lambda t: (t.get("height") or 0) * (t.get("width") or 0))
+        return sized[-1].get("url")
+    return ch_info.get("thumbnail")
+
+
 def fetch_youtube(
     url: str,
     cache_root: Path,
@@ -1377,6 +1446,16 @@ def fetch_youtube(
     title = info.get("title") or video_id
     webpage_url = info.get("webpage_url") or url
     upload_date = info.get("upload_date")  # YYYYMMDD per yt-dlp; None if missing
+    # Thumbnail + channel info — used by the sidebar to render small visual
+    # anchors next to each digest. Best-effort; any field may be missing
+    # (especially for non-YouTube sources via yt-dlp).
+    thumbnail_url = info.get("thumbnail")
+    channel_id = info.get("channel_id") or info.get("uploader_id") or ""
+    channel_name = info.get("channel") or info.get("uploader") or ""
+    channel_url = info.get("channel_url") or info.get("uploader_url") or ""
+    # yt-dlp video info doesn't carry a channel-avatar URL in the standard
+    # fields; we keep the channel_url and let the caller probe separately
+    # if it wants a channel thumbnail.
     out_dir = cache_root / video_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1389,7 +1468,7 @@ def fetch_youtube(
         print(f"      using cached {out_dir}/ (lang: {lang})")
         return {
             "mp4": mp4_path, "srt": existing_srt, "lang": lang,
-            "title": title, "webpage_url": webpage_url, "upload_date": upload_date,
+            "title": title, "webpage_url": webpage_url, "upload_date": upload_date, "thumbnail_url": thumbnail_url, "channel_id": channel_id, "channel_name": channel_name, "channel_url": channel_url,
             "download_secs": 0.0, "whisper_secs": 0.0,
             "used_whisper": False, "whisper_model": None,
         }
@@ -1451,7 +1530,7 @@ def fetch_youtube(
         lang = srt_found.stem[len(video_id) + 1:]
         return {
             "mp4": mp4_path, "srt": srt_found, "lang": lang,
-            "title": title, "webpage_url": webpage_url, "upload_date": upload_date,
+            "title": title, "webpage_url": webpage_url, "upload_date": upload_date, "thumbnail_url": thumbnail_url, "channel_id": channel_id, "channel_name": channel_name, "channel_url": channel_url,
             "download_secs": download_secs, "whisper_secs": 0.0,
             "used_whisper": False, "whisper_model": None,
         }
@@ -1461,7 +1540,7 @@ def fetch_youtube(
     whisper_secs = _time.monotonic() - whisper_t0
     return {
         "mp4": mp4_path, "srt": srt_path, "lang": lang,
-        "title": title, "webpage_url": webpage_url, "upload_date": upload_date,
+        "title": title, "webpage_url": webpage_url, "upload_date": upload_date, "thumbnail_url": thumbnail_url, "channel_id": channel_id, "channel_name": channel_name, "channel_url": channel_url,
         "download_secs": download_secs, "whisper_secs": whisper_secs,
         "used_whisper": True, "whisper_model": whisper_model,
     }
@@ -3661,10 +3740,9 @@ aside h2 {
 aside ul { list-style: none; padding: 0; margin: 0; }
 aside li { margin: 0 0 3px; }
 aside li a {
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
   padding: 6px 8px;
   border-radius: 4px;
   color: var(--fg);
@@ -3672,6 +3750,44 @@ aside li a {
   font-size: 13px;
   line-height: 1.35;
 }
+/* Sidebar item layout: video thumbnail + textual body (title + channel
+   avatar/name). Thumbnails are 16:9 mini-posters at 56px wide; the
+   channel avatar is a small circle. When a digest has no thumbnails
+   (legacy or fetch failure) the items lay out as text only. */
+aside li .digest-thumb {
+  flex: 0 0 56px;
+  width: 56px;
+  height: 32px;
+  border-radius: 3px;
+  background: var(--border);
+  background-size: cover;
+  background-position: center;
+}
+aside li .digest-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+aside li .digest-channel {
+  display: flex; align-items: center; gap: 4px;
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: normal;
+}
+aside li .channel-avatar {
+  flex: 0 0 14px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--border);
+  background-size: cover;
+  background-position: center;
+}
+aside li.active .digest-channel { color: rgba(255,255,255,0.85); }
 aside li a:hover { background: rgba(0,0,0,0.05); }
 @media (prefers-color-scheme: dark) {
   aside li a:hover { background: rgba(255,255,255,0.05); }
@@ -3933,7 +4049,10 @@ details[open] summary { margin-bottom: 8px; }
   <ul>
     {% for d in digests %}
     <li{% if current == 'digest:' + d.id %} class="active"{% endif %}{% if d.unread %} class="unread"{% endif %}>
-      <a href="/digests/{{ d.id }}/">{% if d.unread %}<span class="unread-dot" aria-label="unread"></span>{% endif %}{{ d.title }}</a>
+      <a href="/digests/{{ d.id }}/">
+        {% if d.has_thumbnail %}<span class="digest-thumb" style="background-image: url('/digests/{{ d.id }}/thumbnail.jpg');" aria-hidden="true"></span>{% else %}<span class="digest-thumb" aria-hidden="true"></span>{% endif %}
+        <span class="digest-body">{% if d.unread %}<span class="unread-dot" aria-label="unread"></span>{% endif %}{{ d.title }}{% if d.channel_name %}<span class="digest-channel">{% if d.has_channel_thumbnail %}<span class="channel-avatar" style="background-image: url('/channel-thumbnails/{{ d.channel_id }}.jpg');" aria-hidden="true"></span>{% endif %}{{ d.channel_name }}</span>{% endif %}</span>
+      </a>
     </li>
     {% else %}
     <li class="empty">none yet</li>
@@ -3999,7 +4118,30 @@ def _list_digests(digests_dir: Path) -> List[dict]:
                     break
         except Exception:
             pass
-        results.append({"id": d.name, "title": title, "mtime": d.stat().st_mtime})
+        # Sidebar enrichment: try to load metadata.json + thumbnail presence
+        # so the sidebar can render small visual anchors. All optional;
+        # legacy digests without metadata.json fall back to text-only.
+        entry: dict = {
+            "id": d.name, "title": title, "mtime": d.stat().st_mtime,
+            "has_thumbnail": (d / "thumbnail.jpg").exists(),
+            "channel_id": None, "channel_name": None,
+            "has_channel_thumbnail": False,
+        }
+        meta_path = d / "metadata.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+                entry["channel_id"] = meta.get("channel_id")
+                entry["channel_name"] = meta.get("channel_name")
+                if entry["channel_id"]:
+                    ch_thumb = (
+                        get_data_dir() / "channel_thumbnails"
+                        / f"{entry['channel_id']}.jpg"
+                    )
+                    entry["has_channel_thumbnail"] = ch_thumb.exists()
+            except Exception:
+                pass
+        results.append(entry)
     return results
 
 
@@ -5738,6 +5880,26 @@ def cmd_serve(args) -> int:
     def digest_image(video_id, filename):
         return send_from_directory(digests_dir / video_id / "digest_images", filename)
 
+    @app.route("/digests/<video_id>/thumbnail.jpg")
+    def video_thumbnail(video_id):
+        thumb = digests_dir / video_id / "thumbnail.jpg"
+        if not thumb.exists():
+            abort(404)
+        return send_from_directory(digests_dir / video_id, "thumbnail.jpg")
+
+    @app.route("/channel-thumbnails/<channel_id>.jpg")
+    def channel_thumbnail(channel_id):
+        # Channel avatars are shared across all digests from the same channel.
+        # Disallow any path traversal in channel_id (yt-dlp channel IDs are
+        # always alphanumeric + dashes/underscores).
+        if not re.match(r"^[\w\-]+$", channel_id):
+            abort(404)
+        ch_dir = get_data_dir() / "channel_thumbnails"
+        target = ch_dir / f"{channel_id}.jpg"
+        if not target.exists():
+            abort(404)
+        return send_from_directory(ch_dir, f"{channel_id}.jpg")
+
     @app.route("/digests/<video_id>/slides.pptx")
     def download_slides(video_id):
         slides_path = digests_dir / video_id / "slides.pptx"
@@ -6171,6 +6333,10 @@ def main():
     video_title: Optional[str] = None
     video_url: Optional[str] = None
     upload_date: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    channel_id: str = ""
+    channel_name: str = ""
+    channel_url: str = ""
     # Run-start timestamp lets the summary block aggregate cost from the
     # usage log without needing to thread a list through every call site
     # (slide_classifier in particular records from inside its function).
@@ -6191,6 +6357,10 @@ def main():
         video_title = result.get("title")
         video_url = result.get("webpage_url")
         upload_date = result.get("upload_date")
+        thumbnail_url = result.get("thumbnail_url")
+        channel_id = result.get("channel_id") or ""
+        channel_name = result.get("channel_name") or ""
+        channel_url = result.get("channel_url") or ""
         timings["download"] = round(result["download_secs"], 3)
         timings["whisper"] = round(result["whisper_secs"], 3)
         fetch_meta["used_whisper"] = result["used_whisper"]
@@ -6374,6 +6544,52 @@ def main():
                 video_title=video_title, video_url=video_url,
             )
             print(f"      Digest written. Images in {images_dir}/")
+
+            # Persist thumbnails + metadata sidecar. These power the sidebar's
+            # visual scan — small video poster next to each title, channel
+            # avatar as a secondary anchor. Best-effort: thumbnails are
+            # nice-to-have, not load-bearing, so we don't fail the pipeline
+            # on a missed download.
+            digest_dir = digest_path.parent
+            thumbnail_local: Optional[Path] = None
+            channel_thumbnail_local: Optional[Path] = None
+            if thumbnail_url:
+                cand = digest_dir / "thumbnail.jpg"
+                if download_image(thumbnail_url, cand):
+                    thumbnail_local = cand
+                    print(f"      thumbnail: {cand.name}")
+            if channel_id and channel_url:
+                # Shared across all digests from the same channel — avoids
+                # downloading the same avatar 50× for a 50-video subscription.
+                ch_dir = get_data_dir() / "channel_thumbnails"
+                ch_cand = ch_dir / f"{channel_id}.jpg"
+                if not ch_cand.exists():
+                    ch_url = probe_channel_thumbnail_url(
+                        channel_url,
+                        cookies_from_browser=args.cookies_from_browser,
+                    )
+                    if ch_url and download_image(ch_url, ch_cand):
+                        channel_thumbnail_local = ch_cand
+                        print(f"      channel avatar: {ch_cand.name}")
+                else:
+                    channel_thumbnail_local = ch_cand
+            metadata = {
+                "video_id": video_path.stem,
+                "title": video_title,
+                "url": video_url,
+                "upload_date": upload_date,
+                "channel_id": channel_id or None,
+                "channel_name": channel_name or None,
+                "channel_url": channel_url or None,
+                "has_thumbnail": thumbnail_local is not None,
+                "has_channel_thumbnail": channel_thumbnail_local is not None,
+            }
+            try:
+                (digest_dir / "metadata.json").write_text(
+                    json.dumps(metadata, indent=2) + "\n"
+                )
+            except OSError:
+                pass
 
             # Render the digest to markdown text once for the panel + takeaway
             # prompts (saves a re-read on each step). For the panel/takeaway we
