@@ -303,12 +303,21 @@ def _render_classification_grids(
     if not frames:
         return []
 
-    # Try a system font for legibility; fall back to PIL default if not available.
-    try:
-        font = ImageFont.truetype(
-            "/System/Library/Fonts/Helvetica.ttc", 32,
-        )
-    except (OSError, IOError):
+    # Try platform-appropriate system fonts in order; fall back to PIL's
+    # tiny built-in default if none of them are reachable.
+    font = None
+    for font_path in (
+        "/System/Library/Fonts/Helvetica.ttc",  # macOS
+        "C:\\Windows\\Fonts\\arial.ttf",        # Windows
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  # common Linux
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",              # other Linux
+    ):
+        try:
+            font = ImageFont.truetype(font_path, 32)
+            break
+        except (OSError, IOError):
+            continue
+    if font is None:
         font = ImageFont.load_default()
 
     grids: List[Tuple[Path, List[int]]] = []
@@ -638,6 +647,21 @@ def build_deck(slides_data, output: Path, video_name: str) -> None:
 DEFAULT_DATA_DIR = Path.home() / "yt2md"
 
 
+# Cross-platform "detach this child from the parent" Popen kwargs. On POSIX,
+# start_new_session=True calls setsid() so the child becomes its own session
+# leader and survives even if the parent dies. On Windows, DETACHED_PROCESS
+# + CREATE_NEW_PROCESS_GROUP achieve the same effect (the child is detached
+# from the console and won't receive the parent's Ctrl-C).
+if sys.platform == "win32":
+    _DETACH_KWARGS = {
+        "creationflags": (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        ),
+    }
+else:
+    _DETACH_KWARGS = {"start_new_session": True}
+
+
 def get_data_dir() -> Path:
     return Path(os.environ.get("YT2MD_DATA", str(DEFAULT_DATA_DIR))).expanduser()
 
@@ -785,7 +809,14 @@ def claude_config_dir() -> Path:
 
 
 def claude_binary_path() -> Path:
-    return claude_sandbox_dir() / "node_modules" / ".bin" / "claude"
+    """Path to the sandboxed claude executable. npm installs both a Unix
+    shell shim (`claude`) and a Windows batch shim (`claude.cmd`) into
+    `node_modules/.bin/`. Python's subprocess on Windows can't execute the
+    shell shim directly, so we point at the .cmd shim there."""
+    bin_dir = claude_sandbox_dir() / "node_modules" / ".bin"
+    if sys.platform == "win32":
+        return bin_dir / "claude.cmd"
+    return bin_dir / "claude"
 
 
 def claude_subprocess_env() -> dict:
@@ -965,7 +996,7 @@ def start_install_job() -> Optional[str]:
     if detect_node() is None:
         return (
             f"Node.js {MIN_NODE_MAJOR}+ is required. Install with "
-            "`brew install node` (macOS) or your package manager, then retry."
+            "`brew install node` (macOS) / `winget install OpenJS.NodeJS` (Windows), then retry."
         )
     sandbox = claude_sandbox_dir()
     sandbox.mkdir(parents=True, exist_ok=True)
@@ -979,7 +1010,7 @@ def start_install_job() -> Optional[str]:
     log_f = open(log_path, "a")
     proc = subprocess.Popen(
         cmd, stdout=log_f, stderr=subprocess.STDOUT, text=True,
-        start_new_session=True,
+        **_DETACH_KWARGS,
     )
     import time as _t
     _claude_setup_jobs["install"] = {
@@ -1007,7 +1038,7 @@ def start_login_job() -> Optional[str]:
         stdout=log_f, stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,  # no terminal stdin → CLI relies on browser callback
         text=True,
-        start_new_session=True,
+        **_DETACH_KWARGS,
     )
     import time as _t
     _claude_setup_jobs["login"] = {
@@ -2840,7 +2871,7 @@ def _fire_scheduled_job(kind: str) -> Optional[subprocess.Popen]:
         stdout=log_fd,
         stderr=subprocess.STDOUT,
         env={**os.environ, **_settings_to_env(load_settings()), "PYTHONUNBUFFERED": "1"},
-        start_new_session=True,
+        **_DETACH_KWARGS,
     )
     log_fd.close()
     _scheduler_jobs[kind] = proc
@@ -2913,7 +2944,10 @@ def start_scheduler() -> None:
 def _cleanup_legacy_launchd() -> None:
     """Best-effort one-time removal of the old launchctl plists from
     ~/Library/LaunchAgents — so the user doesn't end up with duplicate
-    scheduling after this migration. Silent if nothing is present."""
+    scheduling after this migration. Silent if nothing is present.
+    macOS-only — launchctl doesn't exist anywhere else."""
+    if sys.platform != "darwin":
+        return
     launchd_dir = Path.home() / "Library" / "LaunchAgents"
     removed = []
     for label in ("com.youtube-to-markdown.poll", "com.youtube-to-markdown.meta"):
@@ -4703,7 +4737,8 @@ def cmd_serve(args) -> int:
             cc_panel += (
                 '<div class="flash" style="border-left-color: #c00; margin: 0;">'
                 f'<strong>Node.js {MIN_NODE_MAJOR}+ required.</strong> '
-                'Install with <code>brew install node</code> (macOS) or your '
+                'Install with <code>brew install node</code> (macOS) / '
+                f'<code>winget install OpenJS.NodeJS</code> (Windows) or your '
                 'package manager, then refresh this page.'
                 '</div>'
             )
@@ -4793,7 +4828,7 @@ def cmd_serve(args) -> int:
       statusEl.innerHTML =
         '<div class="flash" style="border-left-color: #c00; margin: 0;">' +
         '<strong>Node.js ' + 18 + '+ required.</strong> ' +
-        'Install with <code>brew install node</code> (macOS) or your package manager, then refresh this page.' +
+        'Install with <code>brew install node</code> (macOS) / <code>winget install OpenJS.NodeJS</code> (Windows), then refresh this page.' +
         '</div>';
     } else if (s.install_running) {
       statusEl.innerHTML =
@@ -5151,7 +5186,7 @@ def cmd_serve(args) -> int:
                 stdout=log_fd,
                 stderr=subprocess.STDOUT,
                 env={**os.environ, **_settings_to_env(load_settings())},
-                start_new_session=True,
+                **_DETACH_KWARGS,
             )
         finally:
             # Subprocess holds its own copy of the fd; safe for us to close.
@@ -5887,7 +5922,9 @@ def cmd_doctor(args) -> int:
             ok(f"{tool} on PATH")
         else:
             fail(f"{tool} not found",
-                 "macOS: `brew install ffmpeg` · Linux: `apt install ffmpeg`")
+                 "macOS: `brew install ffmpeg` · "
+                 "Windows: `winget install Gyan.FFmpeg` · "
+                 "Linux: `apt install ffmpeg`")
 
     if shutil.which("uv"):
         try:
@@ -6115,7 +6152,12 @@ def main():
 
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
-            sys.exit(f"{tool} not found on PATH. Install with `brew install ffmpeg` or your package manager.")
+            sys.exit(
+                f"{tool} not found on PATH. Install with "
+                "`brew install ffmpeg` (macOS), "
+                "`winget install Gyan.FFmpeg` (Windows), "
+                "or your distro's package manager (Linux)."
+            )
 
     do_digest = not args.deck_only
     if do_digest:

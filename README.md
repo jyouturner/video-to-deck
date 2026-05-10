@@ -49,16 +49,29 @@ markdown. The only thing that leaves is the prompts sent to Claude.
 
 ## Get it running
 
-You need a Mac with [Homebrew](https://brew.sh) installed. Then one
-command:
+One command for your platform:
+
+**macOS** — needs [Homebrew](https://brew.sh):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jyouturner/youtube-to-markdown/main/install.sh | bash
 ```
 
-The installer brew-installs `ffmpeg`, `node`, and `uv` if you don't
-already have them, then installs `yt2md` itself. Re-run it any time to
-upgrade. ([See what it does before running it.](install.sh))
+**Windows 10/11** — uses winget (built into Windows; install "App
+Installer" from the Microsoft Store if it's not on the box yet):
+
+```powershell
+irm https://raw.githubusercontent.com/jyouturner/youtube-to-markdown/main/install.ps1 | iex
+```
+
+The installer installs `ffmpeg`, `node`, and `uv` via your platform's
+package manager if you don't already have them, then installs `yt2md`
+itself. Re-run it any time to upgrade. ([See the Mac
+script](install.sh) · [See the Windows script](install.ps1))
+
+> **Windows note:** Windows support is currently untested — code paths
+> are platform-aware but no one's verified end-to-end on a real Windows
+> box. If something breaks, please open an issue.
 
 Then start the app:
 
