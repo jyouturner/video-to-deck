@@ -1,174 +1,186 @@
-# youtube-to-markdown
+# yt2md — Read YouTube without watching
 
-Read YouTube without watching. A local web app that turns videos into
-Markdown digests — topic-segmented summaries with embedded frames — so you
-can skim what was said in 30 seconds instead of sitting through 30 minutes.
+A local web app that turns long YouTube videos into something you can
+actually consume in a few minutes. Paste a URL or subscribe to channels;
+yt2md downloads the video, transcribes it, and generates four useful
+artifacts for each one:
 
-Subscribe to channels and new videos get auto-digested in the background.
-Drop in a one-off URL when you want a single digest. Click "Discuss with
-experts" on any digest for a panel-of-experts deep-dive. Runs entirely on
-your Mac.
+- **Digest** — topic-segmented summary of what the video says, with the
+  most representative slide / frame embedded under each topic. Click any
+  timestamp to jump straight to that moment in the original video.
+- **Panel discussion** — a 1500–2500 word multi-perspective critique.
+  Three to five domain experts (chosen for the video's actual subject)
+  push back, surface what the speaker glossed over, and connect to
+  adjacent ideas.
+- **Takeaway** — a 1–3 paragraph synthesis written like a friend telling
+  you what they got out of the talk. Integrates the panel's pushback into
+  a single bottom-line read.
+- **Slides** — a clean PowerPoint deck reconstructing the speaker's
+  actual presentation. Vision models filter raw frames down to real deck
+  slides (no talking-head shots, no animation halves), so a 25-minute
+  talk becomes ~25–40 slides instead of hundreds of stills.
 
-## Quickstart
+Everything runs on your machine — your videos, your transcripts, your
+markdown. The only thing that leaves is the prompts sent to Claude.
+
+---
+
+## Before you start
+
+You need a Mac (Linux probably works but isn't tested) and three things:
+
+1. **Homebrew + ffmpeg.** Install Homebrew from
+   [brew.sh](https://brew.sh), then `brew install ffmpeg`. ffmpeg does the
+   heavy local work — extracting frames from videos, building decks.
+2. **Node.js 20+.** `brew install node`. yt-dlp needs it to handle
+   YouTube's anti-bot challenge.
+3. **A Claude account.** You have two paths here:
+   - **API key (simpler, pay-per-call):** Sign in to
+     [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys),
+     add a payment method, create a key. Typical cost ~$0.20 per 25-min
+     video.
+   - **Claude.ai subscription via Claude Code:** If you have a Pro or Max
+     plan, yt2md can drive a sandboxed copy of Claude Code on your Mac
+     instead. No per-call billing — usage counts against your plan's
+     limits. The first-run setup page has an "Install Claude Code" button
+     that handles the install for you.
+
+You don't need to pick now — the app's `/setup` page walks you through
+both paths.
+
+---
+
+## Get it running
 
 ```bash
-# Get the code
 git clone https://github.com/jyouturner/youtube-to-markdown
 cd youtube-to-markdown
-
-# One-command bootstrap + launch
 ./run.sh
 ```
 
-`run.sh` is idempotent — it checks ffmpeg, installs uv if missing (with a
-prompt), syncs Python deps, runs `yt2md doctor` to verify the rest, and
-launches the web reader at `http://localhost:7682/`. Re-run it any time to
-restart; passing checks become no-ops.
+That's it. `run.sh` checks ffmpeg, installs `uv` (a Python package
+manager) if needed, syncs dependencies, and opens
+[http://localhost:7682](http://localhost:7682) in your browser. Re-run it
+any time to start the app again.
 
-If you'd rather drive it manually:
+The first time you open the app, it'll send you to a setup page to
+configure auth (API key or Claude.ai subscription). Once that's done
+you're good.
 
-```bash
-brew install ffmpeg uv      # one-time system deps
-uv sync                     # install Python deps
-uv run yt2md doctor         # verify everything
-uv run yt2md serve          # launch reader (runs the in-process scheduler too)
-``` Everything —
-adding subscriptions, submitting one-off digests, generating panel
-discussions, configuring models — happens through that UI. First run prompts
-for an Anthropic API key
-([get one here](https://console.anthropic.com/settings/keys)).
+---
 
-## Prerequisites
+## Once it's running
 
-| | What | Why |
+The sidebar has two sections:
+
+- **Digests** (top) — every video you've ever processed. Click any one to
+  read it. Unread digests get a small dot.
+- **Manage** (bottom, always visible) — Subscriptions, One-off digest,
+  Schedule, Activity, Settings.
+
+To process a video:
+
+- **One-off** — paste a YouTube URL into the One-off digest page. The
+  whole pipeline runs in the background (5–10 minutes for a typical
+  video). You can close the tab; come back later. Activity will show you
+  when it's done.
+- **Subscriptions** — add a YouTube channel (paste the channel URL or
+  `@handle`). New videos from that channel get auto-digested in the
+  background according to your Schedule (default: every 6 hours).
+
+When you click on a digest, the page has a tab-bar:
+**View digest · View panel · View takeaway · Download slides**. The
+button for the page you're on is highlighted. If an artifact didn't
+generate (rare — happens when an LLM call fails mid-pipeline), the
+button shows "Generate X" instead and you can retry with one click.
+
+There's also a **Continue in chat** button on the takeaway page. It
+copies the digest + panel + takeaway to your clipboard and opens
+claude.ai in a new tab — paste, and you're in a fresh chat with full
+context. Useful when you finish reading and have a follow-up question.
+
+---
+
+## What it costs
+
+You can see your actual spend on the **Activity** page —
+today / 7d / 30d / all-time, plus per-run cost in the table. Every LLM
+call gets logged with tokens and dollar estimate.
+
+Rough numbers for a 25-minute slide-heavy tech talk with the default
+models (Sonnet 4.6 + Opus 4.7):
+
+| Step | What it does | Cost |
 | --- | --- | --- |
-| **System** | `ffmpeg` + `ffprobe` | frame extraction |
-| **System** | `uv` (or `pip`) | Python toolchain |
-| **System** | Node 20+ (or Deno) | yt-dlp's n-challenge JavaScript solver |
-| **Config** | Anthropic API key | digest + panel-discussion LLM calls |
-| **Config (recommended)** | YouTube login in a local browser | yt-dlp passes its cookies through; many videos now require a logged-in session |
+| Digest | Topic segmentation | ~$0.06 |
+| Vision frame-picking | Picks one frame per topic | ~$0.13 |
+| Panel discussion | Opus, multi-expert critique | ~$0.58 |
+| Takeaway | Synthesis prose | ~$0.06 |
+| Slide classifier | Filters frames to real slides | ~$0.01 |
+| **Total** | | **~$0.84** |
 
-`yt2md doctor` checks all of these and prints a punch list with fix hints.
+Subscription users (Claude Code path): no per-call dollars, but each
+generation step counts against your plan's rate limits. The Activity
+page tags those calls as "subscription" instead of a dollar amount.
 
-If you only have Node 18 (old `/usr/local/bin/node`), the doctor and `serve`
-auto-detect newer versions installed via nvm / fnm / asdf / volta and prepend
-them to PATH. yt-dlp marks Node <20 as "unsupported" for the n-challenge.
+Most cost goes to the panel — Opus is expensive but produces the
+deepest critique. You can swap to Sonnet for the panel in Settings if
+you want to cut cost roughly in half.
 
-## How it works
+---
 
-1. **Fetch** — `yt-dlp` downloads mp4 + auto-captions, with cookies passed
-   through from your browser. If captions don't exist (e.g. some non-English
-   videos), [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper)
-   transcribes locally.
-2. **Frame extraction** — `ffmpeg` scene detection + periodic interval sampling
-   (every 20s by default).
-3. **Dedup** — perceptual-hash clustering keeps the *last* frame of each
-   near-identical run, so animated reveals settle on the fully-built diagram
-   instead of a blank slide.
-4. **Topic segmentation** — Claude reads the timestamped transcript and
-   returns 5–12 topic sections (title, summary, key points), anchored to real
-   timestamps.
-5. **Vision-aware frame picking** — for each topic, Claude looks at the
-   candidate frames *and the per-topic transcript slice* and picks the most
-   illustrative one. The transcript context lets it ground picks on phrases
-   like "as you can see here."
-6. **Render** — Markdown digest with `<img>` tags, in either the source
-   language (default — match the transcript) or English.
-7. **(Optional) Discuss with experts** — click the button on any digest and
-   Claude infers 3–5 domain-relevant experts (a neuroscientist for a brain
-   talk, a hardware engineer for a chip-design talk, etc.) and runs a
-   1500–2500-word panel discussion that surfaces what the speaker glossed
-   over, brings contrary readings, and connects to adjacent domains.
+## Where your data lives
 
-## The web UI
+Everything stays on your machine, under `~/yt2md/`:
 
-Once `yt2md serve` is running, the sidebar gives you:
+- `~/yt2md/.env` — your Anthropic credentials
+- `~/yt2md/settings.json` — model preferences, language, cookies setting
+- `~/yt2md/channels.txt` — your subscriptions
+- `~/yt2md/digests/<video-id>/` — per-video artifacts:
+  - `digest.md` — the reading
+  - `panel.md` — the panel discussion
+  - `takeaway.md` — the bottom-line synthesis
+  - `slides.pptx` — the reconstructed deck
+  - `digest_images/` — frames embedded in the markdown
+  - `downloads/` — cached video + transcript (used by regeneration; can
+    be deleted to reclaim space)
+- `~/yt2md/logs/` — job output and the LLM usage log (for the cost audit)
+- `~/yt2md/library.db` — read-state and run history (SQLite)
 
-- **Digests** — every per-video digest, with unread markers
-- **Subscriptions** — manage watched channels
-- **One-off digest** — paste a URL; the digest runs in the background and
-  lands in the sidebar when ready (with live progress on `/one-off` and
-  `/activity`)
-- **Schedule** — polling cadence + "Run now" buttons
-- **Activity** — every completed run with timings, token usage, outcome.
-  Survives server restarts.
-- **Settings** — model choice (digest, panel, Whisper), output language
-  (auto / English), browser to extract YouTube cookies from
+Override the location by setting `YT2MD_DATA=/some/path` before launch.
 
-Each digest page has a top toolbar:
+---
 
-- **Discuss with experts** — generates `panel.md` next to the digest
-- **Delete digest** — wipes the rendered output, frames, and cached video
+## When things go wrong
 
-## Where things live
+- **"Sign in to confirm you're not a bot"** from YouTube. Set the
+  cookies-from-browser option in Settings to whichever browser you're
+  signed into YouTube on. yt-dlp will pass those cookies through.
+- **A video has no captions and Whisper takes forever.** Whisper
+  transcription on the local machine can take 5–10 minutes for a long
+  video. The default model (`medium`) is a balance; pick `small` in
+  Settings if you want faster (slightly less accurate) transcription.
+- **Frame extraction is slow** (5+ minutes on a 25-minute video). This
+  is normal for a slide-heavy talk — ffmpeg has to decode the whole
+  video. The job runs in the background; you can navigate away.
+- **An artifact didn't generate.** The auto-pipeline catches transient
+  failures (rate limits, network blips) and continues with the next
+  step. Open the digest's page; the missing artifact will show a
+  `Generate X` button. One click retries that step in the background.
+- **First run on a new channel doesn't backfill.** Only videos posted
+  *after* you subscribe get digested. Use One-off for videos you want
+  from before you added the channel.
 
-Everything is under `~/yt2md/` (override with `YT2MD_DATA=/path/to/dir`):
+---
 
-- `~/yt2md/.env` — API key + env-style overrides (auto-saved on first run)
-- `~/yt2md/settings.json` — model + language + cookies preferences
-- `~/yt2md/channels.txt` — subscriptions
-- `~/yt2md/state.json` — last-seen video IDs per channel
-- `~/yt2md/schedule.json` — polling interval
-- `~/yt2md/schedule_state.json` — last-run timestamps
-- `~/yt2md/library.db` — read state, run history (SQLite)
-- `~/yt2md/digests/<video-id>/digest.md` — one digest per video
-- `~/yt2md/digests/<video-id>/panel.md` — panel discussion (when generated)
-- `~/yt2md/digests/<video-id>/digest_images/` — frames embedded in the digest
-- `~/yt2md/digests/<video-id>/downloads/` — yt-dlp / Whisper cache
-- `~/yt2md/logs/{poll,oneoff}.log` — job logs
-- `~/yt2md/logs/runs.jsonl` — append-only structured run history
+## What this isn't
 
-## Behavior notes
-
-- **First run on a new channel** seeds state without backfilling — only
-  videos posted *after* you subscribe get digested.
-- **Permanent failures** (members-only / private / deleted videos) are
-  marked seen on first failure so polling stops cycling on them.
-  Transient failures (network, 5xx) keep retrying.
-- **Schedule pauses while serve is down**, then catches up on missed slots
-  the next time you start `yt2md serve`. Trade-off versus launchctl: one
-  fewer execution context to debug, env/PATH match what just worked in your
-  shell.
-- **Why local instead of a cloud runner?** YouTube's "sign in to confirm
-  you're not a bot" wall fires on datacenter IPs, so video downloads need a
-  residential IP. Running on your Mac sidesteps the wall entirely.
-
-## CLI reference
-
-The CLI is small now — `serve` is the primary entry point and the web UI
-covers everything else. The remaining commands:
-
-```bash
-yt2md doctor                          # check prerequisites and config
-yt2md serve                           # local web reader at :7682
-yt2md watch add <CHANNEL_URL>         # subscribe to a channel (or use the web UI)
-yt2md watch list                      # see subscriptions
-yt2md watch remove <CHANNEL_URL>      # unsubscribe
-yt2md watch run                       # poll once now
-yt2md "https://youtu.be/..."          # one-off digest from CLI (or use the web UI)
-```
-
-The single-video flow accepts `--digest-model`, `--whisper-model`,
-`--cookies-from-browser`, `--digest-language`, etc. — most map to settings
-the web UI exposes; check `yt2md --help` for the full list.
-
-## Cost (defaults)
-
-Per 20-min English video, with Sonnet 4.6 + vision: ~$0.16
-- Digest pass: ~$0.05 (~9k input + ~2k output)
-- Vision frame-picking: ~$0.11 (~30 frames as input)
-
-Per panel discussion (Opus 4.7, on demand only): ~$0.30 — one click cost.
-Pick `--digest-language=en` if you want English output for non-English
-videos (slightly cheaper than Whisper-then-translate-yourself).
-
-## Project layout
-
-```
-youtube_to_markdown.py    main script (CLI + web app + scheduler)
-setup.sh                  one-shot onboarding (checks ffmpeg, installs uv, syncs deps)
-pyproject.toml            project metadata + Python dependencies
-uv.lock                   pinned resolution
-.python-version           pinned Python version for uv
-README.md                 this file
-```
+- **It's not a chat tool.** The reading-and-distillation pipeline is the
+  product. If you want to ask follow-up questions, the "Continue in
+  chat" button hands you off to claude.ai — yt2md doesn't try to
+  duplicate Claude.
+- **It's not a cloud service.** You install it locally because YouTube
+  blocks datacenter IPs from downloading videos. Side benefit: your
+  reading library never leaves your Mac.
+- **It's not for live videos.** Streams have to be finalized for
+  yt-dlp to pull them.
