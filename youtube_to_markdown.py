@@ -98,6 +98,89 @@ def extract_interval_frames(video: Path, out_dir: Path, interval: float, duratio
     return list(zip(frame_files, timestamps))
 
 
+def extract_scene_and_interval_frames(
+    video: Path,
+    scene_dir: Path,
+    interval_dir: Path,
+    scene_threshold: float,
+    interval: float,
+    duration: float,
+) -> Tuple[List[Tuple[Path, float]], List[Tuple[Path, float]]]:
+    """Single-pass replacement for the parallel scene+interval pair. Uses
+    ffmpeg's `filter_complex` with `split` to fan the decoded video into
+    two filter chains and produce both frame sets from ONE decode of the
+    source MP4.
+
+    Why this matters: the previous design ran two ffmpeg subprocesses in
+    a thread pool, each doing its own full decode of the input. On a slide-
+    heavy talk that meant 2× the I/O + CPU contending on the same file —
+    typical wall time was ~5–7 minutes for a 25-minute video. Folding both
+    extractions into one decode roughly halves that.
+    """
+    scene_dir.mkdir(parents=True, exist_ok=True)
+    interval_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build the filter graph. The `split=2` filter duplicates the decoded
+    # video into two virtual streams; each chain then does its own thing.
+    # `showinfo` writes per-frame metadata to stderr — we parse `pts_time`
+    # from there to get scene timestamps.
+    fps = 1.0 / interval if interval > 0 else 0.0
+    if fps > 0:
+        filter_complex = (
+            "[0:v]split=2[s][i];"
+            f"[s]select='eq(n,0)+gt(scene,{scene_threshold})',showinfo[scene_out];"
+            f"[i]fps={fps}[interval_out]"
+        )
+        cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-i", str(video),
+            "-filter_complex", filter_complex,
+            "-fps_mode", "vfr", "-q:v", "3",
+            "-map", "[scene_out]", str(scene_dir / "scene_%04d.jpg"),
+            "-q:v", "3",
+            "-map", "[interval_out]", str(interval_dir / "interval_%04d.jpg"),
+        ]
+    else:
+        # Interval sampling disabled — single chain for scene only.
+        cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-i", str(video),
+            "-vf", f"select='eq(n,0)+gt(scene,{scene_threshold})',showinfo",
+            "-fps_mode", "vfr", "-q:v", "3",
+            str(scene_dir / "scene_%04d.jpg"),
+        ]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg single-pass extraction failed:\n{proc.stderr}")
+
+    # Scene timestamps come from showinfo's pts_time in stderr.
+    scene_ts = [float(m) for m in re.findall(r"pts_time:([\d.]+)", proc.stderr)]
+    scene_files = sorted(scene_dir.glob("scene_*.jpg"))
+    if len(scene_files) != len(scene_ts):
+        n = min(len(scene_files), len(scene_ts))
+        scene_files, scene_ts = scene_files[:n], scene_ts[:n]
+    if len(scene_files) > SCENE_FRAME_HARD_CAP:
+        step = len(scene_files) / SCENE_FRAME_HARD_CAP
+        keep = [int(i * step) for i in range(SCENE_FRAME_HARD_CAP)]
+        scene_files = [scene_files[i] for i in keep]
+        scene_ts = [scene_ts[i] for i in keep]
+    scene_frames = list(zip(scene_files, scene_ts))
+
+    # Interval timestamps reconstructed from frame index (ffmpeg's fps filter
+    # places frame i at t = interval * (i + 0.5)).
+    if fps > 0:
+        interval_files = sorted(interval_dir.glob("interval_*.jpg"))
+        interval_ts = [
+            min(duration, interval * (i + 0.5)) for i in range(len(interval_files))
+        ]
+        interval_frames = list(zip(interval_files, interval_ts))
+    else:
+        interval_frames = []
+
+    return scene_frames, interval_frames
+
+
 def merge_frames(*frame_lists: List[Tuple[Path, float]]) -> List[Tuple[Path, float]]:
     """Merge multiple frame lists, sort by timestamp."""
     combined: List[Tuple[Path, float]] = []
@@ -5549,7 +5632,6 @@ def cmd_serve(args) -> int:
         catch and surface the error. Idempotent: writes slides.pptx atomically
         via a temp suffix swap so a partial write doesn't leave a corrupt file.
         """
-        from concurrent.futures import ThreadPoolExecutor
         cache_dir = digests_dir / video_id / "downloads" / video_id
         if not cache_dir.exists():
             raise RuntimeError("No cached video. Re-digest the video first.")
@@ -5565,15 +5647,10 @@ def cmd_serve(args) -> int:
         interval_dir = workdir / "interval"
         try:
             duration = get_video_duration(mp4_path)
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                scene_fut = pool.submit(
-                    extract_scene_frames, mp4_path, scene_dir, 0.2,
-                )
-                interval_fut = pool.submit(
-                    extract_interval_frames, mp4_path, interval_dir, 20.0, duration,
-                )
-                scene_frames = scene_fut.result()
-                interval_frames = interval_fut.result()
+            scene_frames, interval_frames = extract_scene_and_interval_frames(
+                mp4_path, scene_dir, interval_dir,
+                scene_threshold=0.2, interval=20.0, duration=duration,
+            )
             frames = merge_frames(scene_frames, interval_frames)
             frames = dedupe_frames(frames, 4)
             # Slide-aware filtering: global pHash cluster (talk-deck pattern)
@@ -6021,27 +6098,19 @@ def main():
     try:
         duration = get_video_duration(video_path)
 
-        # Run scene detection and interval sampling concurrently — each is
-        # an independent ffmpeg pass that decodes the full video, so doing
-        # them in parallel cuts wall time roughly in half on slide-heavy
-        # talks where scene detection is the slow leg. Each subprocess gets
-        # its own ffmpeg process; CPU contention is real but small.
-        from concurrent.futures import ThreadPoolExecutor
+        # Single-pass extraction: scene detection + interval sampling share
+        # one ffmpeg decode via filter_complex split. Cuts wall time roughly
+        # in half on slide-heavy talks vs. running two parallel ffmpegs that
+        # both decode the same MP4 and contend for CPU + disk read bandwidth.
         print(f"[1/5] Extracting frames "
               f"(scene threshold={args.scene_threshold}, interval={args.interval}s, "
-              f"in parallel)...")
+              f"single-pass)...")
         _frames_t0 = _time.monotonic()
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            scene_fut = pool.submit(
-                extract_scene_frames, video_path, scene_dir, args.scene_threshold,
-            )
-            interval_fut = pool.submit(
-                extract_interval_frames, video_path, interval_dir, args.interval, duration,
-            )
-            _scene_t0 = _time.monotonic()
-            scene_frames = scene_fut.result()
-            scene_secs = _time.monotonic() - _scene_t0
-            interval_frames = interval_fut.result()
+        scene_frames, interval_frames = extract_scene_and_interval_frames(
+            video_path, scene_dir, interval_dir,
+            scene_threshold=args.scene_threshold,
+            interval=args.interval, duration=duration,
+        )
         timings["frames_extract"] = round(_time.monotonic() - _frames_t0, 3)
         frames = merge_frames(scene_frames, interval_frames)
         cap_note = (
