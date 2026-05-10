@@ -47,47 +47,36 @@ markdown. The only thing that leaves is the prompts sent to Claude.
 
 ---
 
-## Before you start
-
-You need a Mac (Linux probably works but isn't tested) and three things:
-
-1. **Homebrew + ffmpeg.** Install Homebrew from
-   [brew.sh](https://brew.sh), then `brew install ffmpeg`. ffmpeg does the
-   heavy local work — extracting frames from videos, building decks.
-2. **Node.js 20+.** `brew install node`. yt-dlp needs it to handle
-   YouTube's anti-bot challenge.
-3. **A Claude account.** You have two paths here:
-   - **API key (simpler, pay-per-call):** Sign in to
-     [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys),
-     add a payment method, create a key. Typical cost ~$0.20 per 25-min
-     video.
-   - **Claude.ai subscription via Claude Code:** If you have a Pro or Max
-     plan, yt2md can drive a sandboxed copy of Claude Code on your Mac
-     instead. No per-call billing — usage counts against your plan's
-     limits. The first-run setup page has an "Install Claude Code" button
-     that handles the install for you.
-
-You don't need to pick now — the app's `/setup` page walks you through
-both paths.
-
----
-
 ## Get it running
 
+You need a Mac with [Homebrew](https://brew.sh) installed. Then one
+command:
+
 ```bash
-git clone https://github.com/jyouturner/youtube-to-markdown
-cd youtube-to-markdown
-./run.sh
+curl -fsSL https://raw.githubusercontent.com/jyouturner/youtube-to-markdown/main/install.sh | bash
 ```
 
-That's it. `run.sh` checks ffmpeg, installs `uv` (a Python package
-manager) if needed, syncs dependencies, and opens
-[http://localhost:7682](http://localhost:7682) in your browser. Re-run it
-any time to start the app again.
+The installer brew-installs `ffmpeg`, `node`, and `uv` if you don't
+already have them, then installs `yt2md` itself. Re-run it any time to
+upgrade. ([See what it does before running it.](install.sh))
 
-The first time you open the app, it'll send you to a setup page to
-configure auth (API key or Claude.ai subscription). Once that's done
-you're good.
+Then start the app:
+
+```bash
+yt2md serve
+```
+
+That opens [http://localhost:7682](http://localhost:7682) in your
+browser. The first time you load it, you'll land on a setup page to
+configure auth — pick one of:
+
+- **API key (simpler, pay-per-call).** Sign in to
+  [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys),
+  add a payment method, paste the key. Typical cost ~$0.20 per 25-min
+  video.
+- **Claude.ai Pro/Max via Claude Code.** Click "Install Claude Code"
+  and yt2md sets up a sandboxed copy on your Mac. No per-call billing —
+  usage counts against your plan's rate limits.
 
 ---
 
@@ -206,3 +195,21 @@ Override the location by setting `YT2MD_DATA=/some/path` before launch.
   reading library never leaves your Mac.
 - **It's not for live videos.** Streams have to be finalized for
   yt-dlp to pull them.
+
+---
+
+## Build from source (developers)
+
+If you want to modify the source instead of just running yt2md:
+
+```bash
+git clone https://github.com/jyouturner/youtube-to-markdown
+cd youtube-to-markdown
+./run.sh
+```
+
+`run.sh` checks ffmpeg, installs uv if missing, syncs dependencies, and
+launches the reader from the local checkout. Edits to
+`youtube_to_markdown.py` are picked up on the next `./run.sh`.
+
+Uninstall the curl-bash install with `uv tool uninstall youtube-to-markdown`.
