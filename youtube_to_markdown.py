@@ -3442,43 +3442,47 @@ def local_job_status(key: str) -> dict:
 
 
 # Job-status polling JS shared by any toolbar element with
-# data-poll-url=<url> — polls every 2s, updates a `.elapsed` child with
-# "{n}s", and reloads the page when the artifact appears (on success) or
-# surfaces the error inline (on failure).
+# data-poll-url=<url> — polls every 2s per element, updates a `.elapsed`
+# child with "{n}s", and reloads the page when the artifact appears (on
+# success) or surfaces the error inline (on failure). Handles multiple
+# concurrent jobs (e.g. panel + slides running for the same digest) by
+# giving each [data-poll-url] element its own poll loop.
 _JOB_POLL_JS = """
 <script>
 (function () {
-  const el = document.querySelector('[data-poll-url]');
-  if (!el) return;
-  const url = el.getAttribute('data-poll-url');
-  const elapsedSpan = el.querySelector('.elapsed');
-  let timer = null;
-  async function tick() {
-    try {
-      const res = await fetch(url);
-      if (!res.ok) return;
-      const s = await res.json();
-      if (s.phase === 'running') {
-        if (elapsedSpan) elapsedSpan.textContent = s.elapsed + 's';
-        return;
-      }
-      if (timer) { clearInterval(timer); timer = null; }
-      if (s.phase === 'done' && s.artifact_exists) {
-        // Reload so the toolbar swaps to "Download slides".
-        window.location.href = window.location.pathname + '?msg=Slides+ready.';
-        return;
-      }
-      if (s.phase === 'error') {
-        el.innerHTML = '<span style="color: #c00;">Generation failed: ' +
-          (s.error || '(unknown error)') + '</span>';
-        return;
-      }
-      // Done but artifact missing — likely a write race. Reload anyway.
-      window.location.reload();
-    } catch (e) { /* network blip — try next tick */ }
-  }
-  tick();
-  timer = setInterval(tick, 2000);
+  const els = document.querySelectorAll('[data-poll-url]');
+  if (els.length === 0) return;
+  els.forEach((el) => {
+    const url = el.getAttribute('data-poll-url');
+    const elapsedSpan = el.querySelector('.elapsed');
+    let timer = null;
+    async function tick() {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const s = await res.json();
+        if (s.phase === 'running') {
+          if (elapsedSpan) elapsedSpan.textContent = s.elapsed + 's';
+          return;
+        }
+        if (timer) { clearInterval(timer); timer = null; }
+        if (s.phase === 'done' && s.artifact_exists) {
+          // Reload so the toolbar swaps to "View X" / "Download X".
+          window.location.reload();
+          return;
+        }
+        if (s.phase === 'error') {
+          el.innerHTML = '<span style="color: #c00;">Generation failed: ' +
+            (s.error || '(unknown error)') + '</span>';
+          return;
+        }
+        // Done but artifact missing — likely a write race. Reload anyway.
+        window.location.reload();
+      } catch (e) { /* network blip — try next tick */ }
+    }
+    tick();
+    timer = setInterval(tick, 2000);
+  });
 })();
 </script>
 """
@@ -4000,11 +4004,23 @@ def _viewer_nav(
     takeaway_md = digests_dir / video_id / "takeaway.md"
     panel_md = digests_dir / video_id / "panel.md"
     slides_path = digests_dir / video_id / "slides.pptx"
+    panel_job = local_job_status(f"{video_id}:panel")
+    takeaway_job = local_job_status(f"{video_id}:takeaway")
     slides_job = local_job_status(f"{video_id}:slides")
-    slides_running = slides_job.get("phase") == "running"
 
     def cls(view: str) -> str:
         return "discuss-btn" if view == current_view else "discuss-btn-secondary"
+
+    def running_placeholder(label: str, kind: str, elapsed: int) -> str:
+        """Inline placeholder shown while a background job is in flight.
+        The data-poll-url drives _JOB_POLL_JS which updates `.elapsed` and
+        reloads the page when the artifact appears."""
+        return (
+            "<span class='discuss-btn-secondary' style='cursor: default;' "
+            f"data-poll-url='/digests/{h(video_id)}/job-status?kind={kind}'>"
+            f"Generating {label}… <span class='elapsed'>{elapsed}s</span>"
+            "</span>"
+        )
 
     parts: List[str] = ["<div class='digest-actions digest-toolbar'>"]
 
@@ -4015,47 +4031,48 @@ def _viewer_nav(
         f"href='/digests/{h(video_id)}/'>View digest</a>"
     )
 
-    # Panel — view link when present, generate button when missing.
+    # Panel — view link / running placeholder / generate button.
     if panel_md.exists():
         parts.append(
             f"<a class='{cls('panel')}' style='text-decoration:none;' "
             f"href='/digests/{h(video_id)}/panel/'>View panel discussion</a>"
         )
+    elif panel_job.get("phase") == "running":
+        parts.append(running_placeholder(
+            "panel", "panel", panel_job.get("elapsed", 0),
+        ))
     else:
-        submit_js = (
-            "this.querySelector('button').disabled=true;"
-            "this.querySelector('button').textContent='Generating panel… (~60–120s)';"
-        )
         parts.append(
             f"<form method='post' action='/digests/{h(video_id)}/discuss' "
-            f"style='display:inline;' onsubmit=\"{submit_js}\">"
+            f"style='display:inline;'>"
             "<button type='submit' class='discuss-btn-secondary' "
             "title='Generates a panel-of-experts discussion "
-            "(~60–120s, one Opus call)'>"
+            "(~60–120s, one Opus call). Runs in the background; the page "
+            "will refresh when ready.'>"
             "Generate panel</button></form>"
         )
 
-    # Takeaway — view link or generate button.
+    # Takeaway — view link / running placeholder / generate button.
     if takeaway_md.exists():
         parts.append(
             f"<a class='{cls('takeaway')}' style='text-decoration:none;' "
             f"href='/digests/{h(video_id)}/takeaway/'>View takeaway</a>"
         )
+    elif takeaway_job.get("phase") == "running":
+        parts.append(running_placeholder(
+            "takeaway", "takeaway", takeaway_job.get("elapsed", 0),
+        ))
     else:
-        submit_js = (
-            "this.querySelector('button').disabled=true;"
-            "this.querySelector('button').textContent='Generating takeaway… (~30s)';"
-        )
         parts.append(
             f"<form method='post' action='/digests/{h(video_id)}/takeaway' "
-            f"style='display:inline;' onsubmit=\"{submit_js}\">"
+            f"style='display:inline;'>"
             "<button type='submit' class='discuss-btn-secondary' "
-            "title='Writes a 1–3 paragraph takeaway and saves it to takeaway.md'>"
+            "title='Writes a 1–3 paragraph takeaway (~30s, one Sonnet call). "
+            "Runs in the background; the page will refresh when ready.'>"
             "Generate takeaway</button></form>"
         )
 
-    # Slides — download link, running indicator, or generate button. Async
-    # via the existing _local_jobs mechanism.
+    # Slides — download link / running placeholder / generate button.
     if slides_path.exists():
         parts.append(
             f"<a class='discuss-btn-secondary' style='text-decoration:none;' "
@@ -4064,14 +4081,10 @@ def _viewer_nav(
             "(one slide per topic, with intelligently-picked frames).'>"
             "Download slides</a>"
         )
-    elif slides_running:
-        elapsed = slides_job.get("elapsed", 0)
-        parts.append(
-            "<span class='discuss-btn-secondary' style='cursor: default;' "
-            f"data-poll-url='/digests/{h(video_id)}/job-status?kind=slides'>"
-            f"Generating slides… <span class='elapsed'>{elapsed}s</span>"
-            "</span>"
-        )
+    elif slides_job.get("phase") == "running":
+        parts.append(running_placeholder(
+            "slides", "slides", slides_job.get("elapsed", 0),
+        ))
     else:
         parts.append(
             f"<form method='post' action='/digests/{h(video_id)}/slides' "
@@ -4085,6 +4098,16 @@ def _viewer_nav(
 
     parts.append("</div>")
     return "".join(parts)
+
+
+def _any_local_job_running(video_id: str) -> bool:
+    """True if any of {panel, takeaway, slides} background job is currently
+    in flight for this video. Drives whether the viewer page injects the
+    polling JS — only emitted when there's actually something to poll."""
+    for kind in ("panel", "takeaway", "slides"):
+        if local_job_status(f"{video_id}:{kind}").get("phase") == "running":
+            return True
+    return False
 
 
 def cmd_serve(args) -> int:
@@ -5428,9 +5451,7 @@ def cmd_serve(args) -> int:
         rendered = _render_markdown(md_source)
 
         nav = _viewer_nav(video_id, "digest", digests_dir)
-        slides_running = (
-            local_job_status(f"{video_id}:slides").get("phase") == "running"
-        )
+        any_running = _any_local_job_running(video_id)
 
         # Bottom-of-page actions: Copy markdown is the canonical "take this
         # elsewhere" affordance for any reader who scrolled to the end.
@@ -5461,7 +5482,7 @@ def cmd_serve(args) -> int:
             "via One-off later.'>Delete digest</button></form></div>"
         )
 
-        poll_js = _JOB_POLL_JS if slides_running else ""
+        poll_js = _JOB_POLL_JS if any_running else ""
         body = (
             nav
             + _COPY_BUTTON_JS
@@ -5474,48 +5495,99 @@ def cmd_serve(args) -> int:
         return page(body, title=video_id, current=f"digest:{video_id}",
                     base_href=f"/digests/{video_id}/")
 
+    def _resolve_cached_srt(video_id: str) -> Tuple[Path, str]:
+        """Locate the cached SRT for a digest and pull the BCP-47 lang from
+        its filename. Used by the panel + takeaway background workers
+        (mirrors what the slides backfill does for the MP4)."""
+        srt_dir = digests_dir / video_id / "downloads" / video_id
+        srt_files = list(srt_dir.glob("*.srt")) if srt_dir.exists() else []
+        if not srt_files:
+            raise RuntimeError(
+                "No cached transcript. Re-digest the video first."
+            )
+        srt_path = srt_files[0]
+        lang = (
+            srt_path.stem[len(video_id) + 1:]
+            if srt_path.stem.startswith(video_id + ".") else "en"
+        )
+        return srt_path, lang
+
+    def _build_panel_for_digest(video_id: str) -> None:
+        """Background worker for panel generation. Atomic write via .tmp →
+        rename so the polling UI never sees a half-written file as ready."""
+        digest_md = digests_dir / video_id / "digest.md"
+        if not digest_md.exists():
+            raise RuntimeError("digest.md missing — re-digest first.")
+        srt_path, lang = _resolve_cached_srt(video_id)
+        s = load_settings()
+        backend = select_backend()
+        panel_model = s.get("panel_model") or DEFAULT_PANEL_MODEL
+        segments = parse_srt(srt_path)
+        text, p_usage = generate_panel_discussion(
+            digest_md.read_text(), segments,
+            model=panel_model, source_lang=lang,
+            output_language=s.get("digest_language") or "auto",
+            backend=backend,
+        )
+        record_llm_usage(
+            video_id=video_id, kind="panel", model=panel_model,
+            backend_name=backend.name, usage=p_usage,
+        )
+        panel_path = digests_dir / video_id / "panel.md"
+        tmp_out = panel_path.with_suffix(".md.tmp")
+        tmp_out.write_text(text)
+        tmp_out.replace(panel_path)
+
+    def _build_takeaway_for_digest(video_id: str) -> None:
+        """Background worker for takeaway generation. Atomic write."""
+        digest_md = digests_dir / video_id / "digest.md"
+        if not digest_md.exists():
+            raise RuntimeError("digest.md missing — re-digest first.")
+        srt_path, lang = _resolve_cached_srt(video_id)
+        # Use the existing panel.md (if any) so the takeaway can weave its
+        # critique in. Otherwise the prompt copes without it.
+        panel_md_path = digests_dir / video_id / "panel.md"
+        panel_text = panel_md_path.read_text() if panel_md_path.exists() else None
+        s = load_settings()
+        backend = select_backend()
+        takeaway_model = (os.environ.get("YT2MD_TAKEAWAY_MODEL")
+                          or DEFAULT_TAKEAWAY_MODEL)
+        segments = parse_srt(srt_path)
+        takeaway_text, t_usage = generate_takeaway(
+            digest_md.read_text(), panel_text, segments,
+            model=takeaway_model,
+            publish_date=None,
+            source_lang=lang,
+            output_language=s.get("digest_language") or "auto",
+            backend=backend,
+        )
+        record_llm_usage(
+            video_id=video_id, kind="takeaway", model=takeaway_model,
+            backend_name=backend.name, usage=t_usage,
+        )
+        body = render_takeaway_markdown(
+            takeaway_text,
+            video_url=f"https://www.youtube.com/watch?v={video_id}",
+        )
+        takeaway_path = digests_dir / video_id / "takeaway.md"
+        tmp_out = takeaway_path.with_suffix(".md.tmp")
+        tmp_out.write_text(body)
+        tmp_out.replace(takeaway_path)
+
     @app.route("/digests/<video_id>/discuss", methods=["POST"])
-    def generate_panel(video_id):
+    def generate_panel_route(video_id):
         from flask import redirect
         gate = _require_llm_or_redirect()
         if gate is not None:
             return gate
-        digest_md = digests_dir / video_id / "digest.md"
-        if not digest_md.exists():
+        if not (digests_dir / video_id / "digest.md").exists():
             abort(404)
-        # Find the cached SRT to feed into the panel prompt. The download dir
-        # holds whichever language track was picked (en / zh-Hans / etc.).
-        srt_dir = digests_dir / video_id / "downloads" / video_id
-        srt_files = list(srt_dir.glob("*.srt")) if srt_dir.exists() else []
-        if not srt_files:
-            return redirect(
-                f"/digests/{video_id}/?msg=No+cached+transcript.+Re-digest+the+video+first."
-            )
-        # Filename pattern: <video_id>.<lang>.srt — pull the lang back out so
-        # the panel can be written in the same language as the digest.
-        srt_path = srt_files[0]
-        lang = srt_path.stem[len(video_id) + 1:] if srt_path.stem.startswith(video_id + ".") else "en"
-        s = load_settings()
-        try:
-            segments = parse_srt(srt_path)
-            backend = select_backend()
-            panel_model = s.get("panel_model") or DEFAULT_PANEL_MODEL
-            text, p_usage = generate_panel_discussion(
-                digest_md.read_text(),
-                segments,
-                model=panel_model,
-                source_lang=lang,
-                output_language=s.get("digest_language") or "auto",
-                backend=backend,
-            )
-            record_llm_usage(
-                video_id=video_id, kind="panel", model=panel_model,
-                backend_name=backend.name, usage=p_usage,
-            )
-        except Exception as e:
-            return redirect(f"/digests/{video_id}/?msg=Panel+generation+failed:+{e}")
-        (digests_dir / video_id / "panel.md").write_text(text)
-        return redirect(f"/digests/{video_id}/panel/")
+        if (digests_dir / video_id / "panel.md").exists():
+            return redirect(f"/digests/{video_id}/?msg=Panel+already+exists.")
+        # Spawn in the background; the digest viewer's running-state
+        # placeholder polls /job-status?kind=panel and reloads when done.
+        start_local_job(f"{video_id}:panel", _build_panel_for_digest, video_id)
+        return redirect(f"/digests/{video_id}/")
 
     @app.route("/digests/<video_id>/takeaway", methods=["POST"])
     def generate_takeaway_route(video_id):
@@ -5523,58 +5595,14 @@ def cmd_serve(args) -> int:
         gate = _require_llm_or_redirect()
         if gate is not None:
             return gate
-        digest_md = digests_dir / video_id / "digest.md"
-        if not digest_md.exists():
+        if not (digests_dir / video_id / "digest.md").exists():
             abort(404)
-        # Look up the cached SRT (same convention as the panel route).
-        srt_dir = digests_dir / video_id / "downloads" / video_id
-        srt_files = list(srt_dir.glob("*.srt")) if srt_dir.exists() else []
-        if not srt_files:
-            return redirect(
-                f"/digests/{video_id}/?msg=No+cached+transcript.+Re-digest+the+video+first."
-            )
-        srt_path = srt_files[0]
-        lang = (
-            srt_path.stem[len(video_id) + 1:]
-            if srt_path.stem.startswith(video_id + ".") else "en"
+        if (digests_dir / video_id / "takeaway.md").exists():
+            return redirect(f"/digests/{video_id}/?msg=Takeaway+already+exists.")
+        start_local_job(
+            f"{video_id}:takeaway", _build_takeaway_for_digest, video_id,
         )
-        # Pull the panel text if it exists so the takeaway can weave its
-        # critique into the synthesis; otherwise pass None and the prompt
-        # copes.
-        panel_md_path = digests_dir / video_id / "panel.md"
-        panel_text = panel_md_path.read_text() if panel_md_path.exists() else None
-        # We don't track the publish_date in saved metadata; pass None and
-        # the takeaway will simply omit the "as of <date>" anchor.
-        s = load_settings()
-        try:
-            segments = parse_srt(srt_path)
-            backend = select_backend()
-            takeaway_model = (os.environ.get("YT2MD_TAKEAWAY_MODEL")
-                              or DEFAULT_TAKEAWAY_MODEL)
-            takeaway_text, t_usage = generate_takeaway(
-                digest_md.read_text(), panel_text, segments,
-                model=takeaway_model,
-                publish_date=None,
-                source_lang=lang,
-                output_language=s.get("digest_language") or "auto",
-                backend=backend,
-            )
-            record_llm_usage(
-                video_id=video_id, kind="takeaway", model=takeaway_model,
-                backend_name=backend.name, usage=t_usage,
-            )
-            body = render_takeaway_markdown(
-                takeaway_text,
-                video_url=f"https://www.youtube.com/watch?v={video_id}",
-            )
-            (digests_dir / video_id / "takeaway.md").write_text(body)
-        except Exception as e:
-            return redirect(
-                f"/digests/{video_id}/?msg=Takeaway+failed:+{type(e).__name__}:+{e}"
-            )
-        # Drop the user straight into the takeaway — that's what they
-        # clicked Generate to read.
-        return redirect(f"/digests/{video_id}/takeaway/")
+        return redirect(f"/digests/{video_id}/")
 
     @app.route("/digests/<video_id>/takeaway/")
     def view_takeaway(video_id):
@@ -5589,6 +5617,7 @@ def cmd_serve(args) -> int:
         # whichever artifacts exist (digest + panel + takeaway).
         chat_prompt = build_chat_handoff_prompt(video_id, digests_dir)
         nav = _viewer_nav(video_id, "takeaway", digests_dir)
+        any_running = _any_local_job_running(video_id)
         # Bottom-of-page actions: Copy markdown for the takeaway itself,
         # plus Continue in chat (only on takeaway — that's the natural
         # "I want to ask a follow-up" endpoint after reading the synthesis).
@@ -5611,8 +5640,9 @@ def cmd_serve(args) -> int:
             f"<textarea id='chat-handoff-source' hidden aria-hidden='true'>"
             f"{h(chat_prompt)}</textarea>"
         )
+        poll_js = _JOB_POLL_JS if any_running else ""
         body = (
-            nav + _COPY_BUTTON_JS
+            nav + _COPY_BUTTON_JS + poll_js
             + "<hr style='margin: 16px 0 32px; border: none; "
             "border-top: 1px solid var(--border);'>"
             + rendered + bottom_actions
@@ -5630,6 +5660,7 @@ def cmd_serve(args) -> int:
         md_source = panel_md.read_text()
         rendered = _render_markdown(md_source)
         nav = _viewer_nav(video_id, "panel", digests_dir)
+        any_running = _any_local_job_running(video_id)
         bottom_actions = (
             "<hr style='margin: 32px 0 16px; border: none; "
             "border-top: 1px solid var(--border);'>"
@@ -5641,8 +5672,9 @@ def cmd_serve(args) -> int:
             f"<textarea id='page-md-source' hidden aria-hidden='true'>"
             f"{h(md_source)}</textarea>"
         )
+        poll_js = _JOB_POLL_JS if any_running else ""
         body = (
-            nav + _COPY_BUTTON_JS
+            nav + _COPY_BUTTON_JS + poll_js
             + "<hr style='margin: 16px 0 32px; border: none; "
             "border-top: 1px solid var(--border);'>"
             + rendered + bottom_actions
@@ -5765,10 +5797,14 @@ def cmd_serve(args) -> int:
         snap = local_job_status(f"{video_id}:{kind}")
         # Surface artifact presence so the polling UI can decide whether to
         # reload to the success state or show "missing" after a clean exit.
-        if kind == "slides":
-            snap["artifact_exists"] = (
-                (digests_dir / video_id / "slides.pptx").exists()
-            )
+        artifact_paths = {
+            "slides": digests_dir / video_id / "slides.pptx",
+            "panel": digests_dir / video_id / "panel.md",
+            "takeaway": digests_dir / video_id / "takeaway.md",
+        }
+        target = artifact_paths.get(kind)
+        if target is not None:
+            snap["artifact_exists"] = target.exists()
         return jsonify(snap)
 
     @app.errorhandler(404)
