@@ -3586,10 +3586,29 @@ aside {
   width: 320px;
   flex-shrink: 0;
   height: 100vh;
-  overflow-y: auto;
+  /* Flex column so the Manage nav can stay pinned at the bottom while the
+     Digests list grows + scrolls within its own pane. Without this, a
+     long library pushes Manage below the viewport fold. */
+  display: flex;
+  flex-direction: column;
   padding: 20px 16px;
   background: var(--sidebar-bg);
   border-right: 1px solid var(--border);
+}
+aside .sidebar-header { flex: 0 0 auto; }
+aside nav[aria-label="Per-video digests"] {
+  flex: 1 1 auto;
+  /* min-height: 0 lets a flex child shrink below its intrinsic content
+     size — required for overflow-y: auto to actually scroll inside the
+     flex column instead of forcing the whole sidebar taller. */
+  min-height: 0;
+  overflow-y: auto;
+}
+aside nav[aria-label="Manage"] {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border);
+  margin-top: 12px;
+  padding-top: 12px;
 }
 aside h1 { margin: 0 0 16px; font-size: 18px; }
 aside h1 a { color: var(--fg); text-decoration: none; }
@@ -3852,7 +3871,9 @@ details[open] summary { margin-bottom: 8px; }
 }
 .theme-toggle:hover { border-color: var(--accent); }
 
-/* Mobile: stack sidebar above main, slimmer padding */
+/* Mobile: stack sidebar above main, slimmer padding. The flex-column
+   layout still applies — header at top, scrollable digests in the
+   middle of the constrained 40vh, manage pinned at the bottom. */
 @media (max-width: 720px) {
   body { flex-direction: column; }
   aside { width: 100%; height: auto; max-height: 40vh; border-right: none; border-bottom: 1px solid var(--border); }
