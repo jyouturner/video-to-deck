@@ -232,23 +232,32 @@ def dedupe_frames(frames: List[Tuple[Path, float]], hash_distance: int = 4) -> L
 
 def global_phash_cluster(
     frames: List[Tuple[Path, float]],
-    distance: int = 6,
+    distance: int = 4,
+    time_window_secs: float = 90.0,
 ) -> List[Tuple[Path, float]]:
-    """Drop frames whose perceptual hash is close to ANY earlier kept frame.
+    """Drop frames whose pHash is close to an earlier kept frame WITHIN a
+    bounded time window.
 
-    Consecutive dedup (dedupe_frames) merges runs of similar adjacent frames
-    but doesn't catch the talk-deck pattern where the camera cuts speaker→
-    slide→speaker→same-slide. Each return to the slide creates a new
-    consecutive cluster, so we end up with N copies of the same slide.
+    Consecutive dedup (dedupe_frames) catches near-identical adjacent
+    frames but misses the talk-deck pattern where the camera cuts
+    speaker → slide → speaker → SAME slide: the speaker cuts break the
+    consecutive-similarity chain so each return to the slide opens a new
+    cluster, and we end up with N copies.
 
-    This is an O(N²) pass that compares each new frame against every
-    previously-kept hash. N is small after consecutive dedup (typically
-    <200), so the cost is negligible. The chronologically-first occurrence
-    of a slide is kept; later returns are dropped.
+    The time-window matters: pHash compares low-frequency components,
+    which is fine for "same slide that just came back" but routinely
+    false-positives on template-similar slides from anywhere in the talk
+    (e.g. two different slides that share the same title-bar + two-card
+    layout). Without the window, a slide at 21:10 can be falsely merged
+    with a different-content-but-same-template slide from 14:12. Bounding
+    the comparison to ~90s keeps the "speaker-cut returns to same slide"
+    case (happens within ~30s) while preserving distinct slides that
+    happen to share a visual template.
 
-    The default distance (6) is looser than dedupe_frames' default (4) —
-    we want to merge "same slide with speaker overlay in the corner" or
-    "same chart at 480p vs 720p", which can drift past 4 in pHash space.
+    The default distance (4) matches the consecutive threshold — we only
+    drop frames that look genuinely identical, not just structurally
+    similar. The vision-LLM classifier downstream catches anything that
+    slips through.
     """
     if not frames:
         return []
@@ -256,14 +265,24 @@ def global_phash_cluster(
     from PIL import Image
 
     kept: List[Tuple[Path, float]] = []
-    kept_hashes: List["imagehash.ImageHash"] = []
+    kept_hashes: List[Tuple["imagehash.ImageHash", float]] = []
     for path, ts in frames:
         with Image.open(path) as im:
             h = imagehash.phash(im)
-        if any((h - kh) <= distance for kh in kept_hashes):
-            continue
-        kept.append((path, ts))
-        kept_hashes.append(h)
+        drop = False
+        # Iterate kept frames in reverse — most matches are recent, so
+        # we exit early. Also lets us bail as soon as we see a kept frame
+        # older than the time window (since the list is in chronological
+        # order, anything older would also fail the time check).
+        for kh, kts in reversed(kept_hashes):
+            if (ts - kts) > time_window_secs:
+                break
+            if (h - kh) <= distance:
+                drop = True
+                break
+        if not drop:
+            kept.append((path, ts))
+            kept_hashes.append((h, ts))
     return kept
 
 
@@ -5940,7 +5959,7 @@ def cmd_serve(args) -> int:
             # Slide-aware filtering: global pHash cluster (talk-deck pattern)
             # then optional vision-LLM classifier via 3×3 grids. Same logic
             # as the CLI auto-pipeline path.
-            deck_frames = global_phash_cluster(frames, distance=6)
+            deck_frames = global_phash_cluster(frames)
             settings = load_settings()
             if (settings.get("slide_classification", True)
                     and len(deck_frames) > _GRID_CELLS):
@@ -6445,7 +6464,7 @@ def main():
             # to actual deck slides only. The digest's vision-pick step
             # still uses the richer `frames` pool — the two consumers want
             # different shapes of the same data.
-            deck_frames = global_phash_cluster(frames, distance=6)
+            deck_frames = global_phash_cluster(frames)
             print(f"      slides: {len(frames)} candidates → "
                   f"{len(deck_frames)} after global pHash dedup")
             settings = load_settings()
