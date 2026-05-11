@@ -20,3 +20,8 @@ frames_*/
 *.pptx
 *.mp4
 *.srt
+
+# ...but DO commit curated test fixtures. tests/compare_slides.py needs
+# a stable reference deck on disk; the negation re-includes that one
+# location after the *.pptx catch-all above.
+!tests/fixtures/*.pptx
