@@ -3819,6 +3819,23 @@ aside .unread-count {
   border-radius: 10px; font-size: 11px; font-weight: 600;
   text-transform: none; letter-spacing: 0; margin-left: 4px;
 }
+/* Banner shown by the sidebar poll JS when the library has changed
+   since the page was rendered (new digest landed via one-off or
+   scheduled poll, or a digest was deleted). Click reloads. */
+#new-digest-banner {
+  display: block;
+  padding: 8px 12px;
+  margin: 12px 0;
+  background: var(--accent);
+  color: white;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  text-align: center;
+  flex: 0 0 auto;
+}
+#new-digest-banner:hover { opacity: 0.9; }
 aside .unread-dot {
   display: inline-block; width: 6px; height: 6px; border-radius: 50%;
   background: var(--unread); margin-right: 6px; vertical-align: middle;
@@ -4055,13 +4072,15 @@ details[open] summary { margin-bottom: 8px; }
 }
 </style>
 </head>
-<body>
+<body data-digests-count="{{ digests_count }}" data-digests-mtime="{{ digests_max_mtime }}">
 <a class="skip-link" href="#main-content">Skip to main content</a>
 <aside>
   <div class="sidebar-header">
     <h1><a href="/">yt2md</a></h1>
     <button class="theme-toggle" type="button" onclick="cycleTheme()" aria-label="Cycle theme: auto / light / dark">🌓</button>
   </div>
+
+  <a id="new-digest-banner" href="" onclick="window.location.reload(); return false;" style="display:none;">✨ New digest — refresh</a>
 
   <nav aria-label="Per-video digests">
   <h2>Digests {% if unread_digest_count %}<span class="unread-count">{{ unread_digest_count }} new</span>{% else %}({{ digests|length }}){% endif %}</h2>
@@ -4115,6 +4134,34 @@ function cycleTheme() {
   applyTheme();
 }
 applyTheme();
+
+// Sidebar freshness check: poll /sidebar-status every 10s to detect
+// new digests landing (auto-pipeline from one-off, scheduled poll, etc.).
+// When the library has drifted, surface a "✨ New digest — refresh"
+// banner above the digest list. Click reloads. We don't auto-reload
+// because the user is usually mid-read; agency over interruption.
+(function () {
+  const banner = document.getElementById('new-digest-banner');
+  if (!banner) return;
+  const initialCount = parseInt(document.body.dataset.digestsCount || '0', 10);
+  const initialMtime = parseFloat(document.body.dataset.digestsMtime || '0');
+  async function check() {
+    try {
+      const res = await fetch('/sidebar-status', { cache: 'no-store' });
+      if (!res.ok) return;
+      const s = await res.json();
+      const newCount = s.digests_count - initialCount;
+      const drifted = (s.max_mtime > initialMtime + 0.5) || (s.digests_count !== initialCount);
+      if (drifted) {
+        banner.textContent = newCount > 0
+          ? `✨ ${newCount} new digest${newCount > 1 ? 's' : ''} — refresh`
+          : '✨ Library updated — refresh';
+        banner.style.display = '';
+      }
+    } catch (e) { /* network blip — next tick */ }
+  }
+  setInterval(check, 10000);
+})();
 </script>
 </body>
 </html>
@@ -4354,6 +4401,12 @@ def cmd_serve(args) -> int:
             )
             body = banner + body
 
+        # Snapshot of library state so the sidebar's poll JS can detect a
+        # new digest landing (auto-pipeline finishing, etc.) without a
+        # manual refresh. We send count + max mtime to the page; the JS
+        # polls /sidebar-status and shows a "new digest" banner if either
+        # value drifts.
+        max_mtime = max((d["mtime"] for d in digests), default=0.0)
         return render_template_string(
             SERVE_PAGE_TEMPLATE,
             body=body,
@@ -4363,6 +4416,8 @@ def cmd_serve(args) -> int:
             digests=digests,
             channel_count=len(read_channels()),
             unread_digest_count=unread_digest_count,
+            digests_count=len(digests),
+            digests_max_mtime=max_mtime,
         )
 
     def _require_llm_or_redirect():
@@ -5260,6 +5315,21 @@ def cmd_serve(args) -> int:
 </script>
 """
         return page(body, title="One-off digest", current="one-off")
+
+    @app.route("/sidebar-status")
+    def sidebar_status():
+        """Lightweight poll target so the sidebar can detect when new digests
+        land — auto-pipeline finish, scheduled poll producing a new digest,
+        manual deletion, etc. Returns just count + max mtime; the page's JS
+        compares to the values it was rendered with and shows a refresh
+        banner if either has drifted.
+        """
+        from flask import jsonify
+        digests = _list_digests(digests_dir)
+        return jsonify({
+            "digests_count": len(digests),
+            "max_mtime": max((d["mtime"] for d in digests), default=0.0),
+        })
 
     @app.route("/one-off/status")
     def one_off_status():
