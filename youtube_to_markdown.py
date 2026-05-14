@@ -5732,6 +5732,18 @@ def cmd_serve(args) -> int:
             "data-copy-target='page-md-source' "
             "title='Copy the markdown source — paste into your notes app, "
             "email, or another LLM'>Copy markdown</button>"
+            # Refresh metadata: re-probe yt-dlp for the current title,
+            # thumbnail, channel info. Useful when a YouTube creator
+            # renames the video after upload (A/B testing titles is
+            # common for data-driven creators).
+            f"<form method='post' action='/digests/{h(video_id)}/refresh-metadata' "
+            "style='display:inline;' "
+            "onsubmit=\"this.querySelector('button').disabled=true;"
+            "this.querySelector('button').textContent='Refreshing…';\">"
+            "<button type='submit' class='discuss-btn-secondary' "
+            "title='Re-probe YouTube and update title, thumbnail, channel "
+            "info. Useful when a creator renames their video after upload.'>"
+            "Refresh metadata</button></form>"
             "</div>"
             f"<textarea id='page-md-source' hidden aria-hidden='true'>"
             f"{h(md_source)}</textarea>"
@@ -5948,6 +5960,118 @@ def cmd_serve(args) -> int:
         return page(body, title=f"Panel · {video_id}",
                     current=f"digest:{video_id}",
                     base_href=f"/digests/{video_id}/panel/")
+
+    @app.route("/digests/<video_id>/refresh-metadata", methods=["POST"])
+    def refresh_metadata_route(video_id):
+        """Re-probe yt-dlp for current title, thumbnail, channel info — and
+        update the digest's H1 + metadata.json + thumbnail files in place.
+        Useful when a YouTube creator renames their video after upload
+        (Nate B Jones, for instance, A/B tests titles regularly). The
+        digest content itself is not regenerated; only the metadata."""
+        from flask import redirect
+        from urllib.parse import quote_plus
+        digest_md = digests_dir / video_id / "digest.md"
+        if not digest_md.exists():
+            abort(404)
+
+        # Probe via yt-dlp with the user's configured cookies (paywalled
+        # videos won't resolve otherwise).
+        try:
+            import yt_dlp
+        except ImportError:
+            return redirect(f"/digests/{video_id}/?msg=yt-dlp+not+available")
+        s = load_settings()
+        cookies = s.get("cookies_from_browser") or os.environ.get(
+            "YT2MD_COOKIES_FROM_BROWSER")
+        # Permissive format selector — yt-dlp validates the requested
+        # format even with skip_download=True, and the default selector
+        # ("bestvideo*+bestaudio") errors on videos with non-standard
+        # streams. Same string fetch_youtube uses on its probe pass.
+        ydl_opts: dict = {
+            "quiet": True, "no_warnings": True, "skip_download": True,
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "ignore_no_formats_error": True,
+        }
+        if cookies:
+            ydl_opts["cookiesfrombrowser"] = (cookies,)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(
+                    f"https://www.youtube.com/watch?v={video_id}",
+                    download=False,
+                )
+        except Exception as e:
+            return redirect(
+                f"/digests/{video_id}/?msg=Refresh+failed:+"
+                f"{quote_plus(str(e)[:200])}"
+            )
+
+        new_title = info.get("title") or video_id
+        new_url = info.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"
+        new_upload = info.get("upload_date")
+        new_thumb_url = info.get("thumbnail")
+        new_channel_id = info.get("channel_id") or info.get("uploader_id") or ""
+        new_channel_name = info.get("channel") or info.get("uploader") or ""
+        new_channel_url = (info.get("channel_url")
+                           or info.get("uploader_url") or "")
+
+        # Update the H1 heading in digest.md in place (preserves the rest
+        # of the file — Watch on YouTube link, topics, slide images).
+        text = digest_md.read_text()
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            if line.startswith("# "):
+                lines[i] = f"# {new_title}"
+                break
+        digest_md.write_text("\n".join(lines))
+
+        # Re-download the video thumbnail if the URL changed (or to
+        # backfill a digest that was generated before thumbnails landed).
+        has_thumb = False
+        if new_thumb_url:
+            has_thumb = download_image(
+                new_thumb_url, digests_dir / video_id / "thumbnail.jpg",
+            )
+
+        # Channel avatar: download if missing for this channel.
+        has_channel_thumb = False
+        if new_channel_id:
+            ch_path = (get_data_dir() / "channel_thumbnails"
+                       / f"{new_channel_id}.jpg")
+            if ch_path.exists():
+                has_channel_thumb = True
+            elif new_channel_url:
+                ch_url = probe_channel_thumbnail_url(
+                    new_channel_url, cookies_from_browser=cookies,
+                )
+                if ch_url:
+                    has_channel_thumb = download_image(ch_url, ch_path)
+
+        # Update metadata.json — merge with existing fields if any.
+        meta_path = digests_dir / video_id / "metadata.json"
+        metadata = {}
+        if meta_path.exists():
+            try:
+                metadata = json.loads(meta_path.read_text())
+            except Exception:
+                pass
+        metadata.update({
+            "video_id": video_id,
+            "title": new_title,
+            "url": new_url,
+            "upload_date": new_upload,
+            "channel_id": new_channel_id or None,
+            "channel_name": new_channel_name or None,
+            "channel_url": new_channel_url or None,
+            "has_thumbnail": has_thumb,
+            "has_channel_thumbnail": has_channel_thumb,
+        })
+        meta_path.write_text(json.dumps(metadata, indent=2) + "\n")
+
+        return redirect(
+            f"/digests/{video_id}/?msg=Metadata+refreshed+(title:+"
+            f"{quote_plus(new_title[:60])})"
+        )
 
     @app.route("/digests/<video_id>/delete", methods=["POST"])
     def delete_digest(video_id):
