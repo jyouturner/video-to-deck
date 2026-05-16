@@ -1418,9 +1418,16 @@ def generate_audio_from_markdown(
         aiff_path = workdir / "out.aiff"
         say_cmd: List[str] = ["say", "-o", str(aiff_path)]
         if voice:
-            say_cmd += ["-v", voice]
+            say_cmd += ["-v", str(voice)]
+        # Accept rate as int or stringy-int; silently fall back to the
+        # system default on anything we can't parse (a malformed value
+        # in the Settings form shouldn't break audio generation).
         if rate is not None:
-            say_cmd += ["-r", str(rate)]
+            try:
+                rate_int = int(str(rate).strip())
+                say_cmd += ["-r", str(rate_int)]
+            except (ValueError, TypeError):
+                pass
         # Pipe text via stdin to dodge argv length limits + shell quoting
         # issues. -f - tells `say` to read text from stdin.
         say_cmd += ["-f", "-"]
@@ -3005,6 +3012,16 @@ DEFAULT_SETTINGS = {
     # cleaner deck. Set False to use pure pHash dedup only.
     "slide_classification": True,
     "slide_classifier_model": "claude-haiku-4-5-20251001",
+    # TTS voice + rate for macOS `say`. Blank → use system default voice,
+    # which is what you want if you've set Siri Voice 1/2/3 as your system
+    # voice in System Settings → Accessibility → Spoken Content (the
+    # best-quality option). Otherwise try "Fiona" or "Samantha" for the
+    # most natural-sounding non-Siri options. `say -v ?` lists all
+    # voices installed on your machine.
+    "tts_voice": "",
+    # Speaking rate in words/min. Blank → system default (≈175 wpm).
+    # Common preferences: 150 for relaxed listening, 200+ to skim faster.
+    "tts_rate": "",
 }
 
 
@@ -5013,6 +5030,40 @@ def cmd_serve(args) -> int:
             '</label>'
         )
 
+        # TTS voice + rate for the 🎧 Listen audio feature on viewer pages.
+        # macOS `say` only — settings still save on other platforms but
+        # won't have any effect there. Blank → system defaults.
+        body += (
+            '<label>TTS voice (macOS only)'
+            f'  <input type="text" name="tts_voice" '
+            f'    value="{h(s.get("tts_voice") or "")}" '
+            '    placeholder="(leave blank to use the system default voice)" '
+            '    autocomplete="off">'
+            '  <span class="suffix" style="display:block;">'
+            'Used by the 🎧 Listen button when generating MP3 narration. '
+            'For the best quality, leave this blank AND set a Siri voice '
+            'as your system default in '
+            '<strong>System Settings → Accessibility → Spoken Content → '
+            'System Voice</strong> (download "Siri Voice 1"). '
+            'For non-Siri options try <code>Fiona</code>, '
+            '<code>Samantha (Enhanced)</code>, or run <code>say -v ?</code> '
+            'in Terminal to see every voice installed on your machine.'
+            '  </span>'
+            '</label>'
+        )
+        body += (
+            '<label>TTS speaking rate'
+            f'  <input type="text" name="tts_rate" '
+            f'    value="{h(s.get("tts_rate") or "")}" '
+            '    placeholder="(blank = system default, ~175 wpm)" '
+            '    inputmode="numeric" autocomplete="off">'
+            '  <span class="suffix" style="display:block;">'
+            'Words per minute. 150 reads slowly + relaxed, 200+ skims '
+            'faster. Blank uses the system default (~175). '
+            '  </span>'
+            '</label>'
+        )
+
         body += '</div>'  # schedule-fields
         body += '<button type="submit" class="primary">Save</button>'
         body += '</form>'
@@ -5024,7 +5075,8 @@ def cmd_serve(args) -> int:
         from urllib.parse import quote_plus
         s = load_settings()
         for key in ("digest_model", "panel_model", "whisper_model",
-                    "cookies_from_browser", "digest_language", "llm_backend"):
+                    "cookies_from_browser", "digest_language", "llm_backend",
+                    "tts_voice", "tts_rate"):
             v = request.form.get(key)
             if v is not None:
                 s[key] = v.strip()
