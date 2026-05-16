@@ -1339,6 +1339,132 @@ def _pick_caption_lang(info: dict) -> Optional[Tuple[str, bool]]:
     return None
 
 
+def strip_markdown_for_tts(text: str) -> str:
+    """Convert markdown to plain text suitable for TTS narration.
+
+    Removes images, HTML tags, and markdown formatting characters while
+    preserving the paragraph structure (so the synthesizer gets natural
+    pauses). Links collapse to their display text.
+
+    Keeping this minimal on purpose — we'd rather narrate a slightly-
+    awkward line than swallow content trying to be clever.
+    """
+    # Images (markdown + raw HTML img tags)
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
+    text = re.sub(r"<img\s[^>]*>", "", text)
+    # Auto-links < https://... > → drop entirely (URLs read awfully aloud)
+    text = re.sub(r"<https?://[^>]+>", "", text)
+    # Bracketed timestamp links — these are the inline [3:15](url) anchors
+    # the takeaway prompt emits to ground specific claims. They read as
+    # "Goldman 4:00 and OpenAI" mid-sentence, which is just confusing
+    # aloud. Drop them entirely (text + URL).
+    text = re.sub(r"\[\d+:\d+(?::\d+)?\]\([^)]+\)", "", text)
+    # Other markdown links → keep just the display text
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # Strip headings markers but keep the heading text on its own line
+    text = re.sub(r"^#+\s+", "", text, flags=re.MULTILINE)
+    # Strip emphasis markers
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", text)
+    # Strip list markers
+    text = re.sub(r"^[-*+]\s+", "", text, flags=re.MULTILINE)
+    # Keep inner text of inline HTML wrappers (<sub>, <em>, <code>, <strong>…)
+    text = re.sub(r"<(\w+)(\s[^>]*)?>(.*?)</\1>", r"\3", text, flags=re.DOTALL)
+    # Drop any remaining standalone HTML
+    text = re.sub(r"<[^>]+>", "", text)
+    # Collapse runs of blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def generate_audio_from_markdown(
+    md_path: Path,
+    mp3_path: Path,
+    *,
+    voice: Optional[str] = None,
+    rate: Optional[int] = None,
+) -> None:
+    """Render a markdown file to MP3 via macOS `say` + ffmpeg transcode.
+
+    macOS only — `say` doesn't exist on Linux or Windows. Cross-platform
+    TTS (piper, cloud APIs) is a future feature; today we leverage what
+    comes free on the user's machine.
+
+    Atomic write via .mp3.tmp → rename so a partial transcode never
+    leaves a corrupt file in place. Cleans up the intermediate AIFF
+    on success or failure.
+
+    voice: any voice from `say -v ?` (default: system default).
+    rate: words per minute (default: system default ≈ 175).
+    """
+    if sys.platform != "darwin":
+        raise RuntimeError(
+            "Audio generation currently requires macOS (uses the `say` "
+            "command). Cross-platform TTS is a future feature."
+        )
+    if shutil.which("say") is None:
+        raise RuntimeError("`say` not on PATH (expected on macOS).")
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg not on PATH — install with `brew install ffmpeg`.")
+
+    text = strip_markdown_for_tts(md_path.read_text())
+    if not text:
+        raise RuntimeError("Markdown produced no narrate-able text.")
+
+    workdir = Path(tempfile.mkdtemp(prefix="yt2md_audio_"))
+    try:
+        aiff_path = workdir / "out.aiff"
+        say_cmd: List[str] = ["say", "-o", str(aiff_path)]
+        if voice:
+            say_cmd += ["-v", voice]
+        if rate is not None:
+            say_cmd += ["-r", str(rate)]
+        # Pipe text via stdin to dodge argv length limits + shell quoting
+        # issues. -f - tells `say` to read text from stdin.
+        say_cmd += ["-f", "-"]
+        proc = subprocess.run(
+            say_cmd, input=text, text=True, capture_output=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"`say` failed (exit {proc.returncode}): "
+                f"{(proc.stderr or '').strip()[-500:]}"
+            )
+
+        mp3_path.parent.mkdir(parents=True, exist_ok=True)
+        mp3_tmp = mp3_path.with_suffix(".mp3.tmp")
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-y",
+             "-i", str(aiff_path),
+             "-codec:a", "libmp3lame", "-b:a", "64k",
+             # The .mp3.tmp suffix defeats ffmpeg's extension-based
+             # format detection — pin the muxer explicitly.
+             "-f", "mp3", str(mp3_tmp)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            mp3_tmp.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"ffmpeg transcode failed (exit {proc.returncode}): "
+                f"{(proc.stderr or '').strip()[-500:]}"
+            )
+        mp3_tmp.replace(mp3_path)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# Maps the audio "kind" string used in URLs / job keys to the source
+# markdown filename. Kept in one place so the routes, viewer UI, and
+# background worker all agree on what the supported kinds are.
+AUDIO_SOURCE_BY_KIND = {
+    "digest":   "digest.md",
+    "panel":    "panel.md",
+    "takeaway": "takeaway.md",
+}
+
+
 def download_image(url: str, dest: Path, *, timeout: float = 15.0) -> bool:
     """Save a remote image to dest. Returns True on success. Atomic write
     via .tmp suffix → rename so a partial download never replaces an
@@ -4342,11 +4468,64 @@ def _viewer_nav(
     return "".join(parts)
 
 
+def _audio_section(
+    video_id: str,
+    kind: str,
+    digests_dir: Path,
+) -> str:
+    """HTML block placed above the rendered markdown on a viewer page.
+    Three states: inline <audio> player when the MP3 exists, a running
+    placeholder while the background job is in flight, or a Generate
+    audio button when no MP3 has been requested yet.
+    """
+    from html import escape as h
+
+    mp3_path = digests_dir / video_id / f"{kind}.mp3"
+    job = local_job_status(f"{video_id}:audio_{kind}")
+    running = job.get("phase") == "running"
+
+    if mp3_path.exists():
+        return (
+            "<div class='audio-row' style='margin: 16px 0 24px; "
+            "display: flex; gap: 12px; align-items: center; flex-wrap: wrap;'>"
+            f"<audio controls preload='none' "
+            f"src='/digests/{h(video_id)}/audio/{h(kind)}.mp3' "
+            "style='width: 100%; max-width: 520px; height: 36px;'></audio>"
+            f"<a href='/digests/{h(video_id)}/audio/{h(kind)}.mp3' download "
+            "style='font-size: 12px; color: var(--muted); "
+            "text-decoration: none;'>Download MP3</a>"
+            "</div>"
+        )
+    if running:
+        elapsed = job.get("elapsed", 0)
+        return (
+            "<div class='audio-row' style='margin: 16px 0 24px;'>"
+            "<span class='discuss-btn-secondary' style='cursor: default;' "
+            f"data-poll-url='/digests/{h(video_id)}/"
+            f"job-status?kind=audio_{h(kind)}'>"
+            f"🎧 Generating audio… <span class='elapsed'>{elapsed}s</span>"
+            "</span></div>"
+        )
+    return (
+        "<div class='audio-row' style='margin: 16px 0 24px;'>"
+        f"<form method='post' action='/digests/{h(video_id)}/audio/{h(kind)}' "
+        "style='display:inline;'>"
+        "<button type='submit' class='discuss-btn-secondary' "
+        "title='Render this artifact to an MP3 using macOS `say` + ffmpeg. "
+        "macOS only. Takes ~30s for the takeaway, 1–3 min for digest/panel.'>"
+        "🎧 Listen (generate audio)</button></form></div>"
+    )
+
+
 def _any_local_job_running(video_id: str) -> bool:
-    """True if any of {panel, takeaway, slides} background job is currently
-    in flight for this video. Drives whether the viewer page injects the
-    polling JS — only emitted when there's actually something to poll."""
-    for kind in ("panel", "takeaway", "slides"):
+    """True if any background job for this video is currently in flight.
+    Drives whether the viewer page injects the polling JS — only emitted
+    when there's actually something to poll."""
+    kinds = (
+        "panel", "takeaway", "slides",
+        "audio_digest", "audio_panel", "audio_takeaway",
+    )
+    for kind in kinds:
         if local_job_status(f"{video_id}:{kind}").get("phase") == "running":
             return True
     return False
@@ -5760,6 +5939,7 @@ def cmd_serve(args) -> int:
             "via One-off later.'>Delete digest</button></form></div>"
         )
 
+        audio = _audio_section(video_id, "digest", digests_dir)
         poll_js = _JOB_POLL_JS if any_running else ""
         body = (
             nav
@@ -5767,6 +5947,7 @@ def cmd_serve(args) -> int:
             + poll_js
             + "<hr style='margin: 16px 0 32px; border: none; "
             "border-top: 1px solid var(--border);'>"
+            + audio
             + rendered
             + bottom_actions
         )
@@ -5918,12 +6099,13 @@ def cmd_serve(args) -> int:
             f"<textarea id='chat-handoff-source' hidden aria-hidden='true'>"
             f"{h(chat_prompt)}</textarea>"
         )
+        audio = _audio_section(video_id, "takeaway", digests_dir)
         poll_js = _JOB_POLL_JS if any_running else ""
         body = (
             nav + _COPY_BUTTON_JS + poll_js
             + "<hr style='margin: 16px 0 32px; border: none; "
             "border-top: 1px solid var(--border);'>"
-            + rendered + bottom_actions
+            + audio + rendered + bottom_actions
         )
         return page(body, title=f"Takeaway · {video_id}",
                     current=f"digest:{video_id}",
@@ -5950,12 +6132,13 @@ def cmd_serve(args) -> int:
             f"<textarea id='page-md-source' hidden aria-hidden='true'>"
             f"{h(md_source)}</textarea>"
         )
+        audio = _audio_section(video_id, "panel", digests_dir)
         poll_js = _JOB_POLL_JS if any_running else ""
         body = (
             nav + _COPY_BUTTON_JS + poll_js
             + "<hr style='margin: 16px 0 32px; border: none; "
             "border-top: 1px solid var(--border);'>"
-            + rendered + bottom_actions
+            + audio + rendered + bottom_actions
         )
         return page(body, title=f"Panel · {video_id}",
                     current=f"digest:{video_id}",
@@ -6200,6 +6383,61 @@ def cmd_serve(args) -> int:
         start_local_job(f"{video_id}:slides", _build_slides_for_digest, video_id)
         return redirect(f"/digests/{video_id}/")
 
+    def _build_audio_for_artifact(video_id: str, kind: str) -> None:
+        """Background worker: turn one artifact's markdown into an MP3
+        via macOS `say` + ffmpeg. Idempotent + atomic; raises on failure."""
+        src_name = AUDIO_SOURCE_BY_KIND.get(kind)
+        if src_name is None:
+            raise RuntimeError(f"unknown audio kind: {kind}")
+        md_path = digests_dir / video_id / src_name
+        if not md_path.exists():
+            raise RuntimeError(
+                f"{src_name} not found — generate it first before requesting audio."
+            )
+        mp3_path = digests_dir / video_id / f"{kind}.mp3"
+        s = load_settings()
+        generate_audio_from_markdown(
+            md_path, mp3_path,
+            voice=s.get("tts_voice") or None,
+            rate=s.get("tts_rate") or None,
+        )
+
+    @app.route("/digests/<video_id>/audio/<kind>", methods=["POST"])
+    def generate_audio_route(video_id, kind):
+        from flask import redirect
+        if kind not in AUDIO_SOURCE_BY_KIND:
+            abort(404)
+        mp3_path = digests_dir / video_id / f"{kind}.mp3"
+        if mp3_path.exists():
+            return redirect(f"/digests/{video_id}/?msg=Audio+already+exists.")
+        src_name = AUDIO_SOURCE_BY_KIND[kind]
+        if not (digests_dir / video_id / src_name).exists():
+            from urllib.parse import quote_plus
+            return redirect(
+                f"/digests/{video_id}/?msg="
+                f"{quote_plus(f'{src_name} missing — generate it first.')}"
+            )
+        start_local_job(
+            f"{video_id}:audio_{kind}",
+            _build_audio_for_artifact, video_id, kind,
+        )
+        # Redirect back to whatever viewer the user clicked from. We don't
+        # know which one called us so bounce to /digests/<id>/ — sidebar
+        # poller + job poller will surface the result wherever the user is.
+        return redirect(f"/digests/{video_id}/")
+
+    @app.route("/digests/<video_id>/audio/<kind>.mp3")
+    def serve_audio(video_id, kind):
+        if kind not in AUDIO_SOURCE_BY_KIND:
+            abort(404)
+        mp3_path = digests_dir / video_id / f"{kind}.mp3"
+        if not mp3_path.exists():
+            abort(404)
+        return send_from_directory(
+            digests_dir / video_id, f"{kind}.mp3",
+            mimetype="audio/mpeg",
+        )
+
     @app.route("/digests/<video_id>/job-status")
     def job_status_route(video_id):
         from flask import jsonify, request
@@ -6211,6 +6449,9 @@ def cmd_serve(args) -> int:
             "slides": digests_dir / video_id / "slides.pptx",
             "panel": digests_dir / video_id / "panel.md",
             "takeaway": digests_dir / video_id / "takeaway.md",
+            "audio_digest":   digests_dir / video_id / "digest.mp3",
+            "audio_panel":    digests_dir / video_id / "panel.mp3",
+            "audio_takeaway": digests_dir / video_id / "takeaway.mp3",
         }
         target = artifact_paths.get(kind)
         if target is not None:
