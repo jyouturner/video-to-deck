@@ -15,6 +15,7 @@ dependencies = [
     "markdown>=3.5",
     "faster-whisper>=1.0.0",
     "onnxruntime<1.20; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "mcp>=1.2",
 ]
 
 [project.scripts]

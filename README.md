@@ -125,6 +125,90 @@ context. Useful when you finish reading and have a follow-up question.
 
 ---
 
+## Talk to your library from Claude (MCP)
+
+yt2md exposes its library as an MCP server, so Claude Desktop / Claude
+Code can read, search, ingest, and trigger generation against your local
+digests without a browser.
+
+**Claude Desktop** — add to
+`~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "yt2md": {
+      "command": "yt2md",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+**Claude Code** — one command:
+
+```bash
+claude mcp add yt2md -- yt2md mcp
+```
+
+Restart the client. Once connected, the agent has these tools:
+
+| Tool | What it does |
+| --- | --- |
+| `list_digests` | Browse the library (filters: channel, since-date, unread, title query) |
+| `read_digest` | Read a specific section: overview, a topic, the panel, a single panel turn, the takeaway, or the full digest |
+| `search_library` | Substring search across digest + panel + takeaway with scored snippets |
+| `digest_video` | Ingest a YouTube URL (skips if already digested) |
+| `generate_panel` / `generate_takeaway` / `generate_slides` | Backfill missing artifacts |
+| `job_status` | Poll a background generation job |
+| `list_subscriptions` / `add_subscription` / `remove_subscription` | Manage watched channels |
+
+Reads are structured JSON (not markdown). The agent does the formatting
+for chat, so you can ask things like *"summarize the panel's pushback
+in the Salesforce digest"* or *"what have I read this month about
+distributed systems?"* without yt2md guessing what format you want.
+
+The same surface is available from the shell, so cron / Claude Desktop's
+schedule feature / any script can drive the library too:
+
+```bash
+yt2md list --unread --since 2026-05-01 --json    # browse
+yt2md read <video-id> --section takeaway --json  # read a slice
+yt2md search "agent pricing" -k 5                # search
+yt2md digest "https://youtu.be/..." --wait       # ingest (blocking)
+
+yt2md topics                                     # taxonomy across library
+yt2md list --topic ai-policy                     # filter by tag
+yt2md list --saved                               # only digests you saved
+yt2md retrofit-topics --dry-run                  # tag old digests (Haiku)
+```
+
+### Topic tags + curation
+
+Each digest gets 2-5 topic tags from a Haiku call after generation
+(reuses the existing taxonomy where possible, marks new tags so you can
+spot vocabulary drift). On top of those, you (or the agent) can add
+user-tags, save, or dismiss digests:
+
+- `tag_digest(id, [tags])` / `untag_digest(id, [tags])` — user tags are
+  kept separate from LLM tags; the LLM never overwrites yours.
+- `save_digest(id)` / `unsave_digest(id)` — for things worth returning to.
+- `dismiss_digest(id)` / `undismiss_digest(id)` — hidden from default
+  briefings.
+- `list_topics()` — taxonomy with counts, grounding the LLM's tagging
+  prompt on each new digest.
+- Filters compose on `list_digests`: `topic`, `source`
+  (`subscription` / `oneoff` / `meta`), `saved`, `dismissed`.
+
+Backfill the topic layer for existing digests:
+
+```bash
+yt2md retrofit-topics --dry-run     # see what would be tagged
+yt2md retrofit-topics               # actually do it (~$0.001/digest)
+```
+
+---
+
 ## What it costs
 
 You can see your actual spend on the **Activity** page —

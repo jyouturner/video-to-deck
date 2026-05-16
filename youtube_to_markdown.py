@@ -1577,7 +1577,7 @@ def generate_audio_from_markdown(
     if chosen == "elevenlabs":
         _tts_elevenlabs(
             text, mp3_path,
-            voice_id=elevenlabs_voice_id or "21m00Tcm4TlvDq8ikWAM",
+            voice_id=elevenlabs_voice_id or "nPczCjzI2devNBz1zQrb",
             model_id=elevenlabs_model or "eleven_multilingual_v2",
         )
     elif chosen == "macos":
@@ -2709,14 +2709,23 @@ def write_markdown_digest(
     video_title: Optional[str] = None,
     video_url: Optional[str] = None,
 ) -> None:
-    """Render the digest as Markdown with <img> tags. Copies frames into images_dir.
+    """Write the digest to disk. Picks frames, copies them into
+    images_dir, builds the structured JSON shape from the in-memory
+    Digest object, and writes BOTH digest.md AND digest.json atomically.
 
-    If vision_picks is provided, prefer those mappings; fall back to timestamp-based picks
-    for any topic not covered.
+    Phase B: JSON is the source of truth — `digest.md` is rendered from
+    the JSON via `render_digest_md`, so a future read via the agent API
+    skips the markdown parser entirely. (Legacy digests written before
+    this change still work via the parse-on-read fallback in
+    `load_digest_json`.)
 
-    video_title (when provided) overrides the LLM-generated title so the digest's
-    heading matches the original YouTube title — readers can map it back to the
-    source. video_url renders a "Watch on YouTube" link directly under the title.
+    If vision_picks is provided, prefer those mappings; fall back to
+    timestamp-based picks for any topic not covered.
+
+    video_title (when provided) overrides the LLM-generated title so the
+    digest's heading matches the original YouTube title — readers can
+    map it back to the source. video_url renders a "Watch on YouTube"
+    link directly under the title.
     """
     images_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2740,43 +2749,23 @@ def write_markdown_digest(
         shutil.copy(src_path, dest)
         topic_images.append(dest)
 
-    rel_dir = images_dir.name  # render as "images/topic_NN.jpg"
-    lines: List[str] = []
-    heading = video_title if video_title else digest.title
-    lines.append(f"# {heading}")
-    lines.append("")
-    if video_url:
-        lines.append(f"**Watch on YouTube:** <{video_url}>")
-        lines.append("")
-    lines.append(digest.overview)
-    lines.append("")
-    for i, topic in enumerate(topics):
-        ts = format_timestamp(topic.start_time)
-        # Deep-link the timestamp when we know the source URL: clicking
-        # jumps the viewer straight to that moment in the original video.
-        # Without a URL (local-file digests), keep the bare timestamp.
-        if video_url:
-            sec = int(topic.start_time)
-            sep = "&" if "?" in video_url else "?"
-            ts_link = f"[{ts}]({video_url}{sep}t={sec}s)"
-            lines.append(f"## {topic.title}  <sub>*{ts_link}*</sub>")
-        else:
-            lines.append(f"## {topic.title}  <sub>*{ts}*</sub>")
-        lines.append("")
-        if topic_images[i] is not None:
-            # Use the topic title as alt text — accessible to screen readers and
-            # readable as a fallback if the image fails to load.
-            alt = topic.title.replace('"', "'")
-            lines.append(f'<img src="{rel_dir}/{topic_images[i].name}" alt="{alt}" width="800">')
-            lines.append("")
-        lines.append(topic.summary)
-        lines.append("")
-        for kp in topic.key_points:
-            lines.append(f"- {kp}")
-        if topic.key_points:
-            lines.append("")
+    # Build the canonical JSON shape directly from the Digest object —
+    # no round-trip through markdown. Sidecar metadata.json (if present)
+    # fills in channel info and upload date.
+    json_dict = _digest_json_from_object(
+        digest,
+        topic_images=topic_images,
+        images_rel_dir=images_dir.name,
+        video_title=video_title,
+        video_url=video_url,
+        video_id=output_md.parent.name,
+        metadata_path=output_md.parent / "metadata.json",
+    )
 
-    output_md.write_text("\n".join(lines).rstrip() + "\n")
+    # Write .md first so its mtime is older than .json; the mtime check
+    # in load_digest_json then sees the .json cache as fresh on read.
+    _atomic_write_text(output_md, render_digest_md(json_dict))
+    _atomic_write_json(output_md.with_suffix(".json"), json_dict)
 
 
 def render_takeaway_markdown(
@@ -2928,18 +2917,23 @@ def _list_channel_videos(url: str, limit: int = LATEST_LIMIT) -> List[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def _digest_video(video_id: str, output_dir: Path) -> Tuple[int, str]:
+def _digest_video(
+    video_id: str, output_dir: Path, *, source: str = "subscription",
+) -> Tuple[int, str]:
     """Run yt2md on a video. Returns (exit_code, combined_stdout_stderr).
 
     Streams output to the parent's stdout in real time (so poll.log captures
     it as it happens) AND collects it into a buffer the caller can scan for
     permanent-failure patterns.
+
+    `source` is stamped into digest_meta as the ingestion provenance.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     digest_path = output_dir / "digest.md"
     yt2md = shutil.which("yt2md") or sys.argv[0]
     proc = subprocess.Popen(
-        [yt2md, f"https://youtu.be/{video_id}", "-o", str(digest_path)],
+        [yt2md, f"https://youtu.be/{video_id}", "-o", str(digest_path),
+         "--source", source],
         cwd=output_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -3150,10 +3144,11 @@ DEFAULT_SETTINGS = {
     "tts_voice": "",
     # macOS-only: speaking rate in words/min. Blank → system default (~175).
     "tts_rate": "",
-    # ElevenLabs voice ID. Default = "Rachel" (a clean narration voice
-    # available on every account). Pick another from your voice library
-    # at https://elevenlabs.io/app/voice-library.
-    "elevenlabs_voice_id": "21m00Tcm4TlvDq8ikWAM",
+    # ElevenLabs voice ID. Default = "Brian" — a calm US narration voice
+    # in the free-tier "Default voices" set, so it works on every plan.
+    # (The older "Rachel" / `21m00Tcm4TlvDq8ikWAM` is now treated as a
+    # library voice and requires a paid plan via API.)
+    "elevenlabs_voice_id": "nPczCjzI2devNBz1zQrb",
     # ElevenLabs model. eleven_multilingual_v2 is the high-quality default;
     # eleven_turbo_v2_5 is faster + cheaper; eleven_flash_v2_5 is fastest.
     "elevenlabs_model": "eleven_multilingual_v2",
@@ -3683,6 +3678,30 @@ def _library_connect():
             digest_id TEXT PRIMARY KEY,
             opened_at INTEGER NOT NULL
         );
+        -- LLM- or user-assigned topic tags. Composite PK lets the same
+        -- tag come from both sources without collision; source filters
+        -- on read distinguish LLM noise from user intent.
+        CREATE TABLE IF NOT EXISTS digest_topics (
+            digest_id TEXT NOT NULL,
+            topic     TEXT NOT NULL,
+            source    TEXT NOT NULL,   -- 'llm' | 'user'
+            added_at  INTEGER NOT NULL,
+            PRIMARY KEY (digest_id, topic, source)
+        );
+        CREATE INDEX IF NOT EXISTS idx_topics_topic
+            ON digest_topics(topic);
+        CREATE INDEX IF NOT EXISTS idx_topics_digest
+            ON digest_topics(digest_id);
+        -- Per-digest curation flags + source provenance. Mirrors fields
+        -- in metadata.json — the JSON is ground truth, this row is the
+        -- query index for list_digests filters.
+        CREATE TABLE IF NOT EXISTS digest_meta (
+            digest_id      TEXT PRIMARY KEY,
+            source_kind    TEXT,           -- 'subscription' | 'oneoff' | 'meta'
+            added_at       INTEGER,
+            user_dismissed INTEGER NOT NULL DEFAULT 0,
+            user_saved     INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             video_id TEXT NOT NULL,
@@ -3727,6 +3746,1734 @@ def _read_digest_ids() -> set:
     with _library_connect() as conn:
         rows = conn.execute("SELECT digest_id FROM digest_reads").fetchall()
         return {r[0] for r in rows}
+
+
+# ----------------------------------------------------------------------
+# Agent-facing data API (Phase A: parse-on-read from existing markdown,
+# cache as JSON sidecar). The principle is that markdown is a render
+# target — these functions yield structured data that an agent (or any
+# non-HTML caller) can consume without parsing the markdown itself.
+#
+# Per-artifact JSON files (digest.json, panel.json, takeaway.json) live
+# next to the corresponding .md and are regenerated whenever the .md is
+# newer. Until Phase B, the .md is the source of truth and the .json is
+# a cache; in Phase B that inverts.
+# ----------------------------------------------------------------------
+
+import json as _json
+import re as _re
+
+
+def _ts_label_to_seconds(label: str) -> Optional[int]:
+    """Convert "M:SS" or "H:MM:SS" into integer seconds. Returns None for
+    anything that doesn't fit either shape so callers can keep going."""
+    try:
+        parts = [int(p) for p in label.split(":")]
+    except ValueError:
+        return None
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return None
+
+
+def _upload_date_iso(yyyymmdd: Optional[str]) -> Optional[str]:
+    """yt-dlp records upload_date as YYYYMMDD with no separator. Convert
+    to ISO YYYY-MM-DD for consumers (or pass through if unparseable)."""
+    if not yyyymmdd or len(yyyymmdd) != 8 or not yyyymmdd.isdigit():
+        return yyyymmdd
+    return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
+
+
+_DIGEST_TOPIC_HEADER_RE = _re.compile(
+    # Matches:    "## Title  <sub>*[5:23](https://...)*</sub>"
+    # And also:   "## Title  <sub>*5:23*</sub>"  (older format, no link)
+    r"^## (?P<title>.+?)\s+<sub>\*"
+    r"(?:\[(?P<ts_linked>\d+(?::\d+){1,2})\]\((?P<ts_url>[^)]+)\)"
+    r"|(?P<ts_bare>\d+(?::\d+){1,2}))"
+    r"\*</sub>\s*$",
+    _re.M,
+)
+
+_DIGEST_IMG_RE = _re.compile(r'<img src="([^"]+)"[^>]*>\s*')
+
+
+def digest_md_to_json(
+    md_path: Path,
+    metadata_path: Optional[Path] = None,
+) -> dict:
+    """Parse a digest.md file (the format emitted by write_markdown_digest)
+    into structured JSON: {video, overview, topics: [...]}.
+
+    Pulls video metadata (channel, upload date) from the sibling
+    metadata.json when present — those fields aren't recoverable from
+    the markdown alone. Sections that fail to parse fall back to a raw
+    chunk so an agent can still see the source text.
+    """
+    text = md_path.read_text()
+
+    video_meta = {}
+    if metadata_path is None:
+        metadata_path = md_path.parent / "metadata.json"
+    if metadata_path.exists():
+        try:
+            video_meta = _json.loads(metadata_path.read_text())
+        except Exception:
+            video_meta = {}
+
+    title_match = _re.match(r"^# (.+?)\n", text)
+    title = (
+        title_match.group(1).strip()
+        if title_match
+        else (video_meta.get("title") or "")
+    )
+
+    url_match = _re.search(
+        r"^\*\*Watch on YouTube:\*\* <(.+?)>\s*$", text, _re.M
+    )
+    video_url = (
+        url_match.group(1) if url_match else (video_meta.get("url") or "")
+    )
+
+    matches = list(_DIGEST_TOPIC_HEADER_RE.finditer(text))
+
+    # Overview: text between the header block and the first topic. Strip
+    # the title line and Watch-on-YouTube line so only the prose remains.
+    if matches:
+        pre = text[: matches[0].start()]
+    else:
+        pre = text
+    pre = _re.sub(r"^# .+?\n", "", pre, count=1)
+    pre = _re.sub(
+        r"^\*\*Watch on YouTube:\*\* <.+?>\s*$", "", pre, count=1, flags=_re.M
+    )
+    overview = pre.strip()
+
+    topics = []
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        block = text[m.end():end].strip()
+
+        ts_label = m.group("ts_linked") or m.group("ts_bare")
+        ts_url = m.group("ts_url")
+
+        img_match = _DIGEST_IMG_RE.match(block)
+        image = img_match.group(1) if img_match else None
+        if img_match:
+            block = block[img_match.end():].strip()
+
+        # Topic body is the paragraph(s) before the first `- ` bullet.
+        # The current writer emits "body then bullets" with no trailing
+        # paragraph, so this split is lossless against present output.
+        lines = block.split("\n")
+        first_bullet = next(
+            (j for j, ln in enumerate(lines) if ln.startswith("- ")), None
+        )
+        if first_bullet is None:
+            body_para = block.strip()
+            bullets: list = []
+        else:
+            body_para = "\n".join(lines[:first_bullet]).strip()
+            bullets = [
+                ln[2:].strip() for ln in lines[first_bullet:] if ln.startswith("- ")
+            ]
+
+        topics.append({
+            "index": i + 1,
+            "title": m.group("title").strip(),
+            "ts_start_s": _ts_label_to_seconds(ts_label) if ts_label else None,
+            "ts_link": ts_url,
+            "image": image,
+            "body": body_para,
+            "bullets": bullets,
+        })
+
+    return {
+        "video": {
+            "id": video_meta.get("video_id") or md_path.parent.name,
+            "title": title,
+            "url": video_url,
+            "channel": video_meta.get("channel_name") or "",
+            "channel_url": video_meta.get("channel_url") or "",
+            "published_at": _upload_date_iso(video_meta.get("upload_date")),
+        },
+        "overview": overview,
+        "topics": topics,
+    }
+
+
+def render_digest_md(d: dict) -> str:
+    """Render a digest JSON shape back to the markdown the viewer + the
+    existing parser expect. Inverse of `digest_md_to_json` — kept
+    byte-compatible so a re-render produces no gratuitous diff.
+
+    Used by `write_markdown_digest` (Phase B: JSON is the source of
+    truth; markdown is a deterministic view of it)."""
+    lines: list = []
+    lines.append(f"# {d['video']['title']}")
+    lines.append("")
+    if d["video"].get("url"):
+        lines.append(f"**Watch on YouTube:** <{d['video']['url']}>")
+        lines.append("")
+    if d.get("overview"):
+        lines.append(d["overview"])
+        lines.append("")
+    for t in d.get("topics", []):
+        ts_s = t.get("ts_start_s")
+        ts_label = format_timestamp(ts_s) if ts_s is not None else ""
+        if t.get("ts_link"):
+            lines.append(f"## {t['title']}  <sub>*[{ts_label}]({t['ts_link']})*</sub>")
+        elif ts_label:
+            lines.append(f"## {t['title']}  <sub>*{ts_label}*</sub>")
+        else:
+            lines.append(f"## {t['title']}")
+        lines.append("")
+        if t.get("image"):
+            alt = (t["title"] or "").replace('"', "'")
+            lines.append(f'<img src="{t["image"]}" alt="{alt}" width="800">')
+            lines.append("")
+        if t.get("body"):
+            lines.append(t["body"])
+            lines.append("")
+        for b in t.get("bullets") or []:
+            lines.append(f"- {b}")
+        if t.get("bullets"):
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _digest_json_from_object(
+    digest_obj,
+    *,
+    topic_images: list,
+    images_rel_dir: str,
+    video_title: Optional[str],
+    video_url: Optional[str],
+    video_id: Optional[str] = None,
+    metadata_path: Optional[Path] = None,
+) -> dict:
+    """Build a digest.json dict directly from the in-memory `Digest`
+    Pydantic object + frame picks. Bypasses the markdown parser — this
+    is the Phase B path for new digests. Output shape is identical to
+    what `digest_md_to_json` produces for the rendered markdown, so the
+    two code paths are interchangeable from the read side."""
+    heading = video_title if video_title else digest_obj.title
+
+    topics_json = []
+    for i, t in enumerate(digest_obj.topics):
+        ts_start_s = int(t.start_time)
+        ts_link = None
+        if video_url:
+            sep = "&" if "?" in video_url else "?"
+            ts_link = f"{video_url}{sep}t={ts_start_s}s"
+        img = None
+        if i < len(topic_images) and topic_images[i] is not None:
+            img = f"{images_rel_dir}/{topic_images[i].name}"
+        topics_json.append({
+            "index": i + 1,
+            "title": t.title,
+            "ts_start_s": ts_start_s,
+            "ts_link": ts_link,
+            "image": img,
+            "body": t.summary,
+            "bullets": list(t.key_points),
+        })
+
+    channel = ""
+    channel_url = ""
+    published_at = None
+    if metadata_path and metadata_path.exists():
+        try:
+            meta = _json.loads(metadata_path.read_text())
+            channel = meta.get("channel_name") or ""
+            channel_url = meta.get("channel_url") or ""
+            published_at = _upload_date_iso(meta.get("upload_date"))
+        except Exception:
+            pass
+
+    return {
+        "video": {
+            "id": video_id or "",
+            "title": heading,
+            "url": video_url or "",
+            "channel": channel,
+            "channel_url": channel_url,
+            "published_at": published_at,
+        },
+        "overview": digest_obj.overview,
+        "topics": topics_json,
+    }
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write `content` to `path` via a .tmp suffix + rename so a reader
+    never sees a half-written file."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    tmp.replace(path)
+
+
+def _atomic_write_json(path: Path, obj) -> None:
+    """JSON-encode and atomic-write."""
+    _atomic_write_text(path, _json.dumps(obj, indent=2, ensure_ascii=False))
+
+
+def _load_artifact_json(
+    digest_id: str,
+    *,
+    artifact: str,
+    parser,
+    digests_dir: Optional[Path] = None,
+) -> dict:
+    """Shared cache logic for digest.json / panel.json / takeaway.json.
+    Re-parses when the .md is newer than the .json sidecar (or the
+    sidecar doesn't exist / is corrupt). Cache write is best-effort —
+    a parse failure on disk doesn't block the in-memory return.
+    """
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    dir_path = digests_dir / digest_id
+    md_path = dir_path / f"{artifact}.md"
+    json_path = dir_path / f"{artifact}.json"
+    if not md_path.exists():
+        raise FileNotFoundError(f"No {artifact}.md at {dir_path}")
+
+    if json_path.exists():
+        try:
+            if json_path.stat().st_mtime >= md_path.stat().st_mtime:
+                return _json.loads(json_path.read_text())
+        except Exception:
+            pass  # corrupt or unreadable — fall through to re-parse
+
+    parsed = parser(md_path)
+    try:
+        json_path.write_text(_json.dumps(parsed, indent=2, ensure_ascii=False))
+    except Exception:
+        pass  # caching is best-effort
+    return parsed
+
+
+def load_digest_json(
+    digest_id: str, *, digests_dir: Optional[Path] = None,
+) -> dict:
+    """Get the structured digest for a video. Parses digest.md on first
+    call, caches the result to digest.json, and returns from cache on
+    subsequent calls until digest.md changes."""
+    return _load_artifact_json(
+        digest_id,
+        artifact="digest",
+        parser=digest_md_to_json,
+        digests_dir=digests_dir,
+    )
+
+
+_PANEL_TURN_RE = _re.compile(
+    r"^\*\*(?P<speaker>[^*\n]+?):\*\*\s*(?P<text>.+?)(?=\n\s*\n|\Z)",
+    _re.M | _re.S,
+)
+# Panelist intro: "**Name** — bio" or "**Name** is bio" (both shapes appear).
+_PANELIST_INTRO_RE = _re.compile(
+    r"^\*\*(?P<name>[^*\n]+?)\*\*\s*(?:[—–-]\s*|is\s+)(?P<bio>.+?)(?=\n\s*\n|\Z)",
+    _re.M | _re.S,
+)
+
+
+def panel_text_to_json(text: str) -> dict:
+    """Core panel parser; operates on a string so the generator can
+    parse in-memory before writing both .md and .json atomically.
+    `panel_md_to_json(path)` is a thin wrapper over this."""
+    title_match = _re.search(r"^## (.+?)\s*$", text, _re.M)
+    title = title_match.group(1).strip() if title_match else ""
+
+    parts = _re.split(r"\n---+\s*\n", text, maxsplit=1)
+    head = parts[0]
+    body = parts[1] if len(parts) == 2 else ""
+
+    panelists = []
+    for m in _PANELIST_INTRO_RE.finditer(head):
+        panelists.append({
+            "name": m.group("name").strip(),
+            "bio": " ".join(m.group("bio").split()).strip(),
+        })
+
+    turns = []
+    for m in _PANEL_TURN_RE.finditer(body):
+        turns.append({
+            "speaker": m.group("speaker").strip(),
+            "text": " ".join(m.group("text").split()).strip(),
+        })
+
+    return {"title": title, "panelists": panelists, "turns": turns}
+
+
+def panel_md_to_json(md_path: Path) -> dict:
+    """Parse panel.md (as produced by generate_panel_discussion) into
+    {title, panelists: [{name, bio}], turns: [{speaker, text}]}.
+
+    The "## The Panel" / "## Panel: ..." header is captured as `title`.
+    Anything between the header and the first `---` line is the
+    panelists block; anything after `---` is the discussion."""
+    return panel_text_to_json(md_path.read_text())
+
+
+def load_panel_json(
+    digest_id: str, *, digests_dir: Optional[Path] = None,
+) -> dict:
+    """Get the structured panel discussion. Parses panel.md on first
+    call, caches to panel.json, re-parses on mtime invalidation."""
+    return _load_artifact_json(
+        digest_id, artifact="panel",
+        parser=panel_md_to_json, digests_dir=digests_dir,
+    )
+
+
+_TAKEAWAY_CITATION_RE = _re.compile(
+    r"\[(?P<label>\d+(?::\d+){1,2})\]\((?P<url>[^)]+)\)"
+)
+
+
+def takeaway_text_to_json(text: str) -> dict:
+    """Core takeaway parser; operates on a string so the generator can
+    parse in-memory before writing both .md and .json atomically.
+    `takeaway_md_to_json(path)` is a thin wrapper over this."""
+    text = text.strip()
+    paragraphs = []
+    for block in _re.split(r"\n\s*\n+", text):
+        block = block.strip()
+        if not block:
+            continue
+        citations = []
+        for m in _TAKEAWAY_CITATION_RE.finditer(block):
+            citations.append({
+                "label": m.group("label"),
+                "ts_s": _ts_label_to_seconds(m.group("label")),
+                "url": m.group("url"),
+            })
+        paragraphs.append({"text": block, "citations": citations})
+    return {"paragraphs": paragraphs}
+
+
+def takeaway_md_to_json(md_path: Path) -> dict:
+    """Parse takeaway.md (a small block of plain prose with inline
+    timestamp links) into {paragraphs: [{text, citations}]}.
+
+    Citations are `[M:SS](url)` or `[H:MM:SS](url)` links — collected
+    per paragraph so an agent can deep-link to the source claim without
+    re-parsing markdown."""
+    return takeaway_text_to_json(md_path.read_text())
+
+
+def load_takeaway_json(
+    digest_id: str, *, digests_dir: Optional[Path] = None,
+) -> dict:
+    """Get the structured takeaway. Parses takeaway.md on first call,
+    caches to takeaway.json, re-parses on mtime invalidation."""
+    return _load_artifact_json(
+        digest_id, artifact="takeaway",
+        parser=takeaway_md_to_json, digests_dir=digests_dir,
+    )
+
+
+def read_digest(
+    digest_id: str,
+    section: str = "full",
+    *,
+    digests_dir: Optional[Path] = None,
+) -> dict:
+    """Agent-facing read for a single digest.
+
+    section: one of "full", "meta", "overview", "topics",
+             "topic:<N>" (1-indexed), "topic:<slug>" (substring match
+             on topic title; first hit wins).
+             "panel" / "takeaway" join after Phase A — until then they
+             raise NotImplementedError.
+
+    Every return includes a `video` block so the caller can ground the
+    content (link back to YouTube, render the title, etc.) without
+    juggling separate lookups.
+    """
+    d = load_digest_json(digest_id, digests_dir=digests_dir)
+    video = d["video"]
+
+    if section == "full":
+        return {"section": section, "video": video, "content": d}
+    if section == "meta":
+        return {"section": section, "video": video, "content": video}
+    if section == "overview":
+        return {
+            "section": section, "video": video,
+            "content": {"overview": d.get("overview", "")},
+        }
+    if section == "topics":
+        return {
+            "section": section, "video": video,
+            "content": {"topics": d.get("topics", [])},
+        }
+    if section.startswith("topic:"):
+        ref = section.split(":", 1)[1]
+        topics = d.get("topics") or []
+        topic = None
+        if ref.isdigit():
+            n = int(ref)
+            if 1 <= n <= len(topics):
+                topic = topics[n - 1]
+        else:
+            needle = ref.lower()
+            for t in topics:
+                if needle in (t.get("title") or "").lower():
+                    topic = t
+                    break
+        if topic is None:
+            raise ValueError(
+                f"No topic matching {ref!r} in {digest_id} "
+                f"(have {len(topics)} topics)"
+            )
+        return {"section": section, "video": video, "content": topic}
+    if section == "panel" or section.startswith("panel:"):
+        try:
+            panel = load_panel_json(digest_id, digests_dir=digests_dir)
+        except FileNotFoundError:
+            raise ValueError(f"No panel for {digest_id}")
+        if section == "panel":
+            return {"section": section, "video": video, "content": panel}
+        ref = section.split(":", 1)[1]
+        # panel:turn:<N>  → single turn (1-indexed)
+        # panel:panelists → just the panelist list
+        if ref == "panelists":
+            return {
+                "section": section, "video": video,
+                "content": {"panelists": panel.get("panelists", [])},
+            }
+        if ref.startswith("turn:"):
+            n_str = ref.split(":", 1)[1]
+            turns = panel.get("turns") or []
+            if n_str.isdigit():
+                n = int(n_str)
+                if 1 <= n <= len(turns):
+                    return {
+                        "section": section, "video": video,
+                        "content": turns[n - 1],
+                    }
+            raise ValueError(
+                f"No turn matching {n_str!r} (have {len(turns)} turns)"
+            )
+        raise ValueError(f"unknown panel sub-section: {ref!r}")
+    if section == "takeaway":
+        try:
+            tk = load_takeaway_json(digest_id, digests_dir=digests_dir)
+        except FileNotFoundError:
+            raise ValueError(f"No takeaway for {digest_id}")
+        return {"section": section, "video": video, "content": tk}
+    raise ValueError(f"unknown section: {section!r}")
+
+
+def list_digests(
+    *,
+    channel: Optional[str] = None,
+    since: Optional[str] = None,
+    unread: bool = False,
+    q: Optional[str] = None,
+    topic: Optional[str] = None,
+    source: Optional[str] = None,
+    saved: Optional[bool] = None,
+    dismissed: Optional[bool] = None,
+    limit: int = 20,
+    digests_dir: Optional[Path] = None,
+) -> list:
+    """Agent-facing index of the local digest library. Returns lightweight
+    entries (no topic body) so a caller can scan, then drill in with
+    `read_digest(id, section=...)`.
+
+    Filters compose (AND):
+      channel   : substring match against channel name (case-insensitive)
+      since     : ISO date "YYYY-MM-DD"; keeps digests whose published_at
+                  is >= the given date. Digests with no published_at fall
+                  back to the on-disk mtime as a coarse proxy.
+      unread    : True → only digests not yet marked read.
+      q         : substring match against title (case-insensitive).
+      topic     : exact-match on a topic tag (LLM or user-assigned).
+      source    : 'subscription' | 'oneoff' | 'meta' (provenance filter).
+      saved     : True → only user-saved; False → only un-saved.
+      dismissed : True → only user-dismissed; False → only not-dismissed.
+                  Defaults None for both → don't filter on the flag.
+      limit     : max results returned. The list is sorted most-recent
+                  first; limit caps the head of that list.
+    """
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    if not digests_dir.exists():
+        return []
+
+    read_ids = _read_digest_ids() if unread else set()
+
+    needle_channel = (channel or "").strip().lower() or None
+    needle_q = (q or "").strip().lower() or None
+
+    # Pre-fetch the digests matching topic / source / saved / dismissed
+    # filters via the indexed tables, so we can short-circuit large
+    # libraries without parsing every metadata.json.
+    topic_match: Optional[set] = None
+    if topic:
+        with _library_connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT digest_id FROM digest_topics WHERE topic = ?",
+                (topic.strip().lower(),),
+            ).fetchall()
+        topic_match = {r[0] for r in rows}
+
+    # digest_meta join: we read all rows once and look up per-id since
+    # the table is at most O(library size).
+    meta_index = {}
+    with _library_connect() as conn:
+        for row in conn.execute(
+            "SELECT digest_id, source_kind, user_saved, user_dismissed "
+            "FROM digest_meta"
+        ):
+            meta_index[row[0]] = {
+                "source_kind": row[1],
+                "user_saved": bool(row[2]),
+                "user_dismissed": bool(row[3]),
+            }
+
+    dirs = sorted(
+        (d for d in digests_dir.iterdir()
+         if d.is_dir() and (d / "digest.md").exists()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    out = []
+    for d in dirs:
+        if unread and d.name in read_ids:
+            continue
+        if topic_match is not None and d.name not in topic_match:
+            continue
+
+        meta_row = meta_index.get(d.name, {})
+        if source and meta_row.get("source_kind") != source:
+            continue
+        if saved is not None and meta_row.get("user_saved", False) != saved:
+            continue
+        if dismissed is not None and meta_row.get("user_dismissed", False) != dismissed:
+            continue
+
+        meta: dict = {}
+        meta_path = d / "metadata.json"
+        if meta_path.exists():
+            try:
+                meta = _json.loads(meta_path.read_text())
+            except Exception:
+                meta = {}
+
+        # Cheap title pull (digest.json may not exist yet on first list)
+        title = meta.get("title") or d.name
+        if not meta.get("title"):
+            try:
+                for line in (d / "digest.md").read_text().splitlines():
+                    if line.startswith("# "):
+                        title = line[2:].strip()
+                        break
+            except Exception:
+                pass
+
+        ch_name = meta.get("channel_name") or ""
+        if needle_channel and needle_channel not in ch_name.lower():
+            continue
+        if needle_q and needle_q not in title.lower():
+            continue
+
+        published = _upload_date_iso(meta.get("upload_date"))
+        if since:
+            ref = published or _iso_from_mtime(d.stat().st_mtime)
+            if ref < since:
+                continue
+
+        # Topics: union of LLM + user, deduped, sorted for stable output.
+        topics_split = _read_topics_for_digest(d.name)
+        all_topics = sorted(set(topics_split["llm"] + topics_split["user"]))
+
+        out.append({
+            "id": d.name,
+            "title": title,
+            "url": meta.get("url") or f"https://www.youtube.com/watch?v={d.name}",
+            "channel": ch_name,
+            "channel_url": meta.get("channel_url") or "",
+            "published_at": published,
+            "mtime": d.stat().st_mtime,
+            "read": d.name in read_ids if unread else (d.name in _read_digest_ids()),
+            "topics": all_topics,
+            "topics_split": topics_split,
+            "source": meta.get("source") or {"kind": meta_row.get("source_kind")},
+            "user_saved": meta_row.get("user_saved", False),
+            "user_dismissed": meta_row.get("user_dismissed", False),
+            "has_panel": (d / "panel.md").exists(),
+            "has_takeaway": (d / "takeaway.md").exists(),
+            "has_slides": (d / "slides.pptx").exists(),
+            "has_audio": {
+                "digest":   (d / "digest.mp3").exists(),
+                "panel":    (d / "panel.mp3").exists(),
+                "takeaway": (d / "takeaway.mp3").exists(),
+            },
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _iso_from_mtime(mtime: float) -> str:
+    """YYYY-MM-DD for a filesystem mtime — used as a fallback when a
+    digest has no upload_date in metadata.json."""
+    import datetime as _dt
+    return _dt.date.fromtimestamp(mtime).isoformat()
+
+
+# ----------------------------------------------------------------------
+# Topic tagging — LLM-derived (Haiku) topic tags per digest, plus user-
+# curation flags. The metadata layer that lets the agent answer
+# questions like "what AI-policy stuff have I read this month?" without
+# scanning every digest body.
+# ----------------------------------------------------------------------
+
+DEFAULT_TAGGING_MODEL = "claude-haiku-4-5-20251001"
+TAXONOMY_TOP_N = 50         # how many existing tags to surface to the LLM
+TAG_RE = _re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+_TAGGING_SYSTEM_PROMPT = """\
+You tag a video digest for retrieval. Given the digest, return 2-5
+topic tags as JSON.
+
+Rules:
+- Tags are lowercase, hyphen-separated, 1-3 words: "agent-pricing",
+  "distributed-systems", "ai-policy", "vc-strategy".
+- REUSE existing tags from the taxonomy when they fit. Do not create
+  synonyms of existing tags (no "ai-regulation" if "ai-policy" exists).
+- Only propose a NEW tag when no existing tag fits. Mark new tags with
+  is_new: true so the system can flag vocabulary drift.
+- Tags describe SUBJECT matter, not format. "interview" is wrong;
+  "venture-capital" is right.
+- Quality over quantity. 3 sharp tags > 5 fuzzy ones.
+
+Output strict JSON only:
+  {"tags": [{"tag": "<slug>", "is_new": <bool>}, ...], "reason": "<one sentence>"}
+"""
+
+
+def _current_taxonomy(limit: int = TAXONOMY_TOP_N) -> list:
+    """Return [(tag, n_digests), ...] sorted by frequency desc. Drives
+    the 'reuse existing tags' guidance in the tagging prompt."""
+    with _library_connect() as conn:
+        rows = conn.execute(
+            "SELECT topic, COUNT(DISTINCT digest_id) AS n "
+            "FROM digest_topics WHERE source = 'llm' "
+            "GROUP BY topic ORDER BY n DESC, topic ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [(r[0], r[1]) for r in rows]
+
+
+def _topic_tagging_user_prompt(d: dict, taxonomy: list) -> str:
+    """Build the per-digest user message for the tagging call.
+    `d` is a digest.json dict."""
+    if taxonomy:
+        tax_lines = "\n".join(f"  {tag} ({n})" for tag, n in taxonomy)
+    else:
+        tax_lines = "  (empty — this is the first digest being tagged)"
+    topics_block = "\n".join(
+        f"  {i + 1}. {t.get('title', '')}"
+        for i, t in enumerate(d.get("topics") or [])
+    )
+    return (
+        f"EXISTING TAXONOMY (most-used first; reuse where reasonable):\n"
+        f"{tax_lines}\n\n"
+        f"DIGEST:\n"
+        f"Title: {d['video'].get('title', '')}\n\n"
+        f"Overview: {d.get('overview', '')}\n\n"
+        f"Topic titles:\n{topics_block}\n"
+    )
+
+
+def _validate_tag(tag: str) -> Optional[str]:
+    """Return a normalized tag or None if it fails the format check.
+    Guards against the LLM emitting CamelCase, spaces, punctuation, etc."""
+    if not isinstance(tag, str):
+        return None
+    norm = tag.strip().lower().replace("_", "-").replace(" ", "-")
+    norm = _re.sub(r"-+", "-", norm).strip("-")
+    if not norm or len(norm) > 40:
+        return None
+    if not TAG_RE.match(norm):
+        return None
+    return norm
+
+
+def tag_digest_via_llm(
+    digest_id: str,
+    *,
+    digests_dir: Optional[Path] = None,
+    model: Optional[str] = None,
+    backend=None,
+) -> dict:
+    """Run the Haiku tagging step for a single digest. Persists tags to
+    metadata.json (under `topics`) AND to digest_topics with source=llm.
+    Returns {tags: [...], new_tags: [...], reason: str}."""
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    if backend is None:
+        backend = select_backend()
+    if model is None:
+        model = DEFAULT_TAGGING_MODEL
+
+    d = load_digest_json(digest_id, digests_dir=digests_dir)
+    taxonomy = _current_taxonomy()
+    user_text = _topic_tagging_user_prompt(d, taxonomy)
+
+    # Use the backend's structured-output path: a Pydantic model that
+    # forces the LLM to emit the right shape. Same pattern as
+    # generate_digest.
+    from pydantic import BaseModel
+    from typing import List as TList
+
+    class _Tag(BaseModel):
+        tag: str
+        is_new: bool = False
+
+    class _Response(BaseModel):
+        tags: TList[_Tag]
+        reason: str = ""
+
+    parsed, _usage = backend.parse(
+        system=_TAGGING_SYSTEM_PROMPT,
+        user_text=user_text,
+        schema=_Response,
+        model=model,
+        max_tokens=400,
+    )
+    record_llm_usage(
+        video_id=digest_id, kind="tagging", model=model,
+        backend_name=backend.name, usage=_usage,
+    )
+
+    cleaned: list = []
+    new_tags: list = []
+    taxonomy_set = {t for t, _ in taxonomy}
+    for entry in parsed.tags:
+        norm = _validate_tag(entry.tag)
+        if norm is None:
+            continue
+        if norm in cleaned:
+            continue
+        cleaned.append(norm)
+        if entry.is_new and norm not in taxonomy_set:
+            new_tags.append(norm)
+    cleaned = cleaned[:5]  # hard cap
+
+    _write_topics_to_metadata(digest_id, cleaned, digests_dir=digests_dir)
+    _write_topics_to_db(digest_id, cleaned, source="llm")
+    return {"tags": cleaned, "new_tags": new_tags, "reason": parsed.reason}
+
+
+def _write_topics_to_metadata(
+    digest_id: str,
+    topics: list,
+    *,
+    digests_dir: Optional[Path] = None,
+) -> None:
+    """Persist LLM tags into metadata.json. Preserves existing fields
+    (channel info, user_tags, etc.) — merges rather than replaces."""
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    meta_path = digests_dir / digest_id / "metadata.json"
+    meta = {}
+    if meta_path.exists():
+        try:
+            meta = _json.loads(meta_path.read_text())
+        except Exception:
+            meta = {}
+    meta["topics"] = list(topics)
+    _atomic_write_json(meta_path, meta)
+
+
+def _write_topics_to_db(
+    digest_id: str,
+    topics: list,
+    *,
+    source: str,
+) -> None:
+    """Insert into digest_topics (PK conflicts → no-op, idempotent).
+    `source` is 'llm' or 'user' — kept separate so re-tagging from one
+    side never wipes the other."""
+    import time as _t
+    now = int(_t.time())
+    with _library_connect() as conn:
+        # Replace LLM tags wholesale (re-tagging means new vocabulary).
+        # User tags are append-only — handled by tag_digest separately.
+        if source == "llm":
+            conn.execute(
+                "DELETE FROM digest_topics WHERE digest_id = ? AND source = 'llm'",
+                (digest_id,),
+            )
+        for tag in topics:
+            conn.execute(
+                "INSERT OR IGNORE INTO digest_topics "
+                "(digest_id, topic, source, added_at) VALUES (?, ?, ?, ?)",
+                (digest_id, tag, source, now),
+            )
+
+
+def _read_topics_for_digest(digest_id: str) -> dict:
+    """Return {llm: [...], user: [...]} for a digest. Sorted, unique."""
+    with _library_connect() as conn:
+        rows = conn.execute(
+            "SELECT topic, source FROM digest_topics WHERE digest_id = ? "
+            "ORDER BY source ASC, topic ASC",
+            (digest_id,),
+        ).fetchall()
+    out = {"llm": [], "user": []}
+    for tag, src in rows:
+        out.setdefault(src, []).append(tag)
+    return out
+
+
+def _digest_meta_row(digest_id: str) -> dict:
+    """Return the digest_meta row as a dict, or {} if absent."""
+    with _library_connect() as conn:
+        row = conn.execute(
+            "SELECT source_kind, added_at, user_dismissed, user_saved "
+            "FROM digest_meta WHERE digest_id = ?",
+            (digest_id,),
+        ).fetchone()
+    if not row:
+        return {}
+    return {
+        "source_kind": row[0],
+        "added_at": row[1],
+        "user_dismissed": bool(row[2]),
+        "user_saved": bool(row[3]),
+    }
+
+
+def _record_digest_added(
+    digest_id: str,
+    *,
+    source_kind: str = "oneoff",
+) -> None:
+    """Stamp source provenance into digest_meta on ingestion. Idempotent
+    — re-ingest preserves the original added_at + source_kind."""
+    import time as _t
+    now = int(_t.time())
+    with _library_connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO digest_meta "
+            "(digest_id, source_kind, added_at) VALUES (?, ?, ?)",
+            (digest_id, source_kind, now),
+        )
+
+
+# Per-section weight when computing search relevance. Title hits matter
+# most (closest to user intent), section bodies count progressively
+# less. Tuned for "what would I want surfaced first if I searched for X
+# across my library" — i.e. matches on the title of a video are almost
+# always more relevant than matches deep in a panelist's seventh turn.
+_SEARCH_WEIGHTS = {
+    "video.title":   10,
+    "overview":       5,
+    "topic.title":    4,
+    "takeaway":       3,
+    "topic.body":     2,
+    "topic.bullet":   2,
+    "panel.turn":     1,
+}
+
+
+def _snippet(text: str, query: str, *, radius: int = 80) -> str:
+    """Return a ~radius*2-char excerpt of `text` centered on the first
+    case-insensitive occurrence of any token from `query`. Falls back
+    to the head of the text when no token is found."""
+    tokens = [t for t in query.lower().split() if t]
+    low = text.lower()
+    idx = -1
+    for tok in tokens:
+        i = low.find(tok)
+        if i >= 0 and (idx < 0 or i < idx):
+            idx = i
+    if idx < 0:
+        return text[: radius * 2].strip() + ("…" if len(text) > radius * 2 else "")
+    start = max(0, idx - radius)
+    end = min(len(text), idx + radius)
+    out = text[start:end].strip()
+    if start > 0:
+        out = "…" + out
+    if end < len(text):
+        out = out + "…"
+    return out
+
+
+def _matches_all_tokens(text: str, tokens: list) -> bool:
+    """True iff every token appears in text (case-insensitive)."""
+    if not text:
+        return False
+    low = text.lower()
+    return all(tok in low for tok in tokens)
+
+
+def search_library(
+    q: str,
+    *,
+    k: int = 10,
+    digests_dir: Optional[Path] = None,
+) -> list:
+    """Substring search across the whole library (digest / panel /
+    takeaway). v1 is case-insensitive whole-token AND: every space-
+    separated token in `q` must appear in the same section to count as
+    a hit. Embeddings are out of scope here — this is the cheap
+    deterministic baseline an agent can rely on.
+
+    Returns up to k hits, each:
+      {digest_id, title, section, snippet, score, url, video}
+
+    `section` is the same string `read_digest(section=...)` understands,
+    so an agent can pipe a hit straight into a follow-up read for the
+    full content."""
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    if not digests_dir.exists():
+        return []
+
+    tokens = [t.lower() for t in (q or "").split() if t]
+    if not tokens:
+        return []
+
+    hits = []
+    for entry in list_digests(limit=10_000, digests_dir=digests_dir):
+        did = entry["id"]
+        try:
+            d = load_digest_json(did, digests_dir=digests_dir)
+        except Exception:
+            continue
+        video_meta = {"id": did, "title": entry["title"], "url": entry["url"]}
+
+        def add(section, source_text, weight):
+            if not _matches_all_tokens(source_text, tokens):
+                return
+            hits.append({
+                "digest_id": did,
+                "title": entry["title"],
+                "section": section,
+                "snippet": _snippet(source_text, q),
+                "score": weight,
+                "url": entry["url"],
+                "video": video_meta,
+            })
+
+        add("meta",     d.get("video", {}).get("title", ""), _SEARCH_WEIGHTS["video.title"])
+        add("overview", d.get("overview", ""),               _SEARCH_WEIGHTS["overview"])
+        for t in d.get("topics", []):
+            ref = f"topic:{t['index']}"
+            add(ref, t.get("title", ""), _SEARCH_WEIGHTS["topic.title"])
+            add(ref, t.get("body", ""),  _SEARCH_WEIGHTS["topic.body"])
+            for b in t.get("bullets", []):
+                add(ref, b, _SEARCH_WEIGHTS["topic.bullet"])
+
+        # Panel + takeaway are optional artifacts — read defensively.
+        if entry["has_panel"]:
+            try:
+                panel = load_panel_json(did, digests_dir=digests_dir)
+                for i, turn in enumerate(panel.get("turns", []), 1):
+                    add(f"panel:turn:{i}", turn.get("text", ""),
+                        _SEARCH_WEIGHTS["panel.turn"])
+            except Exception:
+                pass
+        if entry["has_takeaway"]:
+            try:
+                tk = load_takeaway_json(did, digests_dir=digests_dir)
+                for para in tk.get("paragraphs", []):
+                    add("takeaway", para.get("text", ""),
+                        _SEARCH_WEIGHTS["takeaway"])
+            except Exception:
+                pass
+
+    # Sort by score desc, then most-recent digest first (caller-supplied
+    # mtime not in hits, so re-derive a tiebreak from digest_id order in
+    # the already-mtime-sorted list_digests output).
+    digest_order = {entry["id"]: i for i, entry in enumerate(
+        list_digests(limit=10_000, digests_dir=digests_dir)
+    )}
+    hits.sort(key=lambda h: (-h["score"], digest_order.get(h["digest_id"], 0)))
+    return hits[:k]
+
+
+# ---- Module-level artifact builders ------------------------------------
+#
+# Originally these lived inside cmd_serve() and closed over `digests_dir`.
+# Lifted to module level so the agent-facing API can call them without
+# spinning up a Flask app. cmd_serve's inner wrappers (kept for back-compat
+# with the existing call sites) delegate here.
+
+def _resolve_cached_srt_for(
+    video_id: str,
+    digests_dir: Optional[Path] = None,
+) -> Tuple[Path, str]:
+    """Locate the cached SRT for a digest and pull the BCP-47 lang from
+    its filename. Raises RuntimeError when the transcript isn't on disk
+    (means the video needs to be re-digested first)."""
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    srt_dir = digests_dir / video_id / "downloads" / video_id
+    srt_files = list(srt_dir.glob("*.srt")) if srt_dir.exists() else []
+    if not srt_files:
+        raise RuntimeError(
+            "No cached transcript. Re-digest the video first."
+        )
+    srt_path = srt_files[0]
+    lang = (
+        srt_path.stem[len(video_id) + 1:]
+        if srt_path.stem.startswith(video_id + ".") else "en"
+    )
+    return srt_path, lang
+
+
+def build_panel_for_video(
+    video_id: str,
+    *,
+    digests_dir: Optional[Path] = None,
+) -> Path:
+    """Run the panel-generation pipeline for a digested video. Synchronous;
+    raises on failure. Atomic write via .tmp → rename. Returns the
+    written panel.md path."""
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    digest_md = digests_dir / video_id / "digest.md"
+    if not digest_md.exists():
+        raise RuntimeError("digest.md missing — re-digest first.")
+    srt_path, lang = _resolve_cached_srt_for(video_id, digests_dir)
+    s = load_settings()
+    backend = select_backend()
+    panel_model = s.get("panel_model") or DEFAULT_PANEL_MODEL
+    segments = parse_srt(srt_path)
+    text, p_usage = generate_panel_discussion(
+        digest_md.read_text(), segments,
+        model=panel_model, source_lang=lang,
+        output_language=s.get("digest_language") or "auto",
+        backend=backend,
+    )
+    record_llm_usage(
+        video_id=video_id, kind="panel", model=panel_model,
+        backend_name=backend.name, usage=p_usage,
+    )
+    # Phase B: parse the LLM output to JSON once, write both files
+    # atomically. Read path then never invokes the parser on this digest.
+    panel_path = digests_dir / video_id / "panel.md"
+    panel_json_path = digests_dir / video_id / "panel.json"
+    _atomic_write_text(panel_path, text)
+    _atomic_write_json(panel_json_path, panel_text_to_json(text))
+    return panel_path
+
+
+def build_takeaway_for_video(
+    video_id: str,
+    *,
+    digests_dir: Optional[Path] = None,
+) -> Path:
+    """Run the takeaway-generation pipeline. Uses panel.md when present
+    so the takeaway can integrate the panel's critique; copes without
+    it. Synchronous; raises on failure. Returns takeaway.md path."""
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    digest_md = digests_dir / video_id / "digest.md"
+    if not digest_md.exists():
+        raise RuntimeError("digest.md missing — re-digest first.")
+    srt_path, lang = _resolve_cached_srt_for(video_id, digests_dir)
+    panel_md_path = digests_dir / video_id / "panel.md"
+    panel_text = panel_md_path.read_text() if panel_md_path.exists() else None
+    s = load_settings()
+    backend = select_backend()
+    takeaway_model = (os.environ.get("YT2MD_TAKEAWAY_MODEL")
+                      or DEFAULT_TAKEAWAY_MODEL)
+    segments = parse_srt(srt_path)
+    takeaway_text, t_usage = generate_takeaway(
+        digest_md.read_text(), panel_text, segments,
+        model=takeaway_model,
+        publish_date=None,
+        source_lang=lang,
+        output_language=s.get("digest_language") or "auto",
+        backend=backend,
+    )
+    record_llm_usage(
+        video_id=video_id, kind="takeaway", model=takeaway_model,
+        backend_name=backend.name, usage=t_usage,
+    )
+    body = render_takeaway_markdown(
+        takeaway_text,
+        video_url=f"https://www.youtube.com/watch?v={video_id}",
+    )
+    # Phase B: parse body to JSON once, write both files atomically.
+    takeaway_path = digests_dir / video_id / "takeaway.md"
+    takeaway_json_path = digests_dir / video_id / "takeaway.json"
+    _atomic_write_text(takeaway_path, body)
+    _atomic_write_json(takeaway_json_path, takeaway_text_to_json(body))
+    return takeaway_path
+
+
+def build_slides_for_video(
+    video_id: str,
+    *,
+    digests_dir: Optional[Path] = None,
+) -> Path:
+    """Run the slides-only pipeline against the cached MP4 + SRT for
+    a digested video. Atomic write. Returns the slides.pptx path."""
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    cache_dir = digests_dir / video_id / "downloads" / video_id
+    if not cache_dir.exists():
+        raise RuntimeError("No cached video. Re-digest the video first.")
+    mp4_path = cache_dir / f"{video_id}.mp4"
+    srt_files = list(cache_dir.glob("*.srt"))
+    if not mp4_path.exists() or not srt_files:
+        raise RuntimeError(
+            "Cached video or SRT missing. Re-digest the video first."
+        )
+    srt_path = srt_files[0]
+    workdir = Path(tempfile.mkdtemp(prefix="v2d_slides_"))
+    scene_dir = workdir / "scene"
+    interval_dir = workdir / "interval"
+    try:
+        duration = get_video_duration(mp4_path)
+        scene_frames, interval_frames = extract_scene_and_interval_frames(
+            mp4_path, scene_dir, interval_dir,
+            scene_threshold=0.2, interval=20.0, duration=duration,
+        )
+        frames = merge_frames(scene_frames, interval_frames)
+        frames = dedupe_frames(frames, 4)
+        deck_frames = global_phash_cluster(frames)
+        settings = load_settings()
+        if (settings.get("slide_classification", True)
+                and len(deck_frames) > _GRID_CELLS):
+            try:
+                backend = select_backend()
+                if getattr(backend, "vision_supported", False):
+                    deck_frames = classify_slides_via_grids(
+                        deck_frames, backend=backend,
+                        model=settings.get("slide_classifier_model")
+                              or "claude-haiku-4-5-20251001",
+                        workdir=workdir,
+                        log_video_id=video_id,
+                    )
+            except Exception:
+                pass
+        segments = parse_srt(srt_path)
+        slides_data = assign_transcript_to_frames(deck_frames, segments, duration)
+        digest_md_path = digests_dir / video_id / "digest.md"
+        title = video_id
+        if digest_md_path.exists():
+            for line in digest_md_path.read_text().splitlines():
+                if line.startswith("# "):
+                    title = line[2:].strip()
+                    break
+        out_path = digests_dir / video_id / "slides.pptx"
+        tmp_out = digests_dir / video_id / "slides.pptx.tmp"
+        build_deck(slides_data, tmp_out, title)
+        tmp_out.replace(out_path)
+        return out_path
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def build_audio_for_artifact(
+    video_id: str,
+    kind: str,
+    *,
+    digests_dir: Optional[Path] = None,
+) -> Path:
+    """Render one artifact's markdown to MP3 using the configured TTS
+    provider (macOS `say` or ElevenLabs). kind ∈ {"digest","panel","takeaway"}.
+    Returns the written .mp3 path; raises on failure."""
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    src_name = AUDIO_SOURCE_BY_KIND.get(kind)
+    if src_name is None:
+        raise RuntimeError(f"unknown audio kind: {kind!r}")
+    md_path = digests_dir / video_id / src_name
+    if not md_path.exists():
+        raise RuntimeError(
+            f"{src_name} not found — generate it first before requesting audio."
+        )
+    mp3_path = digests_dir / video_id / f"{kind}.mp3"
+    s = load_settings()
+    generate_audio_from_markdown(
+        md_path, mp3_path,
+        provider=s.get("tts_provider"),
+        voice=s.get("tts_voice") or None,
+        rate=s.get("tts_rate") or None,
+        elevenlabs_voice_id=s.get("elevenlabs_voice_id") or None,
+        elevenlabs_model=s.get("elevenlabs_model") or None,
+    )
+    return mp3_path
+
+
+# ---- Agent-facing ingestion + generation + subscriptions ---------------
+
+def digest_video(
+    url: str,
+    *,
+    blocking: bool = False,
+    source: str = "oneoff",
+    digests_dir: Optional[Path] = None,
+) -> dict:
+    """Kick off the full digest pipeline for a YouTube URL.
+
+    blocking=False (default): spawns `yt2md <url>` as a detached child
+        and returns {"video_id", "job_id" (pid), "status": "started",
+        "log_path"} immediately. Mirrors the /one-off route's pattern
+        so it survives a parent crash.
+
+    blocking=True: runs the pipeline synchronously, returns
+        {"video_id", "status": "done", "digest": <full digest JSON>}
+        on success — or raises RuntimeError on a non-zero exit.
+
+    Skip-if-exists: if the digest is already in the library, returns
+        {"video_id", "status": "exists", "digest": <full digest JSON>}
+        without re-running the pipeline.
+    """
+    import time as _t
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    video_id = extract_video_id(url)
+    if not video_id:
+        raise ValueError(f"Couldn't extract a YouTube video ID from: {url!r}")
+
+    existing = digests_dir / video_id / "digest.md"
+    if existing.exists():
+        return {
+            "video_id": video_id, "status": "exists",
+            "digest": load_digest_json(video_id, digests_dir=digests_dir),
+        }
+
+    digest_path = digests_dir / video_id / "digest.md"
+    digest_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path = get_data_dir() / "logs" / "oneoff.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    yt2md_path = shutil.which("yt2md")
+    if not yt2md_path:
+        raise RuntimeError("yt2md not on PATH — install with `uv tool install`.")
+
+    if blocking:
+        with open(log_path, "a") as log_fd:
+            log_fd.write(
+                f"\n===== {_t.strftime('%Y-%m-%d %H:%M:%S')} (blocking) "
+                f"starting {video_id} ({url}) =====\n"
+            )
+            result = subprocess.run(
+                [yt2md_path, url, "-o", str(digest_path),
+                 "--source", source],
+                cwd=digest_path.parent,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                env={**os.environ, **_settings_to_env(load_settings())},
+            )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"yt2md exited {result.returncode}; see {log_path}"
+            )
+        return {
+            "video_id": video_id, "status": "done",
+            "digest": load_digest_json(video_id, digests_dir=digests_dir),
+        }
+
+    log_fd = open(log_path, "a")
+    log_fd.write(
+        f"\n===== {_t.strftime('%Y-%m-%d %H:%M:%S')} starting {video_id} "
+        f"({url}) =====\n"
+    )
+    log_fd.flush()
+    try:
+        proc = subprocess.Popen(
+            [yt2md_path, url, "-o", str(digest_path),
+             "--source", source],
+            cwd=digest_path.parent,
+            stdout=log_fd,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, **_settings_to_env(load_settings())},
+            **_DETACH_KWARGS,
+        )
+    finally:
+        log_fd.close()
+    return {
+        "video_id": video_id, "job_id": proc.pid, "status": "started",
+        "log_path": str(log_path),
+    }
+
+
+def _start_generation(video_id: str, kind: str, build_fn) -> dict:
+    """Shared shape for generate_{panel,takeaway,slides}. Uses
+    start_local_job for in-process daemon-thread execution so a poll
+    against local_job_status(f"{id}:{kind}") sees the running phase."""
+    started = start_local_job(f"{video_id}:{kind}", build_fn, video_id)
+    return {
+        "video_id": video_id, "kind": kind,
+        "status": "started" if started else "already_running",
+        "job_key": f"{video_id}:{kind}",
+    }
+
+
+def generate_panel(
+    video_id: str, *, blocking: bool = False,
+    digests_dir: Optional[Path] = None,
+) -> dict:
+    """Generate the panel discussion for an already-digested video. If
+    blocking=True, runs synchronously and returns the panel JSON on
+    completion; otherwise dispatches to a background thread and returns
+    a job key the caller can poll via local_job_status()."""
+    if blocking:
+        build_panel_for_video(video_id, digests_dir=digests_dir)
+        return {
+            "video_id": video_id, "kind": "panel", "status": "done",
+            "panel": load_panel_json(video_id, digests_dir=digests_dir),
+        }
+    return _start_generation(
+        video_id, "panel",
+        lambda vid: build_panel_for_video(vid, digests_dir=digests_dir),
+    )
+
+
+def generate_takeaway(
+    video_id: str, *, blocking: bool = False,
+    digests_dir: Optional[Path] = None,
+) -> dict:
+    """Generate the takeaway for an already-digested video. See
+    generate_panel for blocking semantics."""
+    if blocking:
+        build_takeaway_for_video(video_id, digests_dir=digests_dir)
+        return {
+            "video_id": video_id, "kind": "takeaway", "status": "done",
+            "takeaway": load_takeaway_json(video_id, digests_dir=digests_dir),
+        }
+    return _start_generation(
+        video_id, "takeaway",
+        lambda vid: build_takeaway_for_video(vid, digests_dir=digests_dir),
+    )
+
+
+def generate_slides(
+    video_id: str, *, blocking: bool = False,
+    digests_dir: Optional[Path] = None,
+) -> dict:
+    """Generate the slides deck for an already-digested video. See
+    generate_panel for blocking semantics. Returns the .pptx path
+    rather than parsed content (no JSON view for binary decks)."""
+    if blocking:
+        out = build_slides_for_video(video_id, digests_dir=digests_dir)
+        return {
+            "video_id": video_id, "kind": "slides", "status": "done",
+            "slides_path": str(out),
+        }
+    return _start_generation(
+        video_id, "slides",
+        lambda vid: build_slides_for_video(vid, digests_dir=digests_dir),
+    )
+
+
+def generate_audio(
+    video_id: str,
+    kind: str,
+    *,
+    blocking: bool = False,
+    digests_dir: Optional[Path] = None,
+) -> dict:
+    """Render a digest/panel/takeaway markdown file to MP3 using the
+    configured TTS provider. kind ∈ {"digest","panel","takeaway"}.
+
+    blocking=False (default): dispatches to a background thread; poll
+        via local_job_status(f"{id}:audio_{kind}").
+    blocking=True: runs synchronously, returns the mp3 path.
+
+    Skip-if-exists: if the mp3 already exists, returns immediately."""
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    if kind not in AUDIO_SOURCE_BY_KIND:
+        raise ValueError(
+            f"kind must be one of {list(AUDIO_SOURCE_BY_KIND)!r}; got {kind!r}"
+        )
+    mp3_path = digests_dir / video_id / f"{kind}.mp3"
+    if mp3_path.exists():
+        return {
+            "video_id": video_id, "kind": kind, "status": "exists",
+            "mp3_path": str(mp3_path),
+        }
+    if blocking:
+        out = build_audio_for_artifact(video_id, kind, digests_dir=digests_dir)
+        return {
+            "video_id": video_id, "kind": kind, "status": "done",
+            "mp3_path": str(out),
+        }
+    return _start_generation(
+        video_id, f"audio_{kind}",
+        lambda vid: build_audio_for_artifact(vid, kind, digests_dir=digests_dir),
+    )
+
+
+def mark_digest_read(digest_id: str) -> dict:
+    """Mark a digest as read. Idempotent — re-marking just updates the
+    opened_at timestamp."""
+    _mark_digest_read(digest_id)
+    return {"digest_id": digest_id, "status": "read"}
+
+
+def mark_digest_unread(digest_id: str) -> dict:
+    """Mark a digest as unread (removes the read record). Idempotent."""
+    with _library_connect() as conn:
+        conn.execute("DELETE FROM digest_reads WHERE digest_id = ?", (digest_id,))
+    return {"digest_id": digest_id, "status": "unread"}
+
+
+# ---- Topic taxonomy + curation ----------------------------------------
+
+def list_topics(
+    *, min_digests: int = 1, limit: int = 50, source: Optional[str] = None,
+) -> list:
+    """Return the topic taxonomy: [{topic, n_digests, last_seen,
+    sources: {llm, user}}] sorted by n_digests desc.
+
+    Use for "what have I been reading about?" and as input to
+    `list_digests(topic=...)`. `source` filters to 'llm' or 'user' tags
+    only; None returns the union."""
+    src_clause = ""
+    params: list = [min_digests]
+    if source:
+        src_clause = " WHERE source = ?"
+        params = [source, min_digests]
+    with _library_connect() as conn:
+        rows = conn.execute(
+            "SELECT topic, "
+            "       COUNT(DISTINCT digest_id) AS n, "
+            "       MAX(added_at) AS last_seen, "
+            "       GROUP_CONCAT(DISTINCT source) AS sources "
+            "FROM digest_topics" + src_clause + " "
+            "GROUP BY topic HAVING n >= ? "
+            "ORDER BY n DESC, topic ASC LIMIT ?",
+            params + [limit],
+        ).fetchall()
+    out = []
+    for tag, n, last_seen, sources in rows:
+        srcs = set((sources or "").split(","))
+        out.append({
+            "topic": tag, "n_digests": n,
+            "last_seen": last_seen,
+            "sources": {"llm": "llm" in srcs, "user": "user" in srcs},
+        })
+    return out
+
+
+def tag_digest(digest_id: str, tags: list) -> dict:
+    """Add user-curated tags to a digest. Normalizes + dedupes input
+    against existing user tags. Idempotent (re-adding is a no-op).
+
+    Tags are kept separate from LLM-assigned tags so the LLM can be
+    wrong without overwriting your intent — list_digests filters union
+    both sets, but `topics_split` in the response shows which is which."""
+    cleaned: list = []
+    for t in tags:
+        norm = _validate_tag(t)
+        if norm and norm not in cleaned:
+            cleaned.append(norm)
+    if not cleaned:
+        raise ValueError(f"No valid tags in {tags!r}")
+    _write_topics_to_db(digest_id, cleaned, source="user")
+    # Mirror to metadata.json user_tags (union with existing, deduped).
+    digests_dir = get_data_dir() / "digests"
+    meta_path = digests_dir / digest_id / "metadata.json"
+    meta = {}
+    if meta_path.exists():
+        try:
+            meta = _json.loads(meta_path.read_text())
+        except Exception:
+            meta = {}
+    existing = list(meta.get("user_tags") or [])
+    for t in cleaned:
+        if t not in existing:
+            existing.append(t)
+    meta["user_tags"] = existing
+    _atomic_write_json(meta_path, meta)
+    return {"digest_id": digest_id, "user_tags": existing}
+
+
+def untag_digest(digest_id: str, tags: list) -> dict:
+    """Remove user tags from a digest. Idempotent (removing a missing
+    tag is fine). LLM-assigned tags are never touched."""
+    norm = {_validate_tag(t) for t in tags}
+    norm.discard(None)
+    if not norm:
+        return {"digest_id": digest_id, "user_tags": []}
+    with _library_connect() as conn:
+        for t in norm:
+            conn.execute(
+                "DELETE FROM digest_topics WHERE digest_id = ? "
+                "AND topic = ? AND source = 'user'",
+                (digest_id, t),
+            )
+    digests_dir = get_data_dir() / "digests"
+    meta_path = digests_dir / digest_id / "metadata.json"
+    meta = {}
+    if meta_path.exists():
+        try:
+            meta = _json.loads(meta_path.read_text())
+        except Exception:
+            meta = {}
+    meta["user_tags"] = [t for t in (meta.get("user_tags") or []) if t not in norm]
+    _atomic_write_json(meta_path, meta)
+    return {"digest_id": digest_id, "user_tags": meta["user_tags"]}
+
+
+def _set_curation_flag(digest_id: str, field: str, value: bool) -> dict:
+    """Shared shape for save/unsave/dismiss/undismiss. Updates both the
+    DB row and metadata.json."""
+    import time as _t
+    assert field in ("user_saved", "user_dismissed")
+    with _library_connect() as conn:
+        conn.execute(
+            "INSERT INTO digest_meta (digest_id, added_at) "
+            "VALUES (?, ?) ON CONFLICT(digest_id) DO NOTHING",
+            (digest_id, int(_t.time())),
+        )
+        conn.execute(
+            f"UPDATE digest_meta SET {field} = ? WHERE digest_id = ?",
+            (1 if value else 0, digest_id),
+        )
+    digests_dir = get_data_dir() / "digests"
+    meta_path = digests_dir / digest_id / "metadata.json"
+    meta = {}
+    if meta_path.exists():
+        try:
+            meta = _json.loads(meta_path.read_text())
+        except Exception:
+            meta = {}
+    meta[field] = value
+    _atomic_write_json(meta_path, meta)
+    return {"digest_id": digest_id, field: value}
+
+
+def save_digest(digest_id: str) -> dict:
+    """Mark a digest as 'saved' (worth keeping / returning to)."""
+    return _set_curation_flag(digest_id, "user_saved", True)
+
+
+def unsave_digest(digest_id: str) -> dict:
+    """Remove the 'saved' mark."""
+    return _set_curation_flag(digest_id, "user_saved", False)
+
+
+def dismiss_digest(digest_id: str) -> dict:
+    """Mark a digest as 'dismissed' (not worth surfacing in briefings).
+    list_digests(dismissed=False) will hide it; list_digests(dismissed=True)
+    can recall the dismissed set."""
+    return _set_curation_flag(digest_id, "user_dismissed", True)
+
+
+def undismiss_digest(digest_id: str) -> dict:
+    """Remove the 'dismissed' mark."""
+    return _set_curation_flag(digest_id, "user_dismissed", False)
+
+
+def retag_digest(digest_id: str) -> dict:
+    """Re-run the LLM tagging step against the current taxonomy. Useful
+    after the taxonomy has grown (so a digest tagged early can pick up
+    tags introduced later) or after editing the prompt."""
+    return tag_digest_via_llm(digest_id)
+
+
+def retrofit_topics(
+    *,
+    since: Optional[str] = None,
+    limit: Optional[int] = None,
+    dry_run: bool = False,
+    digests_dir: Optional[Path] = None,
+) -> dict:
+    """Tag any digest that doesn't already have LLM topics. Resumable —
+    re-running picks up where it left off.
+
+    since   : ISO date "YYYY-MM-DD"; skip digests older than this.
+    limit   : max digests to tag in this run (None = no cap).
+    dry_run : print what would be tagged without calling the LLM.
+    """
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    if not digests_dir.exists():
+        return {"tagged": 0, "skipped": 0, "errors": []}
+
+    candidates: list = []
+    for d in sorted(digests_dir.iterdir(),
+                    key=lambda p: p.stat().st_mtime, reverse=True):
+        if not d.is_dir() or not (d / "digest.md").exists():
+            continue
+        if _read_topics_for_digest(d.name)["llm"]:
+            continue  # already tagged
+        if since:
+            meta = {}
+            if (d / "metadata.json").exists():
+                try:
+                    meta = _json.loads((d / "metadata.json").read_text())
+                except Exception:
+                    pass
+            published = _upload_date_iso(meta.get("upload_date")) or \
+                _iso_from_mtime(d.stat().st_mtime)
+            if published < since:
+                continue
+        candidates.append(d.name)
+        if limit and len(candidates) >= limit:
+            break
+
+    if dry_run:
+        return {"would_tag": candidates, "count": len(candidates)}
+
+    tagged = 0
+    errors = []
+    for vid in candidates:
+        try:
+            tag_digest_via_llm(vid)
+            tagged += 1
+            print(f"  ✓ tagged {vid}")
+        except Exception as e:
+            errors.append({"digest_id": vid, "error": f"{type(e).__name__}: {e}"})
+            print(f"  ✗ {vid}: {e}")
+    return {"tagged": tagged, "skipped": 0, "errors": errors,
+            "candidates": len(candidates)}
+
+
+def list_subscriptions() -> list:
+    """Return the watched channels as structured entries (vs the raw
+    URL strings in channels.txt). One per subscribed channel."""
+    return [
+        {"url": ch, "added_via": "channels.txt"}
+        for ch in read_channels()
+    ]
+
+
+def add_subscription(channel_url: str) -> dict:
+    """Subscribe to a YouTube channel. Idempotent — adding an
+    already-subscribed channel returns status='exists' rather than
+    erroring. Handles bare @handles and partial URLs the same way
+    the CLI does."""
+    url = normalize_channel_url(channel_url)
+    if not is_url(url):
+        raise ValueError(f"Not a URL: {channel_url!r}")
+    channels = read_channels()
+    if url in channels:
+        return {"url": url, "status": "exists"}
+    channels.append(url)
+    write_channels(channels)
+    return {"url": url, "status": "added"}
+
+
+def remove_subscription(channel_url: str) -> dict:
+    """Unsubscribe from a YouTube channel. Returns status='missing'
+    if the channel wasn't subscribed (idempotent removal)."""
+    url = normalize_channel_url(channel_url)
+    channels = read_channels()
+    if url not in channels:
+        return {"url": url, "status": "missing"}
+    write_channels([c for c in channels if c != url])
+    return {"url": url, "status": "removed"}
 
 
 # ---- serve subcommand (local reader UI) ----
@@ -4626,15 +6373,16 @@ def _audio_section(
     digests_dir: Path,
 ) -> str:
     """HTML block placed above the rendered markdown on a viewer page.
-    Three states: inline <audio> player when the MP3 exists, a running
-    placeholder while the background job is in flight, or a Generate
+    Four states: inline <audio> player when the MP3 exists, a running
+    placeholder while the background job is in flight, an error banner
+    with a retry button when the previous attempt failed, or a Generate
     audio button when no MP3 has been requested yet.
     """
     from html import escape as h
 
     mp3_path = digests_dir / video_id / f"{kind}.mp3"
     job = local_job_status(f"{video_id}:audio_{kind}")
-    running = job.get("phase") == "running"
+    phase = job.get("phase")
 
     if mp3_path.exists():
         return (
@@ -4648,23 +6396,56 @@ def _audio_section(
             "text-decoration: none;'>Download MP3</a>"
             "</div>"
         )
-    if running:
-        elapsed = job.get("elapsed", 0)
+    if phase == "running":
+        # No live counter — the poll JS still reloads the page when the
+        # MP3 lands (or surfaces an error), but a fixed message avoids
+        # the misleading "stuck at 0s" appearance if a browser tab loses
+        # focus or the poll lags. Duration hint tells the user it's
+        # normal to wait rather than wondering if it hung.
         return (
             "<div class='audio-row' style='margin: 16px 0 24px;'>"
             "<span class='discuss-btn-secondary' style='cursor: default;' "
             f"data-poll-url='/digests/{h(video_id)}/"
             f"job-status?kind=audio_{h(kind)}'>"
-            f"🎧 Generating audio… <span class='elapsed'>{elapsed}s</span>"
-            "</span></div>"
+            "🎧 Generating audio…"
+            "</span>"
+            "<span style='margin-left: 10px; font-size: 12px; "
+            "color: var(--muted);'>"
+            "Usually 30s for a takeaway, 1–3 min for digest / panel. "
+            "The page will refresh when it's ready."
+            "</span>"
+            "</div>"
+        )
+    if phase == "error":
+        # Last attempt failed — surface the error message inline so the
+        # user can see what went wrong (e.g. "ElevenLabs library voice
+        # requires paid plan" → switch voice in Settings) and offer a
+        # one-click retry without making them dig into logs.
+        err = (job.get("error") or "(unknown error)")
+        return (
+            "<div class='audio-row' style='margin: 16px 0 24px; "
+            "padding: 12px 14px; border-radius: 4px; "
+            "background: var(--code-bg); "
+            "border-left: 3px solid #c00;'>"
+            "<div style='font-weight: 600; margin-bottom: 6px;'>"
+            "🎧 Audio generation failed</div>"
+            f"<div style='font-size: 13px; color: var(--muted); "
+            f"margin-bottom: 8px; word-break: break-word;'>{h(err)}</div>"
+            f"<form method='post' action='/digests/{h(video_id)}/audio/{h(kind)}' "
+            "style='display:inline;'>"
+            "<button type='submit' class='discuss-btn-secondary' "
+            "title='Retry generating audio. If this keeps failing, "
+            "check your TTS provider settings (voice ID, API key).'>"
+            "Retry</button></form>"
+            "</div>"
         )
     return (
         "<div class='audio-row' style='margin: 16px 0 24px;'>"
         f"<form method='post' action='/digests/{h(video_id)}/audio/{h(kind)}' "
         "style='display:inline;'>"
         "<button type='submit' class='discuss-btn-secondary' "
-        "title='Render this artifact to an MP3 using macOS `say` + ffmpeg. "
-        "macOS only. Takes ~30s for the takeaway, 1–3 min for digest/panel.'>"
+        "title='Render this artifact to an MP3 using your configured TTS "
+        "provider. Takes ~30s for a takeaway, 1-3 min for digest/panel.'>"
         "🎧 Listen (generate audio)</button></form></div>"
     )
 
@@ -5222,20 +7003,66 @@ def cmd_serve(args) -> int:
             '</label>'
         )
 
-        # ElevenLabs-only fields.
+        # ElevenLabs-only fields. Curated list = the "Default voices" set
+        # ElevenLabs ships to every account (free tier included). Library
+        # voices like the old "Rachel" require a paid plan via API, so
+        # they're deliberately not in the dropdown — users on a paid plan
+        # who want a library voice can fall back to the "Custom voice ID"
+        # text field below.
+        elevenlabs_voice_choices = (
+            ("nPczCjzI2devNBz1zQrb", "Brian — US male, deep + calm (default)"),
+            ("EXAVITQu4vr4xnSDxMaL", "Sarah — US female, soft"),
+            ("9BWtsMINqrJLrRacOk9x", "Aria — US female, conversational"),
+            ("cgSgspJ2msm6clMCkdW9", "Jessica — US female, expressive"),
+            ("XrExE9yKIg1WjnnlVkGX", "Matilda — US female, friendly"),
+            ("bIHbv24MWmeRgasZH58o", "Will — US male, friendly"),
+            ("cjVigY5qzO86Huf0OWal", "Eric — US male, friendly"),
+            ("iP95p4xoKVk53GoZ742B", "Chris — US male, casual"),
+            ("pqHfZKP75CvOlQylNhV4", "Bill — US male, gruff/trustworthy"),
+            ("TX3LPaxmHKxFdv7VOQHJ", "Liam — US male, articulate"),
+            ("JBFqnCBsd6RMkjVDRZzb", "George — UK male, warm"),
+            ("onwK4e9ZLuTAKqWW03F9", "Daniel — UK male, news-anchor"),
+            ("Xb7hH8MSUJpSbSDYk0k2", "Alice — UK female, confident"),
+            ("pFZP5JQG7iQjIQuC4Bku", "Lily — UK female, warm"),
+        )
+        current_voice = s.get("elevenlabs_voice_id") or "nPczCjzI2devNBz1zQrb"
+        known_ids = {code for code, _ in elevenlabs_voice_choices}
+        # If the saved voice ID isn't in the curated list (e.g. a custom
+        # library voice on a paid plan), preserve it as "__custom__" so
+        # the selector still reflects the user's actual configuration.
+        is_custom = current_voice not in known_ids and current_voice != ""
+        body += '<label>ElevenLabs voice'
+        body += '  <select name="elevenlabs_voice_id">'
+        for code, label in elevenlabs_voice_choices:
+            sel = ' selected' if current_voice == code else ''
+            body += f'    <option value="{code}"{sel}>{h(label)}</option>'
+        custom_sel = ' selected' if is_custom else ''
         body += (
-            '<label>ElevenLabs voice ID'
-            f'  <input type="text" name="elevenlabs_voice_id" '
-            f'    value="{h(s.get("elevenlabs_voice_id") or "")}" '
-            '    placeholder="21m00Tcm4TlvDq8ikWAM" '
+            f'    <option value="__custom__"{custom_sel}>'
+            'Custom voice ID (use field below)</option>'
+        )
+        body += '  </select>'
+        body += (
+            '  <span class="suffix" style="display:block;">'
+            'Only used when provider = ElevenLabs. These are the '
+            '"Default voices" included with every plan (free tier '
+            'included). Library voices from '
+            '<a href="https://elevenlabs.io/app/voice-library" target="_blank" '
+            'rel="noopener">elevenlabs.io/app/voice-library</a> require a '
+            'paid plan — to use one, pick <em>Custom voice ID</em> above '
+            'and paste the ID into the field below.'
+            '  </span>'
+            '</label>'
+        )
+        body += (
+            '<label>Custom voice ID (optional)'
+            f'  <input type="text" name="elevenlabs_voice_id_custom" '
+            f'    value="{h(current_voice) if is_custom else ""}" '
+            '    placeholder="paste a library voice ID here" '
             '    autocomplete="off">'
             '  <span class="suffix" style="display:block;">'
-            'Only used when provider = ElevenLabs. Default '
-            '<code>21m00Tcm4TlvDq8ikWAM</code> is "Rachel" — a clean '
-            'narration voice available on every account. Browse other '
-            'voices and copy their IDs from '
-            '<a href="https://elevenlabs.io/app/voice-library" target="_blank" '
-            'rel="noopener">elevenlabs.io/app/voice-library</a>.'
+            'Only takes effect when "Custom voice ID" is selected above. '
+            'Requires a paid ElevenLabs plan for library voices.'
             '  </span>'
             '</label>'
         )
@@ -5277,6 +7104,13 @@ def cmd_serve(args) -> int:
             v = request.form.get(key)
             if v is not None:
                 s[key] = v.strip()
+        # The voice selector ships the sentinel "__custom__" when the
+        # user wants to paste a library voice ID. Swap in the custom
+        # field's value so downstream code (which only reads
+        # elevenlabs_voice_id) doesn't need to know about the sentinel.
+        if s.get("elevenlabs_voice_id") == "__custom__":
+            custom = (request.form.get("elevenlabs_voice_id_custom") or "").strip()
+            s["elevenlabs_voice_id"] = custom or "nPczCjzI2devNBz1zQrb"
         # Checkboxes are absent from request.form when unchecked.
         s["claude_code_vision"] = bool(request.form.get("claude_code_vision"))
         save_settings(s)
@@ -5840,7 +7674,8 @@ def cmd_serve(args) -> int:
 
         try:
             proc = subprocess.Popen(
-                [yt2md_path, url, "-o", str(digest_path)],
+                [yt2md_path, url, "-o", str(digest_path),
+                 "--source", "oneoff"],
                 cwd=digest_path.parent,
                 stdout=log_fd,
                 stderr=subprocess.STDOUT,
@@ -6203,84 +8038,14 @@ def cmd_serve(args) -> int:
         return page(body, title=video_id, current=f"digest:{video_id}",
                     base_href=f"/digests/{video_id}/")
 
-    def _resolve_cached_srt(video_id: str) -> Tuple[Path, str]:
-        """Locate the cached SRT for a digest and pull the BCP-47 lang from
-        its filename. Used by the panel + takeaway background workers
-        (mirrors what the slides backfill does for the MP4)."""
-        srt_dir = digests_dir / video_id / "downloads" / video_id
-        srt_files = list(srt_dir.glob("*.srt")) if srt_dir.exists() else []
-        if not srt_files:
-            raise RuntimeError(
-                "No cached transcript. Re-digest the video first."
-            )
-        srt_path = srt_files[0]
-        lang = (
-            srt_path.stem[len(video_id) + 1:]
-            if srt_path.stem.startswith(video_id + ".") else "en"
-        )
-        return srt_path, lang
-
     def _build_panel_for_digest(video_id: str) -> None:
-        """Background worker for panel generation. Atomic write via .tmp →
-        rename so the polling UI never sees a half-written file as ready."""
-        digest_md = digests_dir / video_id / "digest.md"
-        if not digest_md.exists():
-            raise RuntimeError("digest.md missing — re-digest first.")
-        srt_path, lang = _resolve_cached_srt(video_id)
-        s = load_settings()
-        backend = select_backend()
-        panel_model = s.get("panel_model") or DEFAULT_PANEL_MODEL
-        segments = parse_srt(srt_path)
-        text, p_usage = generate_panel_discussion(
-            digest_md.read_text(), segments,
-            model=panel_model, source_lang=lang,
-            output_language=s.get("digest_language") or "auto",
-            backend=backend,
-        )
-        record_llm_usage(
-            video_id=video_id, kind="panel", model=panel_model,
-            backend_name=backend.name, usage=p_usage,
-        )
-        panel_path = digests_dir / video_id / "panel.md"
-        tmp_out = panel_path.with_suffix(".md.tmp")
-        tmp_out.write_text(text)
-        tmp_out.replace(panel_path)
+        """Background worker for panel generation. Delegates to the
+        module-level builder so the agent API can call the same path."""
+        build_panel_for_video(video_id, digests_dir=digests_dir)
 
     def _build_takeaway_for_digest(video_id: str) -> None:
-        """Background worker for takeaway generation. Atomic write."""
-        digest_md = digests_dir / video_id / "digest.md"
-        if not digest_md.exists():
-            raise RuntimeError("digest.md missing — re-digest first.")
-        srt_path, lang = _resolve_cached_srt(video_id)
-        # Use the existing panel.md (if any) so the takeaway can weave its
-        # critique in. Otherwise the prompt copes without it.
-        panel_md_path = digests_dir / video_id / "panel.md"
-        panel_text = panel_md_path.read_text() if panel_md_path.exists() else None
-        s = load_settings()
-        backend = select_backend()
-        takeaway_model = (os.environ.get("YT2MD_TAKEAWAY_MODEL")
-                          or DEFAULT_TAKEAWAY_MODEL)
-        segments = parse_srt(srt_path)
-        takeaway_text, t_usage = generate_takeaway(
-            digest_md.read_text(), panel_text, segments,
-            model=takeaway_model,
-            publish_date=None,
-            source_lang=lang,
-            output_language=s.get("digest_language") or "auto",
-            backend=backend,
-        )
-        record_llm_usage(
-            video_id=video_id, kind="takeaway", model=takeaway_model,
-            backend_name=backend.name, usage=t_usage,
-        )
-        body = render_takeaway_markdown(
-            takeaway_text,
-            video_url=f"https://www.youtube.com/watch?v={video_id}",
-        )
-        takeaway_path = digests_dir / video_id / "takeaway.md"
-        tmp_out = takeaway_path.with_suffix(".md.tmp")
-        tmp_out.write_text(body)
-        tmp_out.replace(takeaway_path)
+        """Background worker for takeaway generation. Delegates."""
+        build_takeaway_for_video(video_id, digests_dir=digests_dir)
 
     @app.route("/digests/<video_id>/discuss", methods=["POST"])
     def generate_panel_route(video_id):
@@ -6556,70 +8321,9 @@ def cmd_serve(args) -> int:
         )
 
     def _build_slides_for_digest(video_id: str) -> None:
-        """Synchronous slides-only pipeline against cached MP4 + SRT.
-        Raises on any failure; the caller (sync or async) is expected to
-        catch and surface the error. Idempotent: writes slides.pptx atomically
-        via a temp suffix swap so a partial write doesn't leave a corrupt file.
-        """
-        cache_dir = digests_dir / video_id / "downloads" / video_id
-        if not cache_dir.exists():
-            raise RuntimeError("No cached video. Re-digest the video first.")
-        mp4_path = cache_dir / f"{video_id}.mp4"
-        srt_files = list(cache_dir.glob("*.srt"))
-        if not mp4_path.exists() or not srt_files:
-            raise RuntimeError(
-                "Cached video or SRT missing. Re-digest the video first."
-            )
-        srt_path = srt_files[0]
-        workdir = Path(tempfile.mkdtemp(prefix="v2d_slides_"))
-        scene_dir = workdir / "scene"
-        interval_dir = workdir / "interval"
-        try:
-            duration = get_video_duration(mp4_path)
-            scene_frames, interval_frames = extract_scene_and_interval_frames(
-                mp4_path, scene_dir, interval_dir,
-                scene_threshold=0.2, interval=20.0, duration=duration,
-            )
-            frames = merge_frames(scene_frames, interval_frames)
-            frames = dedupe_frames(frames, 4)
-            # Slide-aware filtering: global pHash cluster (talk-deck pattern)
-            # then optional vision-LLM classifier via 3×3 grids. Same logic
-            # as the CLI auto-pipeline path.
-            deck_frames = global_phash_cluster(frames)
-            settings = load_settings()
-            if (settings.get("slide_classification", True)
-                    and len(deck_frames) > _GRID_CELLS):
-                try:
-                    backend = select_backend()
-                    if getattr(backend, "vision_supported", False):
-                        deck_frames = classify_slides_via_grids(
-                            deck_frames, backend=backend,
-                            model=settings.get("slide_classifier_model")
-                                  or "claude-haiku-4-5-20251001",
-                            workdir=workdir,
-                            log_video_id=video_id,
-                        )
-                except Exception:
-                    # Backend unavailable / call failed → use pHash-only set.
-                    pass
-            segments = parse_srt(srt_path)
-            slides_data = assign_transcript_to_frames(deck_frames, segments, duration)
-            # Title for the deck's title slide. Prefer the digest's H1 (the
-            # original YouTube title) — falls back to the video_id if absent.
-            digest_md_path = digests_dir / video_id / "digest.md"
-            title = video_id
-            if digest_md_path.exists():
-                for line in digest_md_path.read_text().splitlines():
-                    if line.startswith("# "):
-                        title = line[2:].strip()
-                        break
-            # Write through a temp path then rename so the polling UI
-            # never sees a half-written .pptx as "ready".
-            tmp_out = digests_dir / video_id / "slides.pptx.tmp"
-            build_deck(slides_data, tmp_out, title)
-            tmp_out.replace(digests_dir / video_id / "slides.pptx")
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+        """Background worker for slides generation. Delegates to the
+        module-level builder so the agent API shares this code path."""
+        build_slides_for_video(video_id, digests_dir=digests_dir)
 
     @app.route("/digests/<video_id>/slides", methods=["POST"])
     def generate_slides_route(video_id):
@@ -6633,26 +8337,9 @@ def cmd_serve(args) -> int:
         return redirect(f"/digests/{video_id}/")
 
     def _build_audio_for_artifact(video_id: str, kind: str) -> None:
-        """Background worker: turn one artifact's markdown into an MP3
-        via macOS `say` + ffmpeg. Idempotent + atomic; raises on failure."""
-        src_name = AUDIO_SOURCE_BY_KIND.get(kind)
-        if src_name is None:
-            raise RuntimeError(f"unknown audio kind: {kind}")
-        md_path = digests_dir / video_id / src_name
-        if not md_path.exists():
-            raise RuntimeError(
-                f"{src_name} not found — generate it first before requesting audio."
-            )
-        mp3_path = digests_dir / video_id / f"{kind}.mp3"
-        s = load_settings()
-        generate_audio_from_markdown(
-            md_path, mp3_path,
-            provider=s.get("tts_provider"),
-            voice=s.get("tts_voice") or None,
-            rate=s.get("tts_rate") or None,
-            elevenlabs_voice_id=s.get("elevenlabs_voice_id") or None,
-            elevenlabs_model=s.get("elevenlabs_model") or None,
-        )
+        """Background worker — delegates to module-level builder so the
+        agent API can share this code path."""
+        build_audio_for_artifact(video_id, kind, digests_dir=digests_dir)
 
     @app.route("/digests/<video_id>/audio/<kind>", methods=["POST"])
     def generate_audio_route(video_id, kind):
@@ -6899,6 +8586,415 @@ def cmd_doctor(args) -> int:
     return 0
 
 
+# ---- Library CLI subcommands -------------------------------------------
+#
+# Thin wrappers over the agent API for shell / scheduler use. Designed
+# to be pipe-friendly: --json flips text output (human-readable) to a
+# JSON stream that jq or a Claude Desktop scheduled task can consume.
+
+def _maybe_print_json(obj, *, as_json: bool) -> None:
+    """Pretty-print as JSON or pass to the human-readable formatter."""
+    if as_json:
+        print(json.dumps(obj, indent=2, ensure_ascii=False))
+        return
+    _print_human(obj)
+
+
+def _print_human(obj) -> None:
+    """Minimal human-readable view for the CLI subcommands. JSON is
+    available via --json for any caller that needs full fidelity."""
+    if isinstance(obj, list):
+        if not obj:
+            print("(empty)")
+            return
+        for item in obj:
+            if isinstance(item, dict) and "id" in item and "title" in item:
+                # list_digests entry
+                flags = "".join([
+                    "P" if item.get("has_panel") else "-",
+                    "T" if item.get("has_takeaway") else "-",
+                    "S" if item.get("has_slides") else "-",
+                ])
+                date = item.get("published_at") or "    -    "
+                read = "·" if item.get("read") else " "
+                print(f"  {read} {item['id']:14s} [{flags}] {date}  {item['title']}")
+            elif isinstance(item, dict) and "digest_id" in item and "section" in item:
+                # search_library hit
+                print(f"  [{item['score']:>2d}] {item['digest_id']:14s} "
+                      f"{item['section']:20s} {item.get('snippet', '')}")
+            elif isinstance(item, dict) and "url" in item:
+                print(f"  {item['url']}")
+            else:
+                print(f"  {item}")
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            print(f"  {k}: {v}")
+        return
+    print(obj)
+
+
+def cmd_list(args) -> int:
+    """yt2md list — browse the local digest library."""
+    entries = list_digests(
+        channel=args.channel or None,
+        since=args.since or None,
+        unread=args.unread,
+        q=args.q or None,
+        topic=args.topic or None,
+        source=args.source or None,
+        saved=True if args.saved else None,
+        dismissed=True if args.dismissed else False,
+        limit=args.limit,
+    )
+    _maybe_print_json(entries, as_json=args.json)
+    return 0
+
+
+def cmd_read(args) -> int:
+    """yt2md read <id> — read a section of a digest."""
+    try:
+        result = read_digest(args.video_id, section=args.section)
+    except (ValueError, NotImplementedError, FileNotFoundError) as e:
+        sys.exit(f"read failed: {e}")
+    _maybe_print_json(result, as_json=args.json)
+    return 0
+
+
+def cmd_search(args) -> int:
+    """yt2md search <query> — substring search across the library."""
+    hits = search_library(args.query, k=args.k)
+    _maybe_print_json(hits, as_json=args.json)
+    return 0
+
+
+def cmd_digest(args) -> int:
+    """yt2md digest <url> — kick off the ingestion pipeline for a URL.
+    Non-blocking by default; --wait blocks until done."""
+    result = digest_video(args.url, blocking=args.wait, source=args.source)
+    _maybe_print_json(result, as_json=args.json)
+    return 0
+
+
+def cmd_topics(args) -> int:
+    """yt2md topics — list the topic taxonomy across the library."""
+    topics = list_topics(
+        min_digests=args.min_digests, limit=args.limit,
+        source=args.source or None,
+    )
+    if args.json:
+        print(json.dumps(topics, indent=2, ensure_ascii=False))
+        return 0
+    if not topics:
+        print("(no topics yet — tag a digest with `yt2md retrofit-topics`)")
+        return 0
+    for t in topics:
+        srcs = []
+        if t["sources"]["llm"]: srcs.append("llm")
+        if t["sources"]["user"]: srcs.append("user")
+        print(f"  {t['n_digests']:>3d}  {t['topic']:30s}  ({'+'.join(srcs)})")
+    return 0
+
+
+def cmd_retrofit_topics(args) -> int:
+    """yt2md retrofit-topics — tag any digest that doesn't already have
+    LLM topics. Resumable. Use --dry-run first to see what would happen."""
+    result = retrofit_topics(
+        since=args.since or None,
+        limit=args.limit,
+        dry_run=args.dry_run,
+    )
+    if args.dry_run:
+        print(f"\nWould tag {result['count']} digest(s):")
+        for vid in result["would_tag"][:20]:
+            print(f"  {vid}")
+        if result["count"] > 20:
+            print(f"  ... and {result['count'] - 20} more")
+        return 0
+    print(f"\nTagged {result['tagged']} of {result['candidates']}; "
+          f"errors: {len(result['errors'])}")
+    return 0 if not result["errors"] else 1
+
+
+# ---- MCP server subcommand ---------------------------------------------
+#
+# Exposes the Phase A agent API (read_digest, search_library, etc.) over
+# the Model Context Protocol so Claude Desktop / Claude Code / any MCP
+# client can talk to the local library. Tools intentionally mirror the
+# Python API one-to-one — the server is a thin transport adapter, not a
+# new abstraction layer. Logic lives in the existing functions.
+
+def cmd_mcp(args) -> int:
+    """Run the yt2md MCP server (stdio transport).
+
+    Wire it into Claude Desktop by adding to
+    ~/Library/Application Support/Claude/claude_desktop_config.json:
+
+        {
+          "mcpServers": {
+            "yt2md": {"command": "yt2md", "args": ["mcp"]}
+          }
+        }
+
+    Wire it into Claude Code with:
+        claude mcp add yt2md -- yt2md mcp
+    """
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ImportError:
+        sys.exit(
+            "MCP server requires the `mcp` package. Reinstall with:\n"
+            "  uv tool install --force --python 3.11 .\n"
+            "or:\n"
+            "  pip install 'mcp>=1.2'"
+        )
+
+    mcp = FastMCP("yt2md")
+
+    # ---- Library navigation -------------------------------------------
+
+    @mcp.tool()
+    def list_digests(
+        channel: str = "",
+        since: str = "",
+        unread: bool = False,
+        q: str = "",
+        topic: str = "",
+        source: str = "",
+        saved: bool = False,
+        include_dismissed: bool = False,
+        only_dismissed: bool = False,
+        limit: int = 20,
+    ) -> list:
+        """List digests in the local yt2md library, most recent first.
+
+        Use to browse the library or to find videos before drilling in
+        with read_digest. Filters compose (AND).
+
+        Args:
+            channel: case-insensitive substring match against channel name.
+            since: ISO date "YYYY-MM-DD"; only digests at or after this date.
+            unread: true → only digests not yet marked read.
+            q: case-insensitive substring match against title.
+            topic: exact-match on a topic tag (LLM or user-assigned).
+                Use list_topics to discover available tags.
+            source: "subscription" | "oneoff" | "meta" (provenance filter).
+            saved: true → only user-saved digests.
+            include_dismissed: false (default) hides user-dismissed digests.
+                true → show all including dismissed.
+            only_dismissed: true → only dismissed digests (overrides
+                include_dismissed).
+            limit: max entries (default 20, hard cap 200).
+
+        Returns: list of {id, title, url, channel, channel_url,
+            published_at, mtime, read, topics, topics_split, source,
+            user_saved, user_dismissed, has_panel, has_takeaway,
+            has_slides, has_audio}.
+        """
+        dismissed_filter: Optional[bool]
+        if only_dismissed:
+            dismissed_filter = True
+        elif include_dismissed:
+            dismissed_filter = None  # don't filter
+        else:
+            dismissed_filter = False
+        return globals()["list_digests"](
+            channel=channel or None, since=since or None, unread=unread,
+            q=q or None, topic=topic or None, source=source or None,
+            saved=True if saved else None, dismissed=dismissed_filter,
+            limit=min(limit, 200),
+        )
+
+    @mcp.tool()
+    def read_digest(digest_id: str, section: str = "full") -> dict:
+        """Read a section of a digest as structured data.
+
+        section options:
+            "meta"           - just video metadata
+            "overview"       - the opening overview paragraph
+            "topics"         - all topics (titles + bodies + bullets)
+            "topic:N"        - the Nth topic (1-indexed)
+            "topic:<slug>"   - first topic whose title contains <slug>
+            "panel"          - panelists + all turns
+            "panel:panelists"- just the panelist bios
+            "panel:turn:N"   - the Nth panel turn
+            "takeaway"       - paragraphs + inline citations
+            "full"           - everything (digest only; panel/takeaway
+                               are separate)
+
+        Returns: {section, video, content}. Always includes a `video`
+        block so the caller can deep-link back to YouTube. Raises
+        ValueError for unknown sections or out-of-range indices.
+        """
+        return globals()["read_digest"](digest_id, section=section)
+
+    @mcp.tool()
+    def search_library(q: str, k: int = 10) -> list:
+        """Substring search across the local library (digest + panel +
+        takeaway). Case-insensitive whole-token AND match.
+
+        Use this to find which digests mention a topic, then pipe a
+        hit's `section` directly into read_digest for the full content.
+
+        Returns: list of {digest_id, title, section, snippet, score,
+            url, video} sorted by score desc (title hits weight highest).
+        """
+        return globals()["search_library"](q, k=min(k, 50))
+
+    # ---- Ingestion + generation ---------------------------------------
+
+    @mcp.tool()
+    def digest_video(url: str) -> dict:
+        """Ingest a YouTube video into the library. Non-blocking: spawns
+        the digest pipeline as a detached child process and returns the
+        job handle. The pipeline takes 5-10 minutes for a typical video.
+
+        Skip-if-exists: if the video is already digested, returns the
+        existing digest immediately without re-running.
+
+        Returns one of:
+            {video_id, status: "exists", digest: <full digest JSON>}
+            {video_id, job_id, status: "started", log_path}
+        """
+        return globals()["digest_video"](url, blocking=False)
+
+    @mcp.tool()
+    def generate_panel(video_id: str) -> dict:
+        """Generate the panel discussion for a digested video. Non-
+        blocking: runs in a background thread. Poll with job_status
+        or just read_digest(id, "panel") after a couple of minutes.
+
+        Returns: {video_id, kind: "panel", status, job_key}.
+        """
+        return globals()["generate_panel"](video_id, blocking=False)
+
+    @mcp.tool()
+    def generate_takeaway(video_id: str) -> dict:
+        """Generate the takeaway synthesis for a digested video. Best
+        run after the panel exists so it can integrate panel critique.
+        Non-blocking; see generate_panel for shape."""
+        return globals()["generate_takeaway"](video_id, blocking=False)
+
+    @mcp.tool()
+    def generate_slides(video_id: str) -> dict:
+        """Generate the slide deck (.pptx) from cached frames for a
+        digested video. Non-blocking; see generate_panel for shape."""
+        return globals()["generate_slides"](video_id, blocking=False)
+
+    @mcp.tool()
+    def generate_audio(video_id: str, kind: str) -> dict:
+        """Render a digest/panel/takeaway to MP3 using the configured
+        TTS provider (macOS `say` or ElevenLabs). Non-blocking; poll
+        via job_status with kind=f"audio_{kind}".
+
+        kind: "digest" | "panel" | "takeaway".
+        Skip-if-exists: returns immediately if the mp3 is already on disk."""
+        return globals()["generate_audio"](video_id, kind, blocking=False)
+
+    @mcp.tool()
+    def mark_digest_read(digest_id: str) -> dict:
+        """Mark a digest as read. Use after surfacing a digest to the
+        user so future `list_digests(unread=True)` calls skip it.
+        Idempotent."""
+        return globals()["mark_digest_read"](digest_id)
+
+    @mcp.tool()
+    def mark_digest_unread(digest_id: str) -> dict:
+        """Mark a digest as unread. Idempotent."""
+        return globals()["mark_digest_unread"](digest_id)
+
+    # ---- Topic taxonomy + curation -----------------------------------
+
+    @mcp.tool()
+    def list_topics(min_digests: int = 1, limit: int = 50,
+                    source: str = "") -> list:
+        """List the topic taxonomy across the library.
+
+        Returns [{topic, n_digests, last_seen, sources: {llm, user}}],
+        sorted by digest count desc. Use to answer "what have I been
+        reading about?" and to pick a tag for list_digests(topic=...).
+
+        source: '' (union) | 'llm' | 'user'. Filter to one provenance
+        when you want to see only LLM-assigned vs only your manual tags.
+        """
+        return globals()["list_topics"](
+            min_digests=min_digests, limit=limit,
+            source=source or None,
+        )
+
+    @mcp.tool()
+    def tag_digest(digest_id: str, tags: list) -> dict:
+        """Add user tags to a digest. Idempotent. Kept separate from
+        LLM-assigned tags, so this never overwrites the auto-tagging.
+        Tags are normalized to lowercase-hyphen-separated."""
+        return globals()["tag_digest"](digest_id, tags)
+
+    @mcp.tool()
+    def untag_digest(digest_id: str, tags: list) -> dict:
+        """Remove user tags from a digest. LLM tags are not touched."""
+        return globals()["untag_digest"](digest_id, tags)
+
+    @mcp.tool()
+    def save_digest(digest_id: str) -> dict:
+        """Mark a digest as 'saved' (worth keeping / returning to).
+        Surfaces in list_digests(saved=True)."""
+        return globals()["save_digest"](digest_id)
+
+    @mcp.tool()
+    def unsave_digest(digest_id: str) -> dict:
+        """Remove the 'saved' flag."""
+        return globals()["unsave_digest"](digest_id)
+
+    @mcp.tool()
+    def dismiss_digest(digest_id: str) -> dict:
+        """Mark a digest as 'dismissed' so it's hidden from briefings.
+        list_digests(dismissed=False) excludes it by default."""
+        return globals()["dismiss_digest"](digest_id)
+
+    @mcp.tool()
+    def undismiss_digest(digest_id: str) -> dict:
+        """Remove the 'dismissed' flag."""
+        return globals()["undismiss_digest"](digest_id)
+
+    @mcp.tool()
+    def retag_digest(digest_id: str) -> dict:
+        """Re-run the LLM tagging step. Useful when the taxonomy has
+        grown — a digest tagged early can pick up tags introduced later."""
+        return globals()["retag_digest"](digest_id)
+
+    @mcp.tool()
+    def job_status(video_id: str, kind: str) -> dict:
+        """Check the status of a background generation job.
+
+        kind: "panel" | "takeaway" | "slides" | "audio_digest" |
+              "audio_panel" | "audio_takeaway"
+
+        Returns: {phase: "idle"|"running"|"done"|"error", elapsed?, error?}
+        """
+        return local_job_status(f"{video_id}:{kind}")
+
+    # ---- Subscriptions -------------------------------------------------
+
+    @mcp.tool()
+    def list_subscriptions() -> list:
+        """List subscribed YouTube channels."""
+        return globals()["list_subscriptions"]()
+
+    @mcp.tool()
+    def add_subscription(channel_url: str) -> dict:
+        """Subscribe to a YouTube channel. Accepts a full URL, a
+        youtube.com/@handle path, or a bare @handle. Idempotent."""
+        return globals()["add_subscription"](channel_url)
+
+    @mcp.tool()
+    def remove_subscription(channel_url: str) -> dict:
+        """Unsubscribe from a YouTube channel. Idempotent."""
+        return globals()["remove_subscription"](channel_url)
+
+    mcp.run(transport="stdio")
+    return 0
+
+
 # ---- subcommand dispatcher ----
 
 def _subcommand_main(argv: List[str]) -> int:
@@ -6925,6 +9021,80 @@ def _subcommand_main(argv: List[str]) -> int:
     doctor = sub.add_parser("doctor", help="Check prerequisites and config; print a punch list")
     doctor.set_defaults(func=cmd_doctor)
 
+    mcp_parser = sub.add_parser(
+        "mcp",
+        help="Run the MCP server (stdio). Wire into Claude Desktop / Claude Code "
+             "to give an agent access to the library.",
+    )
+    mcp_parser.set_defaults(func=cmd_mcp)
+
+    # ---- Library query/ingest CLI (same surface as the MCP tools) ----
+    list_p = sub.add_parser("list", help="List digests in the library")
+    list_p.add_argument("--channel", default="", help="Substring match on channel name")
+    list_p.add_argument("--since", default="", help='ISO date "YYYY-MM-DD"')
+    list_p.add_argument("--unread", action="store_true", help="Only unread digests")
+    list_p.add_argument("-q", default="", help="Substring match on title")
+    list_p.add_argument("--topic", default="", help="Exact-match on a topic tag")
+    list_p.add_argument("--source", default="",
+                        choices=("", "subscription", "oneoff", "meta"),
+                        help="Provenance filter")
+    list_p.add_argument("--saved", action="store_true",
+                        help="Only digests marked saved")
+    list_p.add_argument("--dismissed", action="store_true",
+                        help="Only digests marked dismissed (hidden by default)")
+    list_p.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
+    list_p.add_argument("--json", action="store_true", help="Emit JSON (default: human-readable)")
+    list_p.set_defaults(func=cmd_list)
+
+    read_p = sub.add_parser("read", help="Read a section of a digest as structured data")
+    read_p.add_argument("video_id", help="YouTube video ID (digest dir name)")
+    read_p.add_argument("--section", default="full",
+                        help='full | meta | overview | topics | topic:N | '
+                             'topic:<slug> | panel | panel:turn:N | '
+                             'panel:panelists | takeaway')
+    read_p.add_argument("--json", action="store_true",
+                        help="Emit JSON (default: pretty-printed)")
+    read_p.set_defaults(func=cmd_read)
+
+    search_p = sub.add_parser("search", help="Substring search across the library")
+    search_p.add_argument("query", help="Search query (case-insensitive, AND across tokens)")
+    search_p.add_argument("-k", type=int, default=10, help="Max hits (default: 10)")
+    search_p.add_argument("--json", action="store_true", help="Emit JSON")
+    search_p.set_defaults(func=cmd_search)
+
+    digest_p = sub.add_parser("digest", help="Ingest a YouTube URL")
+    digest_p.add_argument("url", help="YouTube URL")
+    digest_p.add_argument("--wait", action="store_true",
+                          help="Block until the pipeline finishes (default: detached)")
+    digest_p.add_argument("--source", default="oneoff",
+                          choices=("oneoff", "subscription", "meta"),
+                          help="Provenance stamp (default: oneoff)")
+    digest_p.add_argument("--json", action="store_true", help="Emit JSON")
+    digest_p.set_defaults(func=cmd_digest)
+
+    topics_p = sub.add_parser("topics", help="Show the topic taxonomy")
+    topics_p.add_argument("--min-digests", type=int, default=1,
+                          help="Only show tags with at least N digests")
+    topics_p.add_argument("--limit", type=int, default=50, help="Max tags")
+    topics_p.add_argument("--source", default="",
+                          choices=("", "llm", "user"),
+                          help="Filter by tag provenance")
+    topics_p.add_argument("--json", action="store_true", help="Emit JSON")
+    topics_p.set_defaults(func=cmd_topics)
+
+    retro_p = sub.add_parser(
+        "retrofit-topics",
+        help="Tag any digest in the library that doesn't have LLM topics yet "
+             "(resumable)",
+    )
+    retro_p.add_argument("--since", default="",
+                         help='Only tag digests on or after this date (ISO "YYYY-MM-DD")')
+    retro_p.add_argument("--limit", type=int, default=None,
+                         help="Max digests to tag this run")
+    retro_p.add_argument("--dry-run", action="store_true",
+                         help="Print what would be tagged without calling the LLM")
+    retro_p.set_defaults(func=cmd_retrofit_topics)
+
     args = ap.parse_args(argv)
     return args.func(args)
 
@@ -6934,7 +9104,10 @@ def _subcommand_main(argv: List[str]) -> int:
 def main():
     # Subcommand dispatch — short-circuit the single-video flow when the user
     # invokes yt2md watch / serve / doctor.
-    if len(sys.argv) > 1 and sys.argv[1] in ("watch", "serve", "doctor"):
+    if len(sys.argv) > 1 and sys.argv[1] in (
+        "watch", "serve", "doctor", "mcp",
+        "list", "read", "search", "digest", "topics", "retrofit-topics",
+    ):
         load_env_files()
         sys.exit(_subcommand_main(sys.argv[1:]))
 
@@ -6971,6 +9144,14 @@ def main():
                          "Distillation will still run but without panel-informed confidence tags.")
     ap.add_argument("--no-takeaway", action="store_true",
                     help="Skip the takeaway step (synthesis prose) appended to digest.md.")
+    ap.add_argument("--no-tagging", action="store_true",
+                    help="Skip the LLM topic-tagging step. Tags drive the agent API's "
+                         "topic filter; skip when iterating on the pipeline locally.")
+    ap.add_argument("--source", choices=("oneoff", "subscription", "meta"),
+                    default="oneoff",
+                    help="Provenance tag stamped into digest_meta. Defaults to 'oneoff' "
+                         "(direct CLI / one-off web route). The watch run loop passes "
+                         "'subscription'; meta-digest runs pass 'meta'.")
     ap.add_argument("--digest-model",
                     default=os.environ.get("YT2MD_DIGEST_MODEL") or "claude-sonnet-4-6",
                     help="Claude model for the digest (default: claude-sonnet-4-6). "
@@ -7285,6 +9466,8 @@ def main():
                         print(f"      channel avatar: {ch_cand.name}")
                 else:
                     channel_thumbnail_local = ch_cand
+            import datetime as _dt
+            added_at_iso = _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
             metadata = {
                 "video_id": video_path.stem,
                 "title": video_title,
@@ -7295,6 +9478,16 @@ def main():
                 "channel_url": channel_url or None,
                 "has_thumbnail": thumbnail_local is not None,
                 "has_channel_thumbnail": channel_thumbnail_local is not None,
+                # New: provenance + curation fields. Topics are filled
+                # in by the tagging step below (best-effort).
+                "source": {
+                    "kind": args.source,
+                    "added_at": added_at_iso,
+                },
+                "topics": [],
+                "user_tags": [],
+                "user_dismissed": False,
+                "user_saved": False,
             }
             try:
                 (digest_dir / "metadata.json").write_text(
@@ -7302,6 +9495,28 @@ def main():
                 )
             except OSError:
                 pass
+            # Mirror source provenance into digest_meta so list_digests
+            # filters by `source` are indexed (avoid scanning all JSONs).
+            try:
+                _record_digest_added(video_path.stem, source_kind=args.source)
+            except Exception as _e:
+                print(f"      [warn] couldn't record digest_meta: {_e}")
+
+            # Topic tagging (Haiku, ~$0.001). Best-effort: a failure here
+            # just leaves `topics` empty in metadata.json; can be
+            # backfilled later via `yt2md retrofit-topics`.
+            if not args.no_tagging:
+                print("[+] Tagging topics with Haiku...")
+                try:
+                    tag_result = tag_digest_via_llm(video_path.stem)
+                    tags_str = ", ".join(tag_result["tags"]) or "(none)"
+                    new_str = (
+                        f"  (new: {', '.join(tag_result['new_tags'])})"
+                        if tag_result["new_tags"] else ""
+                    )
+                    print(f"      tags: {tags_str}{new_str}")
+                except Exception as _e:
+                    print(f"      [warn] tagging failed: {_e}")
 
             # Render the digest to markdown text once for the panel + takeaway
             # prompts (saves a re-read on each step). For the panel/takeaway we
