@@ -1379,39 +1379,31 @@ def strip_markdown_for_tts(text: str) -> str:
     return text.strip()
 
 
-def generate_audio_from_markdown(
-    md_path: Path,
-    mp3_path: Path,
-    *,
-    voice: Optional[str] = None,
-    rate: Optional[int] = None,
-) -> None:
-    """Render a markdown file to MP3 via macOS `say` + ffmpeg transcode.
+def _elevenlabs_api_key() -> Optional[str]:
+    """Look up the ElevenLabs API key from the environment. The canonical
+    name is ELEVENLABS_API_KEY, but we accept any case variant since
+    .env files quietly tolerate typos and humans don't notice them."""
+    direct = os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("ELEVEN_API_KEY")
+    if direct:
+        return direct
+    for k, v in os.environ.items():
+        if k.upper() in ("ELEVENLABS_API_KEY", "ELEVEN_API_KEY") and v:
+            return v
+    return None
 
-    macOS only — `say` doesn't exist on Linux or Windows. Cross-platform
-    TTS (piper, cloud APIs) is a future feature; today we leverage what
-    comes free on the user's machine.
 
-    Atomic write via .mp3.tmp → rename so a partial transcode never
-    leaves a corrupt file in place. Cleans up the intermediate AIFF
-    on success or failure.
-
-    voice: any voice from `say -v ?` (default: system default).
-    rate: words per minute (default: system default ≈ 175).
-    """
+def _tts_macos(text: str, mp3_path: Path,
+               *, voice: Optional[str], rate: Optional[int]) -> None:
+    """Render text → MP3 via macOS `say` + ffmpeg transcode."""
     if sys.platform != "darwin":
         raise RuntimeError(
-            "Audio generation currently requires macOS (uses the `say` "
-            "command). Cross-platform TTS is a future feature."
+            "macOS `say` is only available on macOS. Switch your "
+            "TTS provider to 'elevenlabs' in Settings."
         )
     if shutil.which("say") is None:
         raise RuntimeError("`say` not on PATH (expected on macOS).")
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg not on PATH — install with `brew install ffmpeg`.")
-
-    text = strip_markdown_for_tts(md_path.read_text())
-    if not text:
-        raise RuntimeError("Markdown produced no narrate-able text.")
 
     workdir = Path(tempfile.mkdtemp(prefix="yt2md_audio_"))
     try:
@@ -1419,17 +1411,13 @@ def generate_audio_from_markdown(
         say_cmd: List[str] = ["say", "-o", str(aiff_path)]
         if voice:
             say_cmd += ["-v", str(voice)]
-        # Accept rate as int or stringy-int; silently fall back to the
-        # system default on anything we can't parse (a malformed value
-        # in the Settings form shouldn't break audio generation).
         if rate is not None:
             try:
                 rate_int = int(str(rate).strip())
                 say_cmd += ["-r", str(rate_int)]
             except (ValueError, TypeError):
                 pass
-        # Pipe text via stdin to dodge argv length limits + shell quoting
-        # issues. -f - tells `say` to read text from stdin.
+        # -f - reads text from stdin (avoids argv length + shell quoting).
         say_cmd += ["-f", "-"]
         proc = subprocess.run(
             say_cmd, input=text, text=True, capture_output=True,
@@ -1446,8 +1434,6 @@ def generate_audio_from_markdown(
             ["ffmpeg", "-hide_banner", "-y",
              "-i", str(aiff_path),
              "-codec:a", "libmp3lame", "-b:a", "64k",
-             # The .mp3.tmp suffix defeats ffmpeg's extension-based
-             # format detection — pin the muxer explicitly.
              "-f", "mp3", str(mp3_tmp)],
             capture_output=True, text=True,
         )
@@ -1460,6 +1446,144 @@ def generate_audio_from_markdown(
         mp3_tmp.replace(mp3_path)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _chunk_text_for_tts(text: str, max_chars: int) -> List[str]:
+    """Split text into chunks of at most max_chars, preferring paragraph
+    boundaries (split on blank lines), then sentence boundaries, then
+    hard chops as a last resort.
+    """
+    if len(text) <= max_chars:
+        return [text]
+    out: List[str] = []
+    cur = ""
+    for para in text.split("\n\n"):
+        if len(cur) + len(para) + 2 <= max_chars:
+            cur = (cur + "\n\n" + para).strip() if cur else para
+            continue
+        if cur:
+            out.append(cur)
+            cur = ""
+        # Paragraph itself bigger than the budget — split on sentences.
+        if len(para) <= max_chars:
+            cur = para
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", para)
+        for sent in sentences:
+            if len(cur) + len(sent) + 1 <= max_chars:
+                cur = (cur + " " + sent).strip() if cur else sent
+            else:
+                if cur:
+                    out.append(cur)
+                # Sentence too long even alone — hard chop.
+                while len(sent) > max_chars:
+                    out.append(sent[:max_chars])
+                    sent = sent[max_chars:]
+                cur = sent
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def _tts_elevenlabs(text: str, mp3_path: Path,
+                    *, voice_id: str, model_id: str) -> None:
+    """Render text → MP3 via the ElevenLabs API.
+
+    Chunks text on paragraph/sentence boundaries to stay under the
+    per-request character limit (~5k chars). MP3 frames are
+    self-contained so concatenating chunk bytes produces a valid file
+    with negligible audible artifacts at paragraph boundaries.
+
+    Network failures, auth errors, and rate limits all surface as
+    RuntimeError with the response body included so the user can act on
+    them.
+    """
+    import urllib.request
+    import urllib.error
+
+    api_key = _elevenlabs_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "ELEVENLABS_API_KEY not set. Add it to ~/yt2md/.env and "
+            "restart yt2md serve."
+        )
+
+    chunks = _chunk_text_for_tts(text, max_chars=4500)
+    audio_bytes = bytearray()
+    for i, chunk in enumerate(chunks):
+        req = urllib.request.Request(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            method="POST",
+            data=json.dumps({
+                "text": chunk,
+                "model_id": model_id,
+                "voice_settings": {
+                    "stability": 0.5,
+                    "similarity_boost": 0.75,
+                },
+            }).encode("utf-8"),
+            headers={
+                "xi-api-key": api_key,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+                "User-Agent": "yt2md/1.0 (ElevenLabs TTS)",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                audio_bytes.extend(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")[:500]
+            raise RuntimeError(
+                f"ElevenLabs API error {e.code} on chunk {i + 1}/"
+                f"{len(chunks)}: {body}"
+            )
+        except urllib.error.URLError as e:
+            raise RuntimeError(
+                f"ElevenLabs API request failed on chunk {i + 1}/"
+                f"{len(chunks)}: {e.reason}"
+            )
+
+    if not audio_bytes:
+        raise RuntimeError("ElevenLabs returned no audio bytes.")
+
+    mp3_path.parent.mkdir(parents=True, exist_ok=True)
+    mp3_tmp = mp3_path.with_suffix(".mp3.tmp")
+    mp3_tmp.write_bytes(bytes(audio_bytes))
+    mp3_tmp.replace(mp3_path)
+
+
+def generate_audio_from_markdown(
+    md_path: Path,
+    mp3_path: Path,
+    *,
+    provider: Optional[str] = None,
+    voice: Optional[str] = None,
+    rate: Optional[int] = None,
+    elevenlabs_voice_id: Optional[str] = None,
+    elevenlabs_model: Optional[str] = None,
+) -> None:
+    """Strip markdown to plain text and synthesize an MP3 via the
+    configured TTS provider.
+
+    provider: "macos" (default, free, lower quality) or "elevenlabs"
+    (high quality, costs against your ElevenLabs plan credits).
+    """
+    text = strip_markdown_for_tts(md_path.read_text())
+    if not text:
+        raise RuntimeError("Markdown produced no narrate-able text.")
+
+    chosen = (provider or "macos").lower()
+    if chosen == "elevenlabs":
+        _tts_elevenlabs(
+            text, mp3_path,
+            voice_id=elevenlabs_voice_id or "21m00Tcm4TlvDq8ikWAM",
+            model_id=elevenlabs_model or "eleven_multilingual_v2",
+        )
+    elif chosen == "macos":
+        _tts_macos(text, mp3_path, voice=voice, rate=rate)
+    else:
+        raise RuntimeError(f"Unknown tts_provider: {chosen!r}")
 
 
 # Maps the audio "kind" string used in URLs / job keys to the source
@@ -3012,16 +3136,27 @@ DEFAULT_SETTINGS = {
     # cleaner deck. Set False to use pure pHash dedup only.
     "slide_classification": True,
     "slide_classifier_model": "claude-haiku-4-5-20251001",
-    # TTS voice + rate for macOS `say`. Blank → use system default voice,
-    # which is what you want if you've set Siri Voice 1/2/3 as your system
-    # voice in System Settings → Accessibility → Spoken Content (the
-    # best-quality option). Otherwise try "Fiona" or "Samantha" for the
-    # most natural-sounding non-Siri options. `say -v ?` lists all
-    # voices installed on your machine.
+    # Which TTS backend the 🎧 Listen button uses.
+    #   "macos":      built-in `say` + ffmpeg. Free, offline, lower quality
+    #                 unless you set Siri Voice 1 as your system voice.
+    #   "elevenlabs": ElevenLabs API. Much higher quality, costs against
+    #                 your plan credits. Requires ELEVENLABS_API_KEY in
+    #                 ~/yt2md/.env.
+    "tts_provider": "macos",
+    # macOS-only: voice name (blank → system default). For best quality
+    # leave this blank AND set Siri Voice 1/2/3 as your System Voice in
+    # System Settings → Accessibility → Spoken Content. Otherwise try
+    # "Fiona" or "Samantha (Enhanced)". `say -v ?` lists all voices.
     "tts_voice": "",
-    # Speaking rate in words/min. Blank → system default (≈175 wpm).
-    # Common preferences: 150 for relaxed listening, 200+ to skim faster.
+    # macOS-only: speaking rate in words/min. Blank → system default (~175).
     "tts_rate": "",
+    # ElevenLabs voice ID. Default = "Rachel" (a clean narration voice
+    # available on every account). Pick another from your voice library
+    # at https://elevenlabs.io/app/voice-library.
+    "elevenlabs_voice_id": "21m00Tcm4TlvDq8ikWAM",
+    # ElevenLabs model. eleven_multilingual_v2 is the high-quality default;
+    # eleven_turbo_v2_5 is faster + cheaper; eleven_flash_v2_5 is fastest.
+    "elevenlabs_model": "eleven_multilingual_v2",
 }
 
 
@@ -5030,36 +5165,97 @@ def cmd_serve(args) -> int:
             '</label>'
         )
 
-        # TTS voice + rate for the 🎧 Listen audio feature on viewer pages.
-        # macOS `say` only — settings still save on other platforms but
-        # won't have any effect there. Blank → system defaults.
+        # TTS provider + per-provider settings for the 🎧 Listen feature
+        # on viewer pages. macOS `say` is free + offline + lower quality;
+        # ElevenLabs is paid + cloud + much higher quality.
+        tts_provider_choices = (
+            ("macos", "macOS `say` — free, offline, lower quality"),
+            ("elevenlabs", "ElevenLabs — paid, cloud, much higher quality"),
+        )
+        body += '<label>TTS provider'
+        body += '  <select name="tts_provider">'
+        for code, label in tts_provider_choices:
+            sel = ' selected' if s.get("tts_provider", "macos") == code else ''
+            body += f'    <option value="{code}"{sel}>{h(label)}</option>'
+        body += '  </select>'
         body += (
-            '<label>TTS voice (macOS only)'
+            '  <span class="suffix" style="display:block;">'
+            'Which backend renders the MP3 when you click 🎧 Listen on a '
+            'digest / panel / takeaway. ElevenLabs sounds dramatically '
+            'better but costs against your plan credits — set '
+            '<code>ELEVENLABS_API_KEY</code> in <code>~/yt2md/.env</code> '
+            '(get one at <a href="https://elevenlabs.io/app/settings/api-keys" '
+            'target="_blank" rel="noopener">elevenlabs.io</a>).'
+            '  </span>'
+            '</label>'
+        )
+
+        # macOS-only fields.
+        body += (
+            '<label>macOS TTS voice'
             f'  <input type="text" name="tts_voice" '
             f'    value="{h(s.get("tts_voice") or "")}" '
             '    placeholder="(leave blank to use the system default voice)" '
             '    autocomplete="off">'
             '  <span class="suffix" style="display:block;">'
-            'Used by the 🎧 Listen button when generating MP3 narration. '
-            'For the best quality, leave this blank AND set a Siri voice '
-            'as your system default in '
+            'Only used when provider = macOS. For the best quality, leave '
+            'this blank AND set a Siri voice as your system default in '
             '<strong>System Settings → Accessibility → Spoken Content → '
-            'System Voice</strong> (download "Siri Voice 1"). '
-            'For non-Siri options try <code>Fiona</code>, '
-            '<code>Samantha (Enhanced)</code>, or run <code>say -v ?</code> '
-            'in Terminal to see every voice installed on your machine.'
+            'System Voice</strong> (download "Siri Voice 1"). For non-Siri '
+            'options try <code>Fiona</code>, <code>Samantha (Enhanced)</code>, '
+            'or run <code>say -v ?</code> in Terminal to see every voice '
+            'installed on your machine.'
             '  </span>'
             '</label>'
         )
         body += (
-            '<label>TTS speaking rate'
+            '<label>macOS TTS speaking rate'
             f'  <input type="text" name="tts_rate" '
             f'    value="{h(s.get("tts_rate") or "")}" '
             '    placeholder="(blank = system default, ~175 wpm)" '
             '    inputmode="numeric" autocomplete="off">'
             '  <span class="suffix" style="display:block;">'
-            'Words per minute. 150 reads slowly + relaxed, 200+ skims '
-            'faster. Blank uses the system default (~175). '
+            'Only used when provider = macOS. Words per minute — 150 reads '
+            'slowly + relaxed, 200+ skims faster. Blank uses the system '
+            'default (~175).'
+            '  </span>'
+            '</label>'
+        )
+
+        # ElevenLabs-only fields.
+        body += (
+            '<label>ElevenLabs voice ID'
+            f'  <input type="text" name="elevenlabs_voice_id" '
+            f'    value="{h(s.get("elevenlabs_voice_id") or "")}" '
+            '    placeholder="21m00Tcm4TlvDq8ikWAM" '
+            '    autocomplete="off">'
+            '  <span class="suffix" style="display:block;">'
+            'Only used when provider = ElevenLabs. Default '
+            '<code>21m00Tcm4TlvDq8ikWAM</code> is "Rachel" — a clean '
+            'narration voice available on every account. Browse other '
+            'voices and copy their IDs from '
+            '<a href="https://elevenlabs.io/app/voice-library" target="_blank" '
+            'rel="noopener">elevenlabs.io/app/voice-library</a>.'
+            '  </span>'
+            '</label>'
+        )
+        elevenlabs_model_choices = (
+            ("eleven_multilingual_v2", "eleven_multilingual_v2 — best quality"),
+            ("eleven_turbo_v2_5", "eleven_turbo_v2_5 — faster, slightly lower quality"),
+            ("eleven_flash_v2_5", "eleven_flash_v2_5 — fastest, cheapest"),
+        )
+        body += '<label>ElevenLabs model'
+        body += '  <select name="elevenlabs_model">'
+        for code, label in elevenlabs_model_choices:
+            cur = s.get("elevenlabs_model") or "eleven_multilingual_v2"
+            sel = ' selected' if cur == code else ''
+            body += f'    <option value="{code}"{sel}>{h(label)}</option>'
+        body += '  </select>'
+        body += (
+            '  <span class="suffix" style="display:block;">'
+            'Only used when provider = ElevenLabs. multilingual_v2 is the '
+            'high-quality default; the turbo/flash options trade quality '
+            'for speed + lower credit cost.'
             '  </span>'
             '</label>'
         )
@@ -5076,7 +5272,8 @@ def cmd_serve(args) -> int:
         s = load_settings()
         for key in ("digest_model", "panel_model", "whisper_model",
                     "cookies_from_browser", "digest_language", "llm_backend",
-                    "tts_voice", "tts_rate"):
+                    "tts_provider", "tts_voice", "tts_rate",
+                    "elevenlabs_voice_id", "elevenlabs_model"):
             v = request.form.get(key)
             if v is not None:
                 s[key] = v.strip()
@@ -6450,8 +6647,11 @@ def cmd_serve(args) -> int:
         s = load_settings()
         generate_audio_from_markdown(
             md_path, mp3_path,
+            provider=s.get("tts_provider"),
             voice=s.get("tts_voice") or None,
             rate=s.get("tts_rate") or None,
+            elevenlabs_voice_id=s.get("elevenlabs_voice_id") or None,
+            elevenlabs_model=s.get("elevenlabs_model") or None,
         )
 
     @app.route("/digests/<video_id>/audio/<kind>", methods=["POST"])
