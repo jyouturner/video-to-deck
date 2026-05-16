@@ -6673,10 +6673,16 @@ def cmd_serve(args) -> int:
             f"{video_id}:audio_{kind}",
             _build_audio_for_artifact, video_id, kind,
         )
-        # Redirect back to whatever viewer the user clicked from. We don't
-        # know which one called us so bounce to /digests/<id>/ — sidebar
-        # poller + job poller will surface the result wherever the user is.
-        return redirect(f"/digests/{video_id}/")
+        # Bounce back to the kind-specific viewer the user clicked from
+        # (digest / panel / takeaway). Going to the wrong tab would
+        # leave them staring at a different page with no visible sign
+        # that anything is happening.
+        viewer_path = {
+            "digest":   f"/digests/{video_id}/",
+            "panel":    f"/digests/{video_id}/panel/",
+            "takeaway": f"/digests/{video_id}/takeaway/",
+        }[kind]
+        return redirect(viewer_path)
 
     @app.route("/digests/<video_id>/audio/<kind>.mp3")
     def serve_audio(video_id, kind):
