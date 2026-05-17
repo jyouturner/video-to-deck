@@ -8383,6 +8383,104 @@ def cmd_serve(args) -> int:
             mimetype="audio/mpeg",
         )
 
+    @app.route("/podcast.xml")
+    def podcast_feed():
+        """RSS 2.0 podcast feed listing every *.mp3 in the library as an
+        episode. Subscribe in Apple Podcasts / Overcast / etc. with the
+        URL of this endpoint — once subscribed, the app auto-downloads
+        new takeaways, plays offline, and resumes mid-episode.
+
+        Audio URLs are derived from request.host_url so subscribing from
+        a phone (over LAN with --host 0.0.0.0) bakes phone-reachable
+        URLs into the feed."""
+        from flask import request, Response
+        from html import escape as h
+        from email.utils import format_datetime
+        import datetime as _dt
+
+        base = request.host_url.rstrip("/")
+        items_xml: list = []
+        latest_pub = None
+
+        # Walk all digest dirs, pull each MP3 as a separate episode so
+        # podcast apps queue digest/panel/takeaway independently. Sort
+        # by audio mtime desc so the newest renderings appear first
+        # (podcast apps care about pubDate, not feed position, but
+        # ordering helps anyone eyeballing the raw XML).
+        episodes: list = []
+        for d in digests_dir.iterdir() if digests_dir.exists() else []:
+            if not d.is_dir():
+                continue
+            for kind in AUDIO_SOURCE_BY_KIND:  # digest / panel / takeaway
+                mp3 = d / f"{kind}.mp3"
+                if not mp3.exists():
+                    continue
+                episodes.append((mp3.stat().st_mtime, d.name, kind, mp3))
+        episodes.sort(reverse=True)
+
+        for mtime, vid, kind, mp3 in episodes:
+            # Pull title + overview from digest.json (cheap; cached).
+            try:
+                dj = load_digest_json(vid, digests_dir=digests_dir)
+                title = dj["video"].get("title") or vid
+                overview = dj.get("overview") or ""
+            except Exception:
+                title = vid
+                overview = ""
+            kind_label = kind.capitalize()
+            ep_title = f"{kind_label}: {title}"
+            ep_guid = f"yt2md:{vid}:{kind}"
+            ep_pub = format_datetime(
+                _dt.datetime.fromtimestamp(mtime, tz=_dt.timezone.utc)
+            )
+            if latest_pub is None or mtime > latest_pub:
+                latest_pub = mtime
+            ep_url = f"{base}/digests/{vid}/audio/{kind}.mp3"
+            try:
+                ep_size = mp3.stat().st_size
+            except OSError:
+                ep_size = 0
+            # Description: kind hint + the digest's overview, so the
+            # podcast app's episode notes give the listener context.
+            desc_body = f"({kind_label} narration) {overview}".strip()
+            items_xml.append(
+                f"  <item>\n"
+                f"    <title>{h(ep_title)}</title>\n"
+                f"    <description>{h(desc_body)}</description>\n"
+                f"    <enclosure url=\"{h(ep_url)}\" "
+                f"length=\"{ep_size}\" type=\"audio/mpeg\" />\n"
+                f"    <guid isPermaLink=\"false\">{h(ep_guid)}</guid>\n"
+                f"    <pubDate>{h(ep_pub)}</pubDate>\n"
+                f"    <link>{h(base)}/digests/{h(vid)}/</link>\n"
+                f"  </item>"
+            )
+
+        last_build = format_datetime(
+            _dt.datetime.fromtimestamp(
+                latest_pub or _dt.datetime.now().timestamp(),
+                tz=_dt.timezone.utc,
+            )
+        )
+        body = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<rss version="2.0" '
+            'xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">\n'
+            '<channel>\n'
+            '  <title>yt2md library</title>\n'
+            f'  <link>{h(base)}/</link>\n'
+            '  <description>Audio renditions of your distilled YouTube '
+            'digests, panels, and takeaways — generated locally by yt2md.</description>\n'
+            '  <language>en</language>\n'
+            f'  <lastBuildDate>{h(last_build)}</lastBuildDate>\n'
+            '  <itunes:author>yt2md</itunes:author>\n'
+            '  <itunes:summary>Audio renditions of your distilled YouTube digests.</itunes:summary>\n'
+            '  <itunes:explicit>no</itunes:explicit>\n'
+            '  <itunes:category text="Technology"/>\n'
+            + "\n".join(items_xml)
+            + "\n</channel>\n</rss>\n"
+        )
+        return Response(body, mimetype="application/rss+xml")
+
     @app.route("/digests/<video_id>/job-status")
     def job_status_route(video_id):
         from flask import jsonify, request
@@ -8410,8 +8508,21 @@ def cmd_serve(args) -> int:
             title="404", current="home",
         ), 404
 
+    host = getattr(args, "host", None) or "127.0.0.1"
+    # Localhost URL is what we open in the browser locally, regardless of
+    # bind address — the user is still on this Mac. LAN URL is what
+    # other devices (phone, tablet) should hit when binding to 0.0.0.0.
     url = f"http://127.0.0.1:{args.port}/"
     print(f"yt2md reader: {url}")
+    if host == "0.0.0.0":
+        import socket as _socket
+        hostname = _socket.gethostname()
+        if not hostname.endswith(".local"):
+            hostname = f"{hostname}.local"
+        lan_url = f"http://{hostname}:{args.port}/"
+        print(f"LAN access:   {lan_url}  (reachable from phone/tablet on same Wi-Fi)")
+        print(f"  ⚠ Library is now readable to anyone on your network. "
+              "Use 127.0.0.1 (default) if that's not what you want.")
     print(f"Data dir: {data_dir}")
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if api_key:
@@ -8444,7 +8555,7 @@ def cmd_serve(args) -> int:
         import threading
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
 
-    app.run(host="127.0.0.1", port=args.port, debug=False, use_reloader=False)
+    app.run(host=host, port=args.port, debug=False, use_reloader=False)
     return 0
 
 
@@ -9014,6 +9125,12 @@ def _subcommand_main(argv: List[str]) -> int:
 
     serve = sub.add_parser("serve", help="Start a local web reader (also runs the in-process scheduler)")
     serve.add_argument("--port", type=int, default=7682, help="Port (default: 7682)")
+    serve.add_argument("--host", default="127.0.0.1",
+                       help="Bind address (default: 127.0.0.1, localhost only). "
+                            "Pass 0.0.0.0 to make the library reachable from "
+                            "other devices on the same Wi-Fi (e.g. listen to "
+                            "MP3s on a phone). Exposes the whole library to "
+                            "anyone on your network — only do this on trusted Wi-Fi.")
     serve.add_argument("--no-browser", action="store_true",
                        help="Don't auto-open a browser tab on start")
     serve.set_defaults(func=cmd_serve)
