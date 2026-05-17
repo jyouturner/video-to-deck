@@ -8089,30 +8089,28 @@ def cmd_serve(args) -> int:
         # Pre-assemble the chat handoff prompt server-side so the button can
         # just copy a hidden textarea (same pattern as Copy markdown). Loads
         # whichever artifacts exist (digest + panel + takeaway).
-        chat_prompt = build_chat_handoff_prompt(video_id, digests_dir)
         nav = _viewer_nav(video_id, "takeaway", digests_dir)
         any_running = _any_local_job_running(video_id)
         # Bottom-of-page actions: Copy markdown for the takeaway itself,
         # plus Continue in chat (only on takeaway — that's the natural
         # "I want to ask a follow-up" endpoint after reading the synthesis).
+        # Continue-in-chat now navigates to /handoff so the user can see
+        # what's about to be sent, type their question, and pick the
+        # destination (claude.ai paste flow or Claude Desktop / MCP).
         bottom_actions = (
             "<hr style='margin: 32px 0 16px; border: none; "
             "border-top: 1px solid var(--border);'>"
             "<div class='digest-actions' style='margin-bottom: 16px;'>"
-            "<button type='button' class='discuss-btn' "
-            "data-copy-target='chat-handoff-source' "
-            "data-then-open='https://claude.ai/new' "
-            "title='Copies digest + panel + takeaway to your clipboard and "
-            "opens claude.ai in a new tab — paste to continue the discussion "
-            "with full context.'>Continue in chat</button>"
+            f"<a href='/digests/{h(video_id)}/handoff' "
+            "class='discuss-btn' style='text-decoration:none;' "
+            "title='Open the handoff page — review the bundle, type your "
+            "question, then copy + open Claude.'>Continue in chat ▸</a>"
             "<button type='button' class='discuss-btn-secondary' "
             "data-copy-target='page-md-source' "
             "title='Copy the takeaway markdown'>Copy markdown</button>"
             "</div>"
             f"<textarea id='page-md-source' hidden aria-hidden='true'>"
             f"{h(md_source)}</textarea>"
-            f"<textarea id='chat-handoff-source' hidden aria-hidden='true'>"
-            f"{h(chat_prompt)}</textarea>"
         )
         audio = _audio_section(video_id, "takeaway", digests_dir)
         poll_js = _JOB_POLL_JS if any_running else ""
@@ -8125,6 +8123,241 @@ def cmd_serve(args) -> int:
         return page(body, title=f"Takeaway · {video_id}",
                     current=f"digest:{video_id}",
                     base_href=f"/digests/{video_id}/takeaway/")
+
+    @app.route("/digests/<video_id>/handoff")
+    def handoff_page(video_id):
+        """Visible 'Continue in chat' flow. Replaces the silent
+        copy-then-open-tab dance with a page that shows what's about to
+        be sent, lets the user type their question, and only THEN copies
+        and opens claude.ai. Avoids the failure mode where the user
+        clicks the button, lands on an empty chat, and doesn't realize
+        the bundle is sitting in their clipboard waiting to be pasted.
+        """
+        from html import escape as h
+        digest_md = digests_dir / video_id / "digest.md"
+        if not digest_md.exists():
+            abort(404)
+
+        # Title for the page heading — prefer metadata.json's video
+        # title, fall back to the digest.md H1, then video_id.
+        title = video_id
+        meta_path = digests_dir / video_id / "metadata.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+                if meta.get("title"):
+                    title = meta["title"]
+            except Exception:
+                pass
+        if title == video_id:
+            try:
+                for line in digest_md.read_text().splitlines():
+                    if line.startswith("# "):
+                        title = line[2:].strip()
+                        break
+            except Exception:
+                pass
+
+        # Bundle the artifacts. build_chat_handoff_prompt already ends
+        # with "My question: " — the user types into a separate textarea
+        # and the JS appends it to that trailer at copy time.
+        bundle = build_chat_handoff_prompt(video_id, digests_dir)
+        # Strip the trailing "My question: " so the JS can append
+        # exactly "My question: <typed>" without doubling the label.
+        bundle_no_q = bundle.rstrip()
+        if bundle_no_q.endswith("My question:"):
+            bundle_no_q = bundle_no_q[: -len("My question:")].rstrip()
+
+        artifact_counts = []
+        if (digests_dir / video_id / "digest.md").exists():
+            artifact_counts.append("digest")
+        if (digests_dir / video_id / "panel.md").exists():
+            artifact_counts.append("panel")
+        if (digests_dir / video_id / "takeaway.md").exists():
+            artifact_counts.append("takeaway")
+        artifact_str = " + ".join(artifact_counts) or "summary"
+
+        bundle_size_kb = len(bundle.encode("utf-8")) / 1024
+        nav = _viewer_nav(video_id, "takeaway", digests_dir)
+
+        body = (
+            nav
+            + "<hr style='margin: 16px 0 32px; border: none; "
+            "border-top: 1px solid var(--border);'>"
+            f"<h1 style='margin-top:0;'>Continue in chat</h1>"
+            f"<p class='meta-info' style='margin-bottom:24px;'>"
+            f"Send the {artifact_str} for "
+            f"<strong>{h(title)}</strong> "
+            f"({bundle_size_kb:.1f} KB) to Claude with a follow-up "
+            f"question. The bundle goes on your clipboard; Claude opens "
+            f"in a new tab; you paste with ⌘V.</p>"
+
+            "<label style='display:block; font-weight:600; "
+            "margin-bottom:6px;'>Your follow-up question</label>"
+            "<textarea id='user-question' rows='3' "
+            "placeholder='e.g. How does this compare to the "
+            "subscription-pricing model SAP just announced?' "
+            "style='width:100%; padding:12px 14px; border-radius:4px; "
+            "border:1px solid var(--border); font-family:inherit; "
+            "font-size:15px; line-height:1.5; "
+            "background:var(--bg);' autofocus></textarea>"
+
+            "<div style='margin-top:14px; display:flex; gap:10px; "
+            "flex-wrap:wrap; align-items:center;'>"
+            "<button id='handoff-go' type='button' class='discuss-btn' "
+            "title='Copy the bundle (with your question) to your "
+            "clipboard and open claude.ai in a new tab.'>"
+            "📋 Copy + open Claude</button>"
+            "<a href='https://claude.ai/new' target='_blank' "
+            "rel='noopener' class='discuss-btn-secondary' "
+            "style='text-decoration:none;'>Open Claude only</a>"
+            f"<a href='/digests/{h(video_id)}/takeaway/' "
+            "class='discuss-btn-secondary' "
+            "style='text-decoration:none;'>← Back</a>"
+            "<span id='handoff-status' style='margin-left:8px; "
+            "color:var(--muted); font-size:14px;'></span>"
+            "</div>"
+
+            # Hidden bundle — what gets concatenated with the user's
+            # question at copy time. Stored as a textarea so we don't
+            # have to worry about character escaping in attributes.
+            f"<textarea id='handoff-bundle' hidden aria-hidden='true'>"
+            f"{h(bundle_no_q)}</textarea>"
+
+            # ---- Path B: Claude Desktop + MCP server ----
+            # Same question, different destination. If the user has the
+            # yt2md MCP server wired into Claude Desktop, this path is
+            # strictly better — Claude pulls structured data via tools
+            # instead of staring at a wall of pasted markdown, and can
+            # navigate to specific topics / panel turns on demand.
+            "<hr style='margin:32px 0 24px; border:none; "
+            "border-top:1px dashed var(--border);'>"
+            "<h2 style='margin-top:0; font-size:18px;'>"
+            "Or: discuss in Claude Desktop "
+            "<span style='font-size:12px; color:var(--muted); "
+            "font-weight:normal;'>(if you have the yt2md MCP server "
+            "set up)</span></h2>"
+
+            "<p class='meta-info' style='margin-bottom:14px;'>"
+            "Better than pasting a 60 KB blob — Claude Desktop pulls "
+            "the digest through the <code>read_digest</code> MCP tool "
+            "and can drill into specific topics / panel turns on demand. "
+            "Setup is one config edit; see the "
+            "<a href='https://github.com/jyouturner/youtube-to-markdown"
+            "#talk-to-your-library-from-claude-mcp' target='_blank' "
+            "rel='noopener'>MCP section in the README</a>.</p>"
+
+            "<div style='display:flex; gap:10px; flex-wrap:wrap; "
+            "align-items:center;'>"
+            "<button id='handoff-mcp-go' type='button' "
+            "class='discuss-btn-secondary' "
+            "title='Copy a Claude Desktop prompt that calls the yt2md "
+            "MCP read_digest tool for this video.'>"
+            "📋 Copy Claude Desktop prompt</button>"
+            "<span id='handoff-mcp-status' style='margin-left:8px; "
+            "color:var(--muted); font-size:14px;'></span>"
+            "</div>"
+
+            # Hidden video ID + title for the MCP prompt builder.
+            f"<input type='hidden' id='handoff-vid' value='{h(video_id)}'>"
+            f"<input type='hidden' id='handoff-title' value='{h(title)}'>"
+
+            # Collapsible preview so the user can see exactly what's
+            # being sent (transparency without it dominating the page).
+            "<details style='margin-top:32px;'>"
+            "<summary style='cursor:pointer; color:var(--muted); "
+            "font-size:14px;'>Preview what gets sent "
+            f"({bundle_size_kb:.1f} KB)</summary>"
+            "<pre style='margin-top:12px; padding:14px; "
+            "background:var(--code-bg); border-radius:4px; "
+            "max-height:400px; overflow:auto; font-size:12px; "
+            "white-space:pre-wrap; word-break:break-word;'>"
+            f"{h(bundle_no_q[:6000])}"
+            + ("\n\n... (truncated in preview; full bundle is copied)"
+               if len(bundle_no_q) > 6000 else "")
+            + "</pre>"
+            "</details>"
+
+            # Inline JS — same-page, no globals. Builds the final
+            # payload (bundle + "---" + "My question: " + typed), copies
+            # via Clipboard API, opens new tab, shows clear "now paste"
+            # confirmation. Falls back to a textarea-select trick for
+            # browsers / contexts where the modern clipboard API is
+            # restricted.
+            "<script>"
+            "(function(){"
+            "const btn = document.getElementById('handoff-go');"
+            "const q   = document.getElementById('user-question');"
+            "const b   = document.getElementById('handoff-bundle');"
+            "const st  = document.getElementById('handoff-status');"
+            "function build() {"
+            "  const ques = (q.value || '').trim();"
+            "  const trail = ques ? ('\\n\\nMy question: ' + ques)"
+            "                     : '\\n\\nMy question: ';"
+            "  return b.value + trail;"
+            "}"
+            "async function copyAndOpen() {"
+            "  const text = build();"
+            "  let ok = false;"
+            "  try {"
+            "    await navigator.clipboard.writeText(text);"
+            "    ok = true;"
+            "  } catch(e) {"
+            "    const ta = document.createElement('textarea');"
+            "    ta.value = text; ta.style.position='fixed'; ta.style.left='-9999px';"
+            "    document.body.appendChild(ta); ta.select();"
+            "    try { ok = document.execCommand('copy'); } catch(_){}"
+            "    document.body.removeChild(ta);"
+            "  }"
+            "  if (!ok) { st.textContent = '✗ Copy failed — try Open Claude only and paste manually.'; return; }"
+            "  st.innerHTML = '✓ Copied. Claude opens in a new tab — paste with <kbd>⌘V</kbd> (or <kbd>Ctrl+V</kbd>).';"
+            "  st.style.color = '#0a7d2c';"
+            "  st.style.fontWeight = '600';"
+            "  setTimeout(() => window.open('https://claude.ai/new', '_blank', 'noopener'), 250);"
+            "}"
+            "btn.addEventListener('click', copyAndOpen);"
+            "q.addEventListener('keydown', (e) => {"
+            "  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') copyAndOpen();"
+            "});"
+
+            # ---- MCP path button ----
+            "const mcpBtn = document.getElementById('handoff-mcp-go');"
+            "const mcpSt  = document.getElementById('handoff-mcp-status');"
+            "const vid    = document.getElementById('handoff-vid').value;"
+            "const ttl    = document.getElementById('handoff-title').value;"
+            "function buildMcpPrompt() {"
+            "  const ques = (q.value || '').trim() || '[type your question above first]';"
+            "  return ('Using the yt2md MCP server, call read_digest with '"
+            "    + 'digest_id=\"' + vid + '\" and section=\"full\" to get the '"
+            "    + 'context for \"' + ttl + '\". Also pull '"
+            "    + 'section=\"panel\" if the panel critique is relevant. '"
+            "    + 'Then let\\u2019s discuss:\\n\\n' + ques + '\\n\\n'"
+            "    + 'Reference specific topics (section=\"topic:N\") or panel '"
+            "    + 'turns (section=\"panel:turn:N\") as needed.');"
+            "}"
+            "async function copyMcp() {"
+            "  const text = buildMcpPrompt();"
+            "  let ok = false;"
+            "  try { await navigator.clipboard.writeText(text); ok = true; }"
+            "  catch(e) {"
+            "    const ta = document.createElement('textarea');"
+            "    ta.value = text; ta.style.position='fixed'; ta.style.left='-9999px';"
+            "    document.body.appendChild(ta); ta.select();"
+            "    try { ok = document.execCommand('copy'); } catch(_){}"
+            "    document.body.removeChild(ta);"
+            "  }"
+            "  if (!ok) { mcpSt.textContent = '✗ Copy failed.'; return; }"
+            "  mcpSt.innerHTML = '✓ Copied. Paste into Claude Desktop chat.';"
+            "  mcpSt.style.color = '#0a7d2c';"
+            "  mcpSt.style.fontWeight = '600';"
+            "}"
+            "mcpBtn.addEventListener('click', copyMcp);"
+            "})();"
+            "</script>"
+        )
+        return page(body, title=f"Continue in chat · {h(title)}",
+                    current=f"digest:{video_id}",
+                    base_href=f"/digests/{video_id}/")
 
     @app.route("/digests/<video_id>/panel/")
     def view_panel(video_id):
