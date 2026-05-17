@@ -2422,7 +2422,7 @@ TAKEAWAY_SYSTEM_PROMPT = (
 )
 
 
-def generate_takeaway(
+def generate_takeaway_prose(
     digest_md_text: str,
     panel_md_text: Optional[str],
     segments: List["TranscriptSegment"],
@@ -4891,7 +4891,7 @@ def build_takeaway_for_video(
     takeaway_model = (os.environ.get("YT2MD_TAKEAWAY_MODEL")
                       or DEFAULT_TAKEAWAY_MODEL)
     segments = parse_srt(srt_path)
-    takeaway_text, t_usage = generate_takeaway(
+    takeaway_text, t_usage = generate_takeaway_prose(
         digest_md.read_text(), panel_text, segments,
         model=takeaway_model,
         publish_date=None,
@@ -9559,7 +9559,7 @@ def main():
                 print(f"[+] Generating takeaway with {args.takeaway_model}...")
                 _take_t0 = _time.monotonic()
                 try:
-                    takeaway_text, t_usage = generate_takeaway(
+                    takeaway_text, t_usage = generate_takeaway_prose(
                         digest_md_text, panel_md_text, segments,
                         model=args.takeaway_model,
                         publish_date=upload_date,
