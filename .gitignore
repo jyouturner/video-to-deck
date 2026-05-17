@@ -7,7 +7,12 @@ build/
 *.egg-info/
 .env
 .env.*
-.claude/
+# .claude/ holds two kinds of files:
+#   - Project-shared (settings.json, hooks/, skills/) — committed so
+#     any contributor / future-you gets the same hooks + skills.
+#   - Machine-local (settings.local.json, credentials) — ignored.
+.claude/settings.local.json
+.claude/.credentials.json
 
 # Generated outputs
 downloads/
