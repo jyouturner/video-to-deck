@@ -6128,6 +6128,7 @@ details[open] summary { margin-bottom: 8px; }
   <ul>
     <li{% if current == 'channels' %} class="active"{% endif %}><a href="/channels">Subscriptions ({{ channel_count }})</a></li>
     <li{% if current == 'one-off' %} class="active"{% endif %}><a href="/one-off">One-off digest</a></li>
+    <li{% if current == 'listen' %} class="active"{% endif %}><a href="/listen">📱 Listen on phone</a></li>
     <li{% if current == 'schedule' %} class="active"{% endif %}><a href="/schedule">Schedule</a></li>
     <li{% if current == 'activity' %} class="active"{% endif %}><a href="/activity">Activity</a></li>
     <li{% if current == 'settings' %} class="active"{% endif %}><a href="/settings">Settings</a></li>
@@ -8383,6 +8384,142 @@ def cmd_serve(args) -> int:
             mimetype="audio/mpeg",
         )
 
+    @app.route("/listen")
+    def listen_page():
+        """Friction-free "subscribe in Podcasts" page. Computes the right
+        URL based on bind address + your hostname, generates a QR you
+        scan with the iPhone camera (one tap → Podcasts opens), and
+        offers a copy-to-clipboard backup."""
+        from flask import request
+        from html import escape as h
+        import socket as _socket
+        import io as _io
+
+        # Compose the feed URL the phone should hit. Prefer the request's
+        # host (so a user already browsing via .local sees their LAN URL),
+        # falling back to socket.gethostname for the localhost case.
+        request_host = request.host  # "<host>:<port>" as seen by client
+        host_only = request_host.split(":")[0]
+        is_localhost = host_only in ("127.0.0.1", "localhost")
+        if is_localhost:
+            # User opened /listen via localhost — the URL we expose
+            # must be reachable from the phone, so swap in the .local
+            # hostname. Server may not be bound to 0.0.0.0 yet; warn.
+            hostname = _socket.gethostname()
+            if not hostname.endswith(".local"):
+                hostname = f"{hostname}.local"
+            display_host = f"{hostname}:{request.host.split(':', 1)[1]}"
+        else:
+            display_host = request_host
+
+        feed_url = f"http://{display_host}/podcast.xml"
+        # podcast:// is Apple Podcasts' deep-link scheme. Tapping a
+        # podcast:// URL on iOS opens Podcasts with a Subscribe prompt.
+        deep_link = f"podcast://{display_host}/podcast.xml"
+
+        # Render the deep-link as an SVG QR — no PIL needed for SVG path.
+        import qrcode as _qrcode
+        from qrcode.image.svg import SvgPathImage as _SvgPath
+        qr = _qrcode.QRCode(box_size=10, border=2)
+        qr.add_data(deep_link)
+        qr.make(fit=True)
+        buf = _io.BytesIO()
+        qr.make_image(image_factory=_SvgPath).save(buf)
+        qr_svg = buf.getvalue().decode()
+        # The library writes a full XML doc; strip the prelude so we can
+        # inline the <svg> directly.
+        if "<svg" in qr_svg:
+            qr_svg = qr_svg[qr_svg.index("<svg"):]
+
+        # Bind-host check: warn if the server is loopback-only. The
+        # browser tab the user is reading this page in might be on
+        # localhost regardless (they're on the Mac), so we can't infer
+        # bind state from the request — read it from app.config where
+        # cmd_serve stashed it.
+        bind_host = app.config.get("YT2MD_BIND_HOST", "127.0.0.1")
+        lan_unreachable = bind_host in ("127.0.0.1", "localhost")
+
+        warning_html = ""
+        if lan_unreachable:
+            warning_html = (
+                '<div style="background:#fff3cd; border:1px solid #ffc107; '
+                'border-left-width:4px; padding:14px 18px; margin:0 0 24px; '
+                'border-radius:4px;">'
+                '<strong>⚠ Server isn\'t LAN-reachable yet.</strong><br>'
+                'Restart the server with <code>yt2md serve --host 0.0.0.0</code> '
+                'before subscribing, otherwise your phone can\'t reach the feed.'
+                '</div>'
+            )
+
+        body = (
+            warning_html
+            + '<h1>📱 Listen on phone</h1>'
+            '<p class="meta-info" style="margin-bottom: 28px;">Subscribe '
+            'in Apple Podcasts (or Overcast, Pocket Casts, etc.) to '
+            'auto-download new takeaways as they\'re generated. '
+            'Plays offline, resumes mid-episode.</p>'
+
+            '<div style="display:flex; gap:32px; flex-wrap:wrap; '
+            'align-items:flex-start;">'
+
+            # Left column: QR code
+            '<div style="flex:0 0 auto;">'
+            '<h2 style="margin-top:0;">Easy: scan with your phone</h2>'
+            '<div style="background:#fff; padding:16px; border-radius:8px; '
+            'display:inline-block; border:1px solid var(--border);">'
+            + qr_svg.replace(
+                "<svg",
+                '<svg width="260" height="260" style="display:block;"'
+            )
+            + '</div>'
+            '<ol style="font-size:14px; color:var(--muted); margin-top:14px; '
+            'padding-left:20px; max-width:260px;">'
+            '<li>Open Camera app on your iPhone.</li>'
+            '<li>Point it at the code above.</li>'
+            '<li>Tap the notification — Apple Podcasts opens.</li>'
+            '<li>Tap <strong>Subscribe</strong>.</li>'
+            '</ol>'
+            '</div>'
+
+            # Right column: manual subscribe details
+            '<div style="flex:1 1 320px; min-width:280px;">'
+            '<h2 style="margin-top:0;">Or paste this URL</h2>'
+            f'<input type="text" readonly value="{h(feed_url)}" '
+            'id="feed-url" style="width:100%; font-family:monospace; '
+            'font-size:13px; padding:10px 12px; border:1px solid var(--border); '
+            'border-radius:4px; background:var(--code-bg);" '
+            'onclick="this.select();">'
+            '<div style="margin-top:10px; display:flex; gap:8px;">'
+            '<button class="primary" '
+            'data-copy-target="feed-url-raw">📋 Copy URL</button>'
+            f'<a href="{h(deep_link)}" class="discuss-btn-secondary" '
+            'style="text-decoration:none;">Open in Podcasts ▸</a>'
+            '</div>'
+            f'<textarea id="feed-url-raw" style="position:absolute; '
+            'left:-9999px;">{h(feed_url)}</textarea>'
+
+            '<h3 style="margin-top:24px;">Apple Podcasts</h3>'
+            '<ol style="font-size:14px; line-height:1.6; color:var(--muted);">'
+            '<li>Open <strong>Podcasts</strong> on your iPhone.</li>'
+            '<li>Tap <strong>Library</strong> (bottom right).</li>'
+            '<li>Tap the <strong>⋯</strong> menu → '
+            '<strong>Add a Show by URL</strong>.</li>'
+            '<li>Paste the URL above and tap <strong>Subscribe</strong>.</li>'
+            '</ol>'
+
+            '<h3>Overcast / Pocket Casts</h3>'
+            '<p style="font-size:14px; line-height:1.6; color:var(--muted);">'
+            'Look for "Add URL" or "Add by URL" — same flow.</p>'
+
+            '</div>'  # right column
+            '</div>'  # flex container
+
+            f'<p class="meta-info" style="margin-top:32px;"><strong>Feed URL:</strong> '
+            f'<a href="{h(feed_url)}" target="_blank">{h(feed_url)}</a> · '
+            f'<strong>Deep link:</strong> <code>{h(deep_link)}</code></p>'
+        )
+        return page(body, title="Listen on phone", current="listen")
+
     @app.route("/podcast.xml")
     def podcast_feed():
         """RSS 2.0 podcast feed listing every *.mp3 in the library as an
@@ -8521,8 +8658,15 @@ def cmd_serve(args) -> int:
             hostname = f"{hostname}.local"
         lan_url = f"http://{hostname}:{args.port}/"
         print(f"LAN access:   {lan_url}  (reachable from phone/tablet on same Wi-Fi)")
+        print(f"📱 Listen on phone: {lan_url}listen  "
+              "(QR code + Apple Podcasts deep link)")
         print(f"  ⚠ Library is now readable to anyone on your network. "
-              "Use 127.0.0.1 (default) if that's not what you want.")
+              "Use --host 127.0.0.1 (default) if that's not what you want.")
+    else:
+        # Friendly nudge so users don't miss the phone-playback path
+        # just because they don't know about the --host flag.
+        print(f"  (tip: restart with `yt2md serve --host 0.0.0.0` to "
+              f"listen to MP3s on a phone — see {url}listen)")
     print(f"Data dir: {data_dir}")
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if api_key:
@@ -8555,6 +8699,10 @@ def cmd_serve(args) -> int:
         import threading
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
 
+    # Stash the bind host so /listen can tell the user whether the phone
+    # can actually reach the server (independent of which URL they used
+    # to load the page locally).
+    app.config["YT2MD_BIND_HOST"] = host
     app.run(host=host, port=args.port, debug=False, use_reloader=False)
     return 0
 

@@ -128,24 +128,18 @@ context. Useful when you finish reading and have a follow-up question.
 ## Listen on your phone (podcast feed)
 
 yt2md generates MP3s of each digest's takeaway, panel, and digest as
-they're built. To play them on a phone:
+they're built. Subscribe in Apple Podcasts and they auto-download —
+plays offline, resumes mid-episode, queues nicely.
 
 ```bash
 yt2md serve --host 0.0.0.0    # bind to all interfaces (LAN-reachable)
 ```
 
-Then subscribe to the podcast feed in **Apple Podcasts** (or Overcast,
-Pocket Casts, etc.) by URL:
-
-```
-http://<your-mac>.local:7682/podcast.xml
-```
-
-The mac's hostname is whatever `hostname` prints with `.local` tacked
-on. The feed lists every MP3 in your library as a separate episode,
-sorted newest-first. Once subscribed, the podcast app auto-downloads
-new takeaways and panels as you generate them, plays offline, and
-resumes mid-episode like any other podcast.
+Then open <http://localhost:7682/listen> in your Mac browser. The
+page shows a QR code — scan it with your iPhone camera and Apple
+Podcasts opens with a Subscribe prompt. That's it. If you can't scan,
+the page also has a copy-to-clipboard URL and step-by-step manual
+instructions.
 
 > Warning: `--host 0.0.0.0` makes your whole digest library readable
 > to anyone on the same Wi-Fi. Fine on your home network; don't do it
